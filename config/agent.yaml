@@ -1,0 +1,7 @@
+rag_summary_model: "deepseek-v4.1-flash-1017"
+rag_summary_model_provider: "openai"
+rag_summary_model_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+main_agent_model:  "deepseek-v4.1-flash-1017"
+main_agent_model_provider: "openai"
+main_agent_model_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
