@@ -8,7 +8,6 @@ def load_config(file_path):
         with open(abs_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
     except FileNotFoundError as e:
-        # 配置缺失会让后续取值直接抛 TypeError，这里提前用明确的信息终止启动
         raise RuntimeError(f"配置文件不存在: {abs_path}") from e
     except Exception as e:
         raise RuntimeError(f"加载配置失败 ({abs_path}): {e}") from e

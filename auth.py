@@ -19,12 +19,8 @@ load_dotenv()
 
 PG_CONN = os.getenv("PG_CONNECTION_STRING", "postgresql://postgres:postgres@localhost:5432/deepagent_rag")
 PG_POOL_MIN = int(os.getenv("PG_POOL_MIN", "2"))
-# 业务池承载全部鉴权查询、限流读写与会话增删改查（均为短操作），
-# 多 worker 部署时注意 workers × (本池上限 + 检查点池上限) 不能超过 PG max_connections
+# 多 worker 部署时需把业务池与检查点池的总量控制在 PG 上限内。
 PG_POOL_MAX = int(os.getenv("PG_POOL_MAX", "20"))
-# JWT 签名密钥必须显式配置：随机兜底会导致重启后已签发 token 全部失效，
-# 多 worker 下更会让各进程互不认签、用户随机掉线，均属不可接受的状态，故缺失即拒绝启动。
-# 生成方式：python -c "import secrets; print(secrets.token_hex(32))"
 JWT_SECRET = os.getenv("JWT_SECRET")
 if not JWT_SECRET:
     raise RuntimeError(
@@ -33,26 +29,18 @@ if not JWT_SECRET:
     )
 JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "72"))
 
-# 用户名长度上限，与 users.username VARCHAR(50) 对齐：超长用户名在入口直接拒绝，
-# 否则插入 users 或写入 rate_limits.key 时会抛 DataError，接口变成 500
 USERNAME_MAX_LENGTH = 50
 
-# ---------- 登录安全配置 ----------
-# 账号级限流：按用户名计数，抵挡针对单一账号的多 IP 爆破；不按来源 IP，避免误伤同出口的其他用户
 LOGIN_ACCOUNT_RATE_LIMIT = int(os.getenv("LOGIN_ACCOUNT_RATE_LIMIT", "10"))
 LOGIN_ACCOUNT_RATE_WINDOW_SECONDS = int(os.getenv("LOGIN_ACCOUNT_RATE_WINDOW_SECONDS", "60"))
-# IP 级限流：仅作粗粒度兜底（防单机横扫多账号），阈值放宽，避免 NAT 共享出口被整体拒绝
 LOGIN_IP_RATE_LIMIT = int(os.getenv("LOGIN_IP_RATE_LIMIT", "100"))
 LOGIN_IP_RATE_WINDOW_SECONDS = int(os.getenv("LOGIN_IP_RATE_WINDOW_SECONDS", "60"))
-# 单 IP 针对单账号的失败冷却：只挡该来源对该账号的尝试，其他 IP 的正常登录不受影响
 LOGIN_ACCOUNT_IP_MAX_ATTEMPTS = int(os.getenv("LOGIN_ACCOUNT_IP_MAX_ATTEMPTS", "5"))
 LOGIN_ACCOUNT_IP_WINDOW_SECONDS = int(os.getenv("LOGIN_ACCOUNT_IP_WINDOW_SECONDS", "900"))
-# JWT 复核用户信息的缓存时长（秒）：越大越省数据库，代价是删号/降权生效延迟
 USER_CACHE_TTL_SECONDS = int(os.getenv("USER_CACHE_TTL_SECONDS", "30"))
-REGISTER_RATE_LIMIT = int(os.getenv("REGISTER_RATE_LIMIT", "5"))          # 同一 IP 在窗口期内允许的最大注册次数
-REGISTER_RATE_WINDOW_SECONDS = int(os.getenv("REGISTER_RATE_WINDOW_SECONDS", "3600"))  # 注册限流窗口（秒）
+REGISTER_RATE_LIMIT = int(os.getenv("REGISTER_RATE_LIMIT", "5"))
+REGISTER_RATE_WINDOW_SECONDS = int(os.getenv("REGISTER_RATE_WINDOW_SECONDS", "3600"))
 
-# ---------- DB helpers ----------
 
 _pool: ConnectionPool | None = None
 _pool_lock = threading.Lock()
@@ -60,8 +48,8 @@ _pool_lock = threading.Lock()
 
 def _get_pool() -> ConnectionPool:
     global _pool
-    # 双重检查锁：并发首次调用时只创建一个连接池，避免竞态导致池泄漏
     if _pool is None:
+        # 双重检查避免并发首次调用创建多个池。
         with _pool_lock:
             if _pool is None:
                 _pool = ConnectionPool(
@@ -77,7 +65,6 @@ def _get_conn():
 
 
 def _put_conn(conn):
-    # psycopg3 中 SELECT 也会开启事务；归还前回滚未提交的读事务，避免池打印警告
     if conn.info.transaction_status == TransactionStatus.INTRANS:
         conn.rollback()
     _get_pool().putconn(conn)
@@ -85,8 +72,6 @@ def _put_conn(conn):
 
 def init_db():
     """创建所需表（users、conversations、messages、rate_limits）。"""
-    # 多 worker 同时启动会并发执行 DDL 而冲突，用 PG 咨询锁串行化；
-    # 与检查点建表（main_deep_agent）共用同一把锁，表已存在时 DDL 极快，后续 worker 依次通过
     with exclusive_section(PG_CONN, PG_LOCK_KEY_SETUP):
         conn = _get_conn()
         try:
@@ -101,8 +86,6 @@ def init_db():
                         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
-                # 清理早期"账号锁定"方案的遗留字段：该方案已废弃（爆破防护完全由三层限流承担，
-                # 尝试与失败记录都在 rate_limits 表中，无需在 users 上重复计数）
                 cur.execute("ALTER TABLE users DROP COLUMN IF EXISTS locked_until")
                 cur.execute("ALTER TABLE users DROP COLUMN IF EXISTS failed_attempts")
                 cur.execute("""
@@ -132,16 +115,11 @@ def init_db():
                         attempted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
-                # 兼容迁移：早期 key 为 VARCHAR(64)，装不下 login_fail_ip 的
-                # "{用户名}|{IP}" 复合键（用户名 50 + "|" + IPv6 45 = 96），
-                # 超长会抛 DataError 使登录返回 500
                 cur.execute("ALTER TABLE rate_limits ALTER COLUMN key TYPE VARCHAR(128)")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_rate_limits_lookup "
                     "ON rate_limits (scope, key, attempted_at)"
                 )
-                # 惰性清理按 attempted_at 过滤，缺这个索引时清理会退化为全表扫描；
-                # 对话接口也写入本表后（每用户可达上千行/小时）这一条尤为重要
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_rate_limits_attempted_at "
                     "ON rate_limits (attempted_at)"
@@ -151,7 +129,6 @@ def init_db():
             _put_conn(conn)
 
 
-# ---------- password ----------
 
 _ph = PasswordHasher()
 
@@ -185,7 +162,6 @@ def _validate_password(password: str) -> str | None:
     return None
 
 
-# ---------- JWT ----------
 
 def _create_token(user_id: int, username: str, role: str) -> str:
     payload = {
@@ -219,8 +195,6 @@ def get_user_by_id(user_id: int) -> dict | None:
         _put_conn(conn)
 
 
-# 用户信息短 TTL 缓存：每个鉴权请求都要复核账号，直连数据库会放大连接池压力。
-# 缓存后删号/降权的最长生效延迟 = USER_CACHE_TTL_SECONDS。
 _user_cache: dict[int, tuple[float, dict | None]] = {}
 _user_cache_lock = threading.Lock()
 _USER_CACHE_MAX_ENTRIES = 20000
@@ -236,7 +210,6 @@ def get_user_cached(user_id: int) -> dict | None:
     user = get_user_by_id(user_id)
     with _user_cache_lock:
         if len(_user_cache) >= _USER_CACHE_MAX_ENTRIES:
-            # 先淘汰过期项；仍满则整体清空（TTL 很短，重建代价可控）
             expired = [k for k, v in _user_cache.items() if now - v[0] >= USER_CACHE_TTL_SECONDS]
             if expired:
                 for k in expired:
@@ -247,11 +220,8 @@ def get_user_cached(user_id: int) -> dict | None:
     return user
 
 
-# ---------- 通用速率限制（DB 版滑动窗口，跨多进程共享，内存有界） ----------
 
-# 惰性清理概率：每次记录后以该概率清理过期行，防止 rate_limits 表无限增长
 _RATE_PURGE_PROBABILITY = 0.01
-# 各 scope 的窗口最长 1 小时，保留 2 小时可安全清理窗口外记录而不误删
 _RATE_RETENTION = timedelta(hours=2)
 
 
@@ -294,7 +264,6 @@ def check_rate(scope: str, key: str, limit: int, window_seconds: int) -> bool:
         _put_conn(conn)
 
 
-# ---------- 业务接口 ----------
 
 def register(username: str, password: str, ip: str | None = None) -> dict:
     """注册新用户（角色固定为 user）。返回 {'ok': True} 或 {'ok': False, 'error': ...}。"""
@@ -307,15 +276,12 @@ def register(username: str, password: str, ip: str | None = None) -> dict:
     if err:
         return {"ok": False, "error": err}
 
-    # 注册限流：必须在 Argon2 哈希等昂贵计算之前拒绝，防止批量注册刷 CPU
     if ip and not check_rate("register", ip, REGISTER_RATE_LIMIT, REGISTER_RATE_WINDOW_SECONDS):
         return {"ok": False, "error": "注册过于频繁，请稍后再试", "rate_limited": True}
 
     conn = _get_conn()
     try:
         with conn.cursor() as cur:
-            # 唯一性交给数据库约束判断：SELECT-then-INSERT 在并发下会双双通过检查，
-            # 后插入者撞 UNIQUE 约束抛异常变成 500，而不是返回"用户名已存在"
             cur.execute(
                 "INSERT INTO users (username, password, role) VALUES (%s, %s, %s) "
                 "ON CONFLICT (username) DO NOTHING",
@@ -342,8 +308,6 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
     故意输错密码，就能把真实用户踢下线。
     """
     username = username.strip()
-    # 超过列上限的用户名不可能对应真实账号，直接按凭据错误处理：既避免超长复合键
-    # 写入 rate_limits 抛 DataError（接口变 500），也不额外暴露「账号是否存在」
     if len(username) > USERNAME_MAX_LENGTH:
         return {"ok": False, "error": "用户名或密码错误"}
     now = datetime.now()
@@ -352,7 +316,6 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
     conn = _get_conn()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            # ---- 限流判定（同一连接内完成，不额外占用连接池）----
             checks = [
                 ("login_acct", username, LOGIN_ACCOUNT_RATE_LIMIT, LOGIN_ACCOUNT_RATE_WINDOW_SECONDS),
             ]
@@ -365,11 +328,8 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
                 )
             for scope, key, limit, window in checks:
                 if _rate_exceeded(cur, scope, key, limit, window, now):
-                    # 带 rate_limited 标记，让接口层回 429 而不是 401，
-                    # 客户端与监控才能区分「密码错」和「被限流」
                     return {"ok": False, "error": "尝试过于频繁，请稍后再试", "rate_limited": True}
 
-            # ---- 记录本次尝试 ----
             _rate_record(cur, "login_acct", username, now)
             if ip:
                 _rate_record(cur, "login_ip", ip, now)
@@ -384,13 +344,11 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
                 return {"ok": False, "error": "用户名或密码错误"}
 
             if not _verify_password(password, row["password"]):
-                # 失败只记入限流表（login_fail_ip），统一返回通用错误，不向外暴露账号状态
                 if acct_ip_key:
                     _rate_record(cur, "login_fail_ip", acct_ip_key, now)
                 conn.commit()
                 return {"ok": False, "error": "用户名或密码错误"}
 
-            # 密码正确：提交本次尝试记录（login_acct / login_ip）并签发 token
             conn.commit()
             token = _create_token(row["id"], row["username"], row["role"])
             return {
@@ -406,7 +364,6 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
         _put_conn(conn)
 
 
-# ---------- 对话记录 ----------
 
 def list_conversations(user_id: int) -> list[dict]:
     """返回用户所有会话（含消息），按最近更新倒序。"""

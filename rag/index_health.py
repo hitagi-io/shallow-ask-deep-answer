@@ -34,7 +34,6 @@ def _md5_txt_path() -> str:
 def _write_md5_set(hashes: set) -> None:
     with md5_lock:
         path = _md5_txt_path()
-        # 原子替换：先写临时文件再 rename，避免中途失败截断损坏 md5.txt
         tmp_path = path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             for h in sorted(hashes):
@@ -50,7 +49,7 @@ def _milvus_source_counts(vector_store) -> dict:
     （invalid max query result window），导致整个自检/自愈抛异常。
     """
     vs = vector_store.vector_store
-    client = vs.client  # pymilvus.MilvusClient（query_iterator/delete 均基于它，版本稳定）
+    client = vs.client
     counts: dict = {}
     iterator = client.query_iterator(
         collection_name=vs.collection_name,
@@ -106,8 +105,6 @@ class IndexHealth:
                 source_counts = _milvus_source_counts(self.vector_store)
             except Exception as e:
                 report["healthy"] = False
-                # 原始异常可能是连接串 / 主机名 / 上游原文，只写服务端日志；
-                # 报告体由接口原样返回，不能带上这些内部信息
                 print(f"[索引健康] 自检失败，无法连接 Milvus: {e}")
                 report["milvus_error"] = "无法连接 Milvus，详情见服务端日志"
                 report["issues"].append({
@@ -120,24 +117,21 @@ class IndexHealth:
             milvus_by_norm = {os.path.normcase(s): s for s in source_counts}
             report["stats"]["chunks"] = sum(source_counts.values())
 
-            # 磁盘文件：normcase路径 -> (原路径, md5)
+            # 路径用于定位向量，MD5 用于判断同内容文件是否已入库。
             disk_by_norm: dict = {}
             for f in disk_files:
                 disk_by_norm[os.path.normcase(f)] = (f, get_file_md5_hex(f))
 
-            # 内容级视角：同内容文件按内容去重（只入库一次），因此判定基准是"内容"而非"路径"
             files_by_md5: dict = {}
             for _, (path, md5) in disk_by_norm.items():
                 if md5:
                     files_by_md5.setdefault(md5, []).append(path)
             disk_hashes = set(files_by_md5)
-            # 某内容只要有任意一个同内容文件带向量，该内容即视为已入库
             backed_hashes = {
                 md5 for norm, (_, md5) in disk_by_norm.items()
                 if md5 and norm in milvus_by_norm
             }
 
-            # 场景2（Milvus侧）：有向量但磁盘文件已丢失 → 残留向量
             ghost = [s for s in source_counts if os.path.normcase(s) not in disk_by_norm]
             if ghost:
                 report["healthy"] = False
@@ -148,7 +142,6 @@ class IndexHealth:
                     "count": len(ghost), "items": ghost,
                 })
 
-            # 场景2（md5侧）：md5.txt 中的记录在磁盘上已无对应文件
             orphan_hashes = [h for h in md5_set if h not in disk_hashes]
             if orphan_hashes:
                 report["healthy"] = False
@@ -158,17 +151,14 @@ class IndexHealth:
                     "count": len(orphan_hashes), "items": [h[:12] + "..." for h in orphan_hashes],
                 })
 
-            # 场景1（内容级）：向量库已有该内容，但入库记录缺失 → 界面误标「未入库」，重建会重复入库
             missing_record = [
                 p for h in (backed_hashes - md5_set) for p in files_by_md5[h]
             ]
 
-            # 场景3（内容级）：有入库记录但向量库里没有该内容的向量 → 检索静默漏查
             missing_vectors = [
                 p for h in (md5_set - backed_hashes) if h in files_by_md5 for p in files_by_md5[h]
             ]
 
-            # 已入库文件数：内容已被记录即视为已入库，与前端 /api/files 的判定标准保持一致
             report["stats"]["indexed_files"] = sum(
                 1 for _, (_, md5) in disk_by_norm.items() if md5 and md5 in md5_set
             )
@@ -208,7 +198,6 @@ class IndexHealth:
 
             summary = {"ghost_deleted": [], "ghost_errors": [], "md5_rebuilt": False, "re_indexed": [], "re_index_failures": []}
 
-            # 1. 清理残留向量（场景2）
             for src in source_counts:
                 if os.path.normcase(src) in disk_by_norm:
                     continue
@@ -216,11 +205,9 @@ class IndexHealth:
                     self.vector_store.delete_by_source(src)
                     summary["ghost_deleted"].append(src)
                 except Exception as e:
-                    # 该摘要随接口原样返回，异常原文（含 Milvus 内部信息）只写日志
                     print(f"[索引健康] 清理残留向量失败 source={src}: {e}")
                     summary["ghost_errors"].append(f"{src}: 删除失败，详情见服务端日志")
 
-            # 2. 以 Milvus 为准重建 md5.txt（场景1 + 剔除场景2孤立记录）
             try:
                 source_counts = _milvus_source_counts(self.vector_store)
             except Exception as e:
@@ -233,8 +220,6 @@ class IndexHealth:
             _write_md5_set(keep_hashes)
             summary["md5_rebuilt"] = True
 
-            # 3. 重索引“记录存在但向量丢失”的内容（场景3）
-            #    内容级去重：每个缺失内容只需入库一个代表文件，其余同内容副本共享该结果
             backed_after = {
                 md5 for norm, (_, md5) in disk_by_norm.items()
                 if md5 and norm in milvus_by_norm
@@ -250,10 +235,6 @@ class IndexHealth:
                 failed_files = {item["file"] for item in failures}
                 summary["re_indexed"] = [p for p in to_reindex if p not in failed_files]
                 summary["re_index_failures"] = failures
-                # 这些内容的记录已在步骤 2 被清掉；重索引失败就把记录补回去，
-                # 让 check() 判为 missing_vectors 并在下一轮自检继续重试。
-                # 否则会静默停在「未入库」——既非 missing_vectors 也非 missing_md5_record，
-                # 自检认为一切健康、永远不再重试，只能靠管理员手动补建。
                 failed_hashes = {
                     disk_by_norm[os.path.normcase(p)][1] for p in failed_files
                     if os.path.normcase(p) in disk_by_norm

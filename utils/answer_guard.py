@@ -1,156 +1,201 @@
 """降级回答兜底：裁决"仅知识库"模式的流式输出，接管降级文案；通用模式仅过滤工具消息。
 
 两种模式（与前端「仅知识库」开关一一对应）：
-- kb_only=True（默认，严格模式）：事实性内容只能来自知识库。子代理用固定短句报告
-  "无资料 / 服务故障"，本模块在代码层解析并通过固定文案接管；模型文本先缓冲，
-  只有检索成功才放行，降级时直接输出固定文案并提前终止底层流。
+- kb_only=True（默认，严格模式）：事实性内容只能来自知识库。子代理在出口由代码根据
+  检索 artifact 生成结构化报告；本模块只认结构报告，不扫描任何失败短句。模型文本
+  先缓冲，只有拿到 status=ok 且来源可校验的回合才放行，否则输出固定文案并丢弃文本。
 - kb_only=False（通用模式）：模型自身知识 + 必要时联网搜索，没有固定文案约定；
   本模块只过滤工具消息（并记录联网异常标记），模型文本实时透传。
 
-固定文案与固定短句以本模块为唯一来源，提示词模板经 utils.prompt_loader 注入，
-避免两处不一致。
+固定文案以本模块为唯一来源，提示词模板经 utils.prompt_loader 注入。
 """
 
-# ---- 工具层标记串（模型在工具输出中看到，提示词据此解释含义）----
-RETRIEVAL_ERROR_MARKER = "__RETRIEVAL_UNAVAILABLE__"  # do_retrieval 检索服务故障
-SEARCH_ERROR_MARKER = "__SEARCH_UNAVAILABLE__"        # tavily_search 搜索服务故障
-SEARCH_EMPTY_MARKER = "__SEARCH_EMPTY__"              # tavily_search 正常但没有结果
+from utils.retrieval_protocol import (
+    CITATION_SOURCE_LIMIT,
+    STATUS_EMPTY,
+    STATUS_ERROR,
+    STATUS_OK,
+    looks_like_report,
+    parse_direct_answer_content,
+    parse_retrieval_report,
+    split_answer_and_citations,
+)
 
-# ---- 子代理固定短句（作为约定：整段唯一内容，代码精确解析）----
-SENTINEL_KB_DOWN = "检索服务暂时不可用"  # 子代理：检索工具故障
-SENTINEL_KB_MISS = "未找到足够资料"      # 子代理：知识库无资料
+# 通用模式向模型传递的两种联网搜索状态。
+SEARCH_ERROR_MARKER = "__SEARCH_UNAVAILABLE__"
+SEARCH_EMPTY_MARKER = "__SEARCH_EMPTY__"
 
-# ---- 用户可见固定文案（唯一来源，渲染进提示词模板）----
 COPY_KB_DOWN = "抱歉，知识库检索服务暂时不可用，请稍后重试。"
 COPY_KB_MISS = "抱歉，内部知识库中未找到相关资料。您可以关闭「仅知识库」开关后重试。"
+COPY_KB_UNVERIFIED = "抱歉，本次回答未能通过知识库依据校验，请稍后重试。"
 
-# 子代理成功输出的来源标注前缀（仅用于日志检查，不参与判定）
-_SOURCE_BLOCK_PREFIX = "来源："
-
-# 降级获胜状态 -> 用户可见固定文案
 _COPY_BY_WINNER = {
     "kb_down": COPY_KB_DOWN,
     "kb_miss": COPY_KB_MISS,
+    "unverified": COPY_KB_UNVERIFIED,
 }
+_FIXED_COPY_TEXTS = frozenset(_COPY_BY_WINNER.values())
 
 
 class AnswerGuard:
-    """仅知识库模式的单回合输出判定器：feed_tool / feed_text / finish 三个入口。
+    """仅知识库模式的单回合输出判定器。
 
     调用方（guarded_stream）负责从流中取出消息并区分工具消息与文本消息；
-    本类只维护回合状态，返回"此刻应发给用户的内容"（None 表示继续缓冲）。
+    本类只维护回合状态，finish() 返回"此刻应发给用户的内容"（None 表示无可输出）。
     """
 
     def __init__(self) -> None:
-        self.terminated = False  # 已输出降级文案并终止回合
-        self._released = False   # 缓冲文本已放行，后续文本实时透传
+        self.terminated = False
         self._buffer: list[str] = []
-        self._kb_success = False
-        self._kb_down = False
-        self._kb_miss = False
-        self._seen_tools: list[str] = []  # 仅用于日志（零检索回合排查）
+        self._reports: list[dict] = []
+        self._direct_category: str | None = None
+        self._task_seen = False
+        self._task_call_ids: set[str] = set()
+        self._direct_call_ids: set[str] = set()
+        self._seen_tools: list[str] = []
 
-    # ---------- 状态入口 ----------
 
-    def feed_tool(self, text: str, tool_name: str | None = None) -> str | None:
-        """处理一条工具消息，返回此刻需要直接发给用户的文本（放行缓冲或降级文案）。"""
+    def note_tool_call(self, tool_name: str | None, tool_call_id: str | None = None) -> None:
+        """记录模型发起的工具调用，用于把工具结果关联到具体调用。"""
+        if tool_name == "task":
+            self._task_seen = True
+            if tool_call_id:
+                self._task_call_ids.add(tool_call_id)
+        elif tool_name == "mark_direct_answer" and tool_call_id:
+            self._direct_call_ids.add(tool_call_id)
+
+    def feed_tool(
+        self,
+        text: str,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> None:
+        """处理一条工具消息：只接受结构化报告/直答声明，不解析失败短句。"""
         if self.terminated:
-            return None
+            return
         text = text or ""
         if tool_name:
             self._seen_tools.append(tool_name)
-
-        # 防御：子代理内部工具标记意外进入主流时，同样按知识库故障处理
-        if RETRIEVAL_ERROR_MARKER in text:
-            self._kb_down = True
-            return self._settle("知识库检索服务故障")
-
         if tool_name == "task":
-            if SENTINEL_KB_DOWN in text:
-                self._kb_down = True
-                self._log_if_nonstandard(text, SENTINEL_KB_DOWN)
-                return self._settle("知识库检索服务故障")
-            if SENTINEL_KB_MISS in text:
-                self._kb_miss = True
-                self._log_if_nonstandard(text, SENTINEL_KB_MISS)
-                return self._settle("知识库无资料")
-            self._kb_success = True
-            if _SOURCE_BLOCK_PREFIX not in text:
-                print("[兜底] 知识库检索成功，但子代理输出缺少「来源：」标注，请检查检索提示词")
-            return self._settle("知识库检索成功")
+            self._task_seen = True
 
-        return None
+        report = parse_retrieval_report(text)
+        if report is not None:
+            if (
+                not tool_call_id
+                or tool_call_id not in self._task_call_ids
+                or tool_name not in (None, "task")
+            ):
+                print("[兜底] 结构化检索报告没有匹配的 task 调用，已忽略")
+                return
+            report["task_call_id"] = tool_call_id
+            self._reports.append(report)
+            sources = "、".join(report["sources"][:CITATION_SOURCE_LIMIT]) or "-"
+            print(
+                f"[兜底] 结构化检索报告 status={report['status']} "
+                f"reason={report.get('reason') or '-'} sources={sources} "
+                f"task_call={tool_call_id or '-'}"
+            )
+            return
 
-    def feed_text(self, text: str) -> str | None:
-        """处理一段模型文本：已放行则透传，否则缓冲。"""
+        if looks_like_report(text):
+            print("[兜底] 结构化检索报告解析失败，本回合按无有效证据处理")
+
+        category = parse_direct_answer_content(text)
+        if category is not None:
+            if (
+                not tool_call_id
+                or tool_call_id not in self._direct_call_ids
+                or tool_name not in (None, "mark_direct_answer")
+            ):
+                print("[兜底] 直答声明没有匹配的 mark_direct_answer 调用，已忽略")
+                return
+            self._direct_category = category
+            print(f"[兜底] 已声明直答分支 category={category}")
+
+    def feed_text(self, text: str) -> None:
+        """缓冲模型文本，回合结束时统一校验后再放行。"""
         if self.terminated or not text:
-            return None
-        if self._released:
-            return text
+            return
         self._buffer.append(text)
-        return None
 
     def finish(self) -> str | None:
-        """回合结束（流耗尽）时的收尾：放行缓冲或输出兜底固定文案。"""
+        """回合结束（流耗尽）时的唯一放行点。"""
         if self.terminated:
             return None
-        winner = self._winner()
-        if winner is None:
-            # 无工具调用属正常直答（如寒暄），不打印；调用了工具却未走知识库检索才值得记录，
-            # 便于排查提示词或工具路由问题
-            if self._seen_tools:
-                tools = "、".join(self._seen_tools)
-                print(f"[兜底] 本回合未出现知识库检索，文本直接放行（已见工具：{tools}）")
-            self._released = True
-            return self._flush()
-        if winner == "kb_success":
-            self._released = True
-            return self._flush()
-        # kb_down / kb_miss 理论上已在 feed_tool 中终止，此处兜底同样接管
-        return self._terminate(winner, "回合结束兜底接管")
 
-    # ---------- 内部逻辑 ----------
+        ok_reports = [report for report in self._reports if report["status"] == STATUS_OK]
+        if ok_reports:
+            return self._finish_with_evidence(ok_reports)
 
-    def _winner(self) -> str | None:
-        if self._kb_success:
-            return "kb_success"
-        if self._kb_down:
-            return "kb_down"
-        if self._kb_miss:
-            return "kb_miss"
+        if any(report["status"] == STATUS_ERROR for report in self._reports):
+            return self._terminate("kb_down", "结构化报告为知识库检索服务故障")
+        if any(report["status"] == STATUS_EMPTY for report in self._reports):
+            return self._terminate("kb_miss", "结构化报告为知识库无资料")
+        if self._reports:
+            statuses = "、".join(sorted({report["status"] for report in self._reports}))
+            return self._terminate("unverified", f"结构化报告状态不可用（{statuses}）")
+
+        if self._direct_category is not None and not self._task_seen:
+            return self._finish_direct()
+
+        if self._buffer_text().strip():
+            if self._direct_category is not None:
+                return self._terminate("unverified", "已声明直答但本轮仍调用了 task")
+            tools = f"（已见工具：{'、'.join(self._seen_tools)}）" if self._seen_tools else ""
+            return self._terminate("unverified", f"无检索证据且未声明可直接回答{tools}")
         return None
 
-    def _settle(self, reason: str) -> str | None:
-        winner = self._winner()
-        if winner is None:
+
+    def _finish_with_evidence(self, ok_reports: list[dict]) -> str | None:
+        text = self._buffer_text()
+        if not text.strip():
+            return self._terminate("unverified", "检索成功但本轮没有可校验的回答文本")
+        if text.strip() in _FIXED_COPY_TEXTS:
+            return self._terminate("unverified", "检索成功但模型输出了降级文案")
+
+        body, cited = split_answer_and_citations(text)
+        if not body.strip():
+            return self._terminate("unverified", "回答只有来源标注，没有正文")
+        if body.strip() in _FIXED_COPY_TEXTS:
+            return self._terminate("unverified", "检索成功但模型输出了降级文案")
+
+        sources = _merge_sources(ok_reports)
+        invalid = [name for name in cited if name not in sources]
+        if invalid:
+            return self._terminate(
+                "unverified", f"回答引用了本轮检索证据之外的文件：{'、'.join(invalid)}"
+            )
+
+        self._buffer.clear()
+        if cited:
+            return text
+        return (
+            f"{body}\n\n参考来源（内部知识库）："
+            f"{'、'.join(sources[:CITATION_SOURCE_LIMIT])}"
+        )
+
+    def _finish_direct(self) -> str | None:
+        text = self._buffer_text()
+        if not text.strip():
             return None
-        if winner == "kb_success":
-            if self._released:
-                return None
-            self._released = True
-            return self._flush()
-        return self._terminate(winner, reason)
+        _, cited = split_answer_and_citations(text)
+        if cited:
+            return self._terminate("unverified", "直答分支不应出现来源标注")
+        self._buffer.clear()
+        return text
+
+    def _buffer_text(self) -> str:
+        return "".join(self._buffer)
 
     def _terminate(self, winner: str, reason: str) -> str:
-        dropped = len("".join(self._buffer))
+        dropped = len(self._buffer_text())
         self._buffer.clear()
         self.terminated = True
-        print(f"[兜底] {reason}，已输出固定文案并终止本回合（丢弃模型文本 {dropped} 字）")
+        print(f"[兜底] {reason}，已输出固定文案并拦截模型文本 {dropped} 字")
         return _COPY_BY_WINNER[winner]
 
-    def _flush(self) -> str | None:
-        out = "".join(self._buffer)
-        self._buffer.clear()
-        return out or None
 
-    @staticmethod
-    def _log_if_nonstandard(text: str, sentinel: str) -> None:
-        if text.strip() != sentinel:
-            preview = text.strip().replace("\n", " ")[:60]
-            print(f"[兜底] 子代理固定短句包含附加文字，请检查检索提示词：{preview}")
-
-
-# ---------- 流包装 ----------
 
 def _chunk_text(chunk) -> str:
     """提取消息块文本，兼容 str 与内容块列表两种 content 形态。"""
@@ -168,14 +213,27 @@ def _chunk_text(chunk) -> str:
     return "" if content is None else str(content)
 
 
-def _close_stream(stream) -> None:
-    """提前终止时关闭底层流，避免继续消耗模型调用。"""
-    close = getattr(stream, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception as e:
-            print(f"[兜底] 关闭底层流失败（已忽略）: {e}")
+def _tool_calls(chunk) -> list[tuple[str | None, str | None]]:
+    """从流式 AI 消息中提取（工具名, tool_call_id），用于关联具体工具调用。"""
+    calls = []
+    for item in getattr(chunk, "tool_call_chunks", None) or []:
+        if isinstance(item, dict):
+            calls.append((item.get("name"), item.get("id")))
+        else:
+            calls.append((getattr(item, "name", None), getattr(item, "id", None)))
+    try:
+        tool_calls = getattr(chunk, "tool_calls", None) or []
+    except Exception:
+        tool_calls = []
+    for item in tool_calls:
+        if isinstance(item, dict):
+            calls.append((item.get("name"), item.get("id")))
+        else:
+            calls.append((getattr(item, "name", None), getattr(item, "id", None)))
+    return [
+        (str(name) if name else None, str(call_id) if call_id else None)
+        for name, call_id in calls
+    ]
 
 
 def _general_stream(raw_stream):
@@ -183,7 +241,6 @@ def _general_stream(raw_stream):
     for item in raw_stream:
         chunk = item[0] if isinstance(item, (tuple, list)) and len(item) == 2 else item
         text = _chunk_text(chunk)
-        # 联网异常标记由 tavily_search 记日志，这里只负责过滤工具消息，避免重复刷屏
         if getattr(chunk, "type", "") == "tool":
             continue
         if text:
@@ -193,9 +250,8 @@ def _general_stream(raw_stream):
 def guarded_stream(raw_stream, kb_only: bool = True):
     """把 Agent 的原始消息流包装为"用户可见文本流"。
 
-    输入为 (chunk, metadata) 二元组或消息块本身（LangGraph stream_mode="messages" 的形态）；
-    工具消息不产出文本：严格模式下参与回合判定，通用模式下直接过滤。
-    严格模式的降级回合由本函数直接产出固定文案并提前终止底层流。
+    严格模式先缓冲全部模型文本，回合结束后依据结构化报告统一裁决：
+    有有效证据才放行，并校验回答中的来源引用；降级回合由本函数直接产出固定文案。
     """
     if not kb_only:
         yield from _general_stream(raw_stream)
@@ -204,20 +260,26 @@ def guarded_stream(raw_stream, kb_only: bool = True):
     guard = AnswerGuard()
     for item in raw_stream:
         chunk = item[0] if isinstance(item, (tuple, list)) and len(item) == 2 else item
-        text = _chunk_text(chunk)
+        for name, call_id in _tool_calls(chunk):
+            guard.note_tool_call(name, call_id)
         if getattr(chunk, "type", "") == "tool":
-            emit = guard.feed_tool(text, getattr(chunk, "name", None))
-            if emit:
-                yield emit
-            if guard.terminated:
-                break
+            guard.feed_tool(
+                _chunk_text(chunk),
+                getattr(chunk, "name", None),
+                getattr(chunk, "tool_call_id", None),
+            )
             continue
-        emit = guard.feed_text(text)
-        if emit:
-            yield emit
-    if guard.terminated:
-        _close_stream(raw_stream)
-        return
+        guard.feed_text(_chunk_text(chunk))
+
     emit = guard.finish()
     if emit:
         yield emit
+
+
+def _merge_sources(reports: list[dict]) -> list[str]:
+    sources = []
+    for report in reports:
+        for source in report["sources"]:
+            if source not in sources:
+                sources.append(source)
+    return sources

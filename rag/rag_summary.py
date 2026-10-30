@@ -3,20 +3,27 @@ import os
 from deepagents import CompiledSubAgent
 from langchain.chat_models import init_chat_model
 from langchain.tools import tool
-from utils.answer_guard import RETRIEVAL_ERROR_MARKER
+from langchain_core.runnables import RunnableLambda
+from utils.retrieval_protocol import (
+    RETRIEVAL_EMPTY_MARKER,
+    RETRIEVAL_ERROR_MARKER,
+    STATUS_EMPTY,
+    STATUS_ERROR,
+    STATUS_OK,
+    RetrievalReport,
+    build_report_from_messages,
+    build_retrieval_artifact,
+)
 from utils.prompt_loader import render_summary_prompt
 from rag.vector_store import get_vector_store
 from utils.config_loader import agent_config
 from langchain.agents import create_agent
 from dotenv import load_dotenv
 load_dotenv()
-# 检索异常与"确实无结果"必须可区分：否则 Milvus 挂掉时用户只会看到
-# "知识库中未找到相关资料"，既误导用户，管理员侧也没有任何信号。
-# 异常时返回 RETRIEVAL_ERROR_MARKER（定义在 utils/answer_guard.py，与提示词模板同源），
-# 由子代理按提示词转成固定短句，主 Agent 侧的降级回答兜底据此接管用户可见文案。
 
 
-@tool
+
+@tool(response_format="content_and_artifact")
 def do_retrieval(query):
     """从内部知识库检索与用户问题相关的专业文档和资料。
 
@@ -26,25 +33,30 @@ def do_retrieval(query):
         query: 改写后的自包含问题，或需要检索的关键词。
 
     Returns:
-        list[str]: 检索到的文档片段列表，每项以「【来源：文件名】」开头并附片段内容
-        （来源标注供最终回答引用）；无结果时返回空列表；
-        检索服务异常时返回 [RETRIEVAL_ERROR_MARKER]。
+        tuple[str, dict]: 文本结果给模型阅读（每项以「【来源：文件名】」开头）；
+        结构化 artifact 供系统判定检索状态（ok / empty / error），其中 error
+        与 empty 严格区分。
     """
     if not isinstance(query, str) or not query.strip():
-        return []
+        return RETRIEVAL_EMPTY_MARKER, build_retrieval_artifact(STATUS_EMPTY, "", [])
     try:
         retriever = get_vector_store().get_retriever()
         docs = retriever.invoke(query)
-        return [
-            # source 元数据是文件绝对路径（入库时写入），对外只暴露文件名
-            f"【来源：{os.path.basename(str(doc.metadata.get('source', '未知来源')))}】\n{doc.page_content}"
-            for doc in docs
-        ]
     except Exception as e:
-        # 异常原文只写服务端日志，避免上游细节进入模型上下文；
-        # 用标记告诉子代理"这是检索故障，不是没有资料"
         print(f"[知识库检索] 检索失败，已向子代理返回故障标记: {e}")
-        return [RETRIEVAL_ERROR_MARKER]
+        return RETRIEVAL_ERROR_MARKER, build_retrieval_artifact(STATUS_ERROR, query, [])
+
+    chunks = []
+    for doc in docs:
+        source = os.path.basename(str(doc.metadata.get("source", "未知来源")))
+        content = str(doc.page_content or "")
+        if content.strip():
+            chunks.append((source, content))
+
+    if not chunks:
+        return RETRIEVAL_EMPTY_MARKER, build_retrieval_artifact(STATUS_EMPTY, query, [])
+    text = "\n\n".join(f"【来源：{source}】\n{content}" for source, content in chunks)
+    return text, build_retrieval_artifact(STATUS_OK, query, chunks)
 
 
 rag_summary_agent = create_agent(
@@ -54,14 +66,24 @@ rag_summary_agent = create_agent(
         base_url=agent_config["rag_summary_model_base_url"]),
     tools=[do_retrieval],
     system_prompt=render_summary_prompt(),
-    # 有意不配 checkpointer：主 Agent 经 task 工具调用子代理时会继承主 Agent 的 checkpointer
-    # （LangGraph 中继承来的 __pregel_checkpointer 优先于图自身配置），状态按
-    # thread_id + 每次调用独立的 checkpoint_ns 隔离。自带 saver 永不生效，
-    # 反而会让"主 Agent 之外单独调用"因缺少 thread_id 直接报错。
 )
+
+
+def _invoke_with_report(state):
+    """运行子代理，并用代码（而非模型文本）生成结构化检索报告。"""
+    result = rag_summary_agent.invoke(state)
+    if isinstance(result, dict) and isinstance(result.get("messages"), list):
+        result = dict(result)
+        result["structured_response"] = RetrievalReport(
+            **build_report_from_messages(result["messages"])
+        )
+    return result
+
+
+structured_rag_summary_agent = RunnableLambda(_invoke_with_report)
 
 rag_summary_subagents = CompiledSubAgent(
     name="rag_summary_subagents",
     description="知识库检索专家。专门用于从内部向量数据库中检索专业文档、技术资料和知识库内容。当用户询问任何需要查阅内部资料的问题时（如特定概念解释、文档查询、专业知识等），必须首先调用此子代理。它会自动检索相关文档并生成基于知识库的准确回答。",
-    runnable=rag_summary_agent,
+    runnable=structured_rag_summary_agent,
 )

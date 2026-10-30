@@ -14,8 +14,6 @@ from utils.path_tool import get_abs_path
 from dotenv import load_dotenv
 load_dotenv()
 
-# DashScopeEmbeddings 把单次请求的输入条数硬编码在模块级 BATCH_SIZE 表（未登记的模型默认 25），
-# 且该库升级/重装时整表还原。这里用配置覆盖当前模型的表项，使批大小随项目配置持久生效。
 _embedding_batch_size = vector_db_config.get("embedding_batch_size")
 if _embedding_batch_size:
     _dashscope_embeddings.BATCH_SIZE[vector_db_config["embedding_model"]] = int(_embedding_batch_size)
@@ -23,12 +21,9 @@ if _embedding_batch_size:
 _vector_store_instance: VectorStore | None = None
 _lock: threading.Lock = threading.Lock()
 
-# 单文件入库闭环参数：失败后删向量重建的最大次数与重试间隔（秒）
 _INDEX_MAX_ATTEMPTS = 3
 _INDEX_RETRY_SLEEP = 1.0
 
-# 入库失败的对外文案：意外异常的原文可能含 Milvus 连接串、主机名等内部信息，只写服务端日志，
-# 接口回传统一用此文案；已知原因（类型不支持 / 加载失败 / 校验条数不符）仍如实返回，便于管理员定位
 _INDEX_FAIL_GENERIC = "入库失败，详见服务端日志"
 
 
@@ -61,8 +56,6 @@ class VectorStore:
             length_function=len,
         )
         self._retriever = self.vector_store.as_retriever(search_kwargs={"k": vector_db_config["k"]})
-        # 入库/删除互斥锁（可重入，index_file 内部也会获取）：
-        # 防止并发构建或"构建-删除"交错导致同一文件重复入库
         self._store_lock = threading.RLock()
 
     def get_retriever(self):
@@ -99,7 +92,6 @@ class VectorStore:
                     failures.append({"file": f, "error": _INDEX_FAIL_GENERIC})
         return failures
 
-    # ---------- 单文件入库闭环 ----------
 
     def index_file(self, file_path: str) -> dict:
         """单文件入库闭环：切分 → 写入向量 → 写 md5 记录 → 立即校验。
@@ -111,11 +103,11 @@ class VectorStore:
         自己构成一个小闭环，不依赖定时自检兜底。
         """
         file_path = get_abs_path(file_path)
+        # 写向量、MD5 记录和校验必须在同一把进程内锁下完成。
         with self._store_lock:
             md5_hex = get_file_md5_hex(file_path)
             if md5_hex is None:
                 return {"file": file_path, "chunks": None, "ok": False, "error": "MD5 计算失败"}
-            # 已被其他流程完成入库则幂等跳过（并发构建/上传时防重复写入）
             if check_file_md5_hex_in_file(md5_hex):
                 return {"file": file_path, "chunks": None, "ok": True, "error": None}
             loader = choose_loader(file_path)
@@ -142,7 +134,6 @@ class VectorStore:
                         f"[向量库] 入库失败 name={os.path.basename(file_path)}"
                         f" 第 {attempt}/{_INDEX_MAX_ATTEMPTS} 次尝试: {e}"
                     )
-                # 补偿清理：删除该文件全部向量与 md5 记录后重试，保证下次写入不重复
                 self.delete_by_source(file_path)
                 if check_file_md5_hex_in_file(md5_hex):
                     remove_file_md5_hex_from_file(md5_hex)
@@ -173,8 +164,6 @@ class VectorStore:
         if client is not None:
             client.flush(self.vector_store.collection_name)
 
-    # Milvus 的 query() 有 offset + limit ≤ 16384 的硬上限，固定页大小 + 递增 offset 翻页
-    # 在数据量涨上去后必然报错（invalid max query result window）。游标迭代器没有该上限。
     _ITER_BATCH_SIZE = 1000
 
     def pks_by_source(self, file_path: str) -> list:
@@ -242,20 +231,16 @@ class VectorStore:
 
         with self._store_lock:
             survivor = self._another_file_with_same_content(file_path, md5_hex) if md5_hex else None
-            # 内容级去重：仅当磁盘上已无同内容文件时才移除入库记录，
-            # 否则删掉副本会连带把原文件误标成「未入库」（向量其实还在）
             drop_record = bool(md5_hex) and survivor is None
             if drop_record:
                 try:
                     remove_file_md5_hex_from_file(md5_hex)
                 except Exception:
-                    # 瞬时故障重试一次；仍失败则抛出，此刻记录、向量、文件均未动，无部分状态
                     remove_file_md5_hex_from_file(md5_hex)
 
             try:
                 deleted = self.delete_by_source(file_path)
             except Exception:
-                # 回滚：恢复本次移除的入库记录，使文件保持"可检索"的一致状态
                 if drop_record:
                     try:
                         add_file_md5_hex_to_file(md5_hex)
@@ -267,16 +252,11 @@ class VectorStore:
                         )
                 raise
 
-            # 删掉的正是持有向量的那一份，且磁盘上还有同内容副本：
-            # 向量已随之消失，若只保留记录就会变成 missing_vectors（界面显示「已入库」
-            # 但实际检索不到）。这里立即以副本重新入库，维持「磁盘上还有同内容 ⇒ 仍可检索」。
             if deleted and survivor is not None:
-                # 先摘掉记录：index_file 见到记录会幂等跳过，那样等于没重建
                 remove_file_md5_hex_from_file(md5_hex)
                 result = self.index_file(survivor)
                 if result["ok"]:
                     print(f"[向量库] 已用同内容副本重建向量 name={os.path.basename(survivor)}")
                 else:
-                    # 重建失败：把记录放回，让自检按 missing_vectors 自动重试
                     add_file_md5_hex_to_file(md5_hex)
                     print(f"[向量库] 同内容副本重建向量失败 name={os.path.basename(survivor)}: {result['error']}")

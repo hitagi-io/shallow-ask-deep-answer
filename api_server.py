@@ -37,31 +37,21 @@ from auth import (
     delete_conversation,
 )
 
-# ---------- 并发与部署参数 ----------
-# 线程池上限：同步端点与 SSE 流式生成器都占用它，每个活跃对话流约占用 1 个线程，
-# 因此该值应不小于目标并发流数（anyio 默认仅 40，是单进程并发的真实天花板）
+# 流式回答也占用线程池；该值应覆盖预期的同时在线流数。
 THREADPOOL_SIZE = int(os.getenv("THREADPOOL_SIZE", "200"))
-# 工作进程数：>1 时需核算 PG 连接总量（见启动检查），并依赖咨询锁保证定时任务单实例
 UVICORN_WORKERS = int(os.getenv("UVICORN_WORKERS", "1"))
-# 交互式文档 /docs、/redoc 与 /openapi.json 默认关闭：公网可达会暴露完整接口清单与数据模型
 ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "false").lower() in ("1", "true", "yes")
 
-# 输入边界：超限由 Pydantic 直接拒绝（422），不会打到模型上下文、也不会撞数据库列宽变成 500
 CHAT_MESSAGE_MAX_CHARS = int(os.getenv("CHAT_MESSAGE_MAX_CHARS", "8000"))
 CHAT_THREAD_ID_MAX_CHARS = 128
 CONV_TITLE_MAX_CHARS = 255   # 与 conversations.title VARCHAR(255) 对齐
 MESSAGE_STATUS_VALUES = ("streaming", "completed", "error")
 
-# 对话接口按用户限流：单次调用会触发多轮 LLM 与外部 API，不限流时可被单账号刷额度与线程池
 CHAT_RATE_LIMIT = int(os.getenv("CHAT_RATE_LIMIT", "30"))
 CHAT_RATE_WINDOW_SECONDS = int(os.getenv("CHAT_RATE_WINDOW_SECONDS", "60"))
-# 单用户并发对话上限：每个活跃流占 1 个线程池线程，只限频率挡不住同时开多个流。
-# 计数在进程内（UVICORN_WORKERS=1 时精确；多 worker 时各进程独立计数，属近似值）
 MAX_CONCURRENT_CHAT_PER_USER = int(os.getenv("MAX_CONCURRENT_CHAT_PER_USER", "3"))
-# 单个流的最长存活时间（秒）：兜底清理客户端断开时未及释放的槽位
 CHAT_SLOT_MAX_AGE_SECONDS = int(os.getenv("CHAT_SLOT_MAX_AGE_SECONDS", "1800"))
 
-# 注：JWT_SECRET 缺失由 auth.py 在导入时直接拒绝启动（含单进程），此处无需重复校验。
 
 
 def _warn_connection_budget() -> None:
@@ -86,7 +76,6 @@ def _warn_connection_budget() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # 必须在事件循环内设置，anyio 的默认线程池限流器随循环创建
     anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_SIZE
     print(f"[启动] 线程池上限 {THREADPOOL_SIZE}，工作进程数 {UVICORN_WORKERS}")
     _warn_connection_budget()
@@ -110,20 +99,15 @@ index_health = IndexHealth()
 knowledge_dir = get_abs_path(vector_db_config["knowledge_dir"])
 allowed_types = vector_db_config["allowed_types"]
 
-# 单文件上传大小上限（MB）：上传按块写入并即时校验，避免超大文件整块读入内存
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
 
 init_db()
 
 
-# ---------- 索引健康自检 + 自愈（后台定时执行，发现问题即自动修复） ----------
 
 _health_report: dict | None = None
 _health_report_at: float = 0.0
 
-# 健康报告缓存的时效（秒）：多 worker 下各进程各存一份，若不设时效，会出现
-# 某个 worker 一直返回几小时前的旧报告、另一个 worker 现算一份新的。
-# 超过该时长即视为过期并重新自检，把各 worker 之间的判定标准差异限制在该时长内。
 HEALTH_REPORT_TTL_SECONDS = int(os.getenv("HEALTH_REPORT_TTL_SECONDS", "120"))
 
 
@@ -134,23 +118,14 @@ def _set_health_report(report: dict) -> None:
     _health_report_at = time.monotonic()
 
 
-# 自检/自愈的单实例咨询锁键，以及非持有者的锁竞争轮询间隔（秒）
 _PG_LOCK_KEY_HEALTH = 0x64656570
 _HEALTH_LEADER_POLL_SECONDS = 60
 
-# 索引写操作的跨进程互斥锁键：上传入库、删除文件、构建、修复都会写 Milvus 与 md5.txt，
-# 而 VectorStore._store_lock / md5_lock / IndexHealth._lock 全是进程内锁，多 worker 下
-# 不同进程会并发写、互相覆盖，必须再套一层 PG 咨询锁。
-# 注：持锁期间额外占用一个 PG 连接（与业务连接池相互独立）。
+# 进程内锁无法协调多 worker，所有索引写操作还要持有这把 PG 锁。
 _PG_LOCK_KEY_INDEX_WRITE = 0x64656572
 
-# 等待索引写锁的上限（秒）：持锁段内含外部 embedding 调用，若某个持锁者阻塞不返回，
-# 无限等待会让其余写请求各自占住一个线程池线程与一条 PG 连接，最终拖慢整个服务。
-# 超时后请求快速失败（503），把压力交还给客户端重试。
 INDEX_WRITE_LOCK_TIMEOUT_SECONDS = int(os.getenv("INDEX_WRITE_LOCK_TIMEOUT_SECONDS", "300"))
 
-# 自检（只读）等待写锁的上限（秒）：与写锁同一考量——写操作持锁时长不可控，
-# 共享锁无限等待会让检查请求长时间无响应并占住线程与连接；超时同样返回 503
 INDEX_READ_LOCK_TIMEOUT_SECONDS = int(os.getenv("INDEX_READ_LOCK_TIMEOUT_SECONDS", "30"))
 
 
@@ -185,7 +160,6 @@ def _auto_heal_report() -> dict:
     停止条件：report['healthy'] 为 True。Milvus 不可达或修复异常时立即终止，
     等待下一轮自检再试。
     """
-    # 整段（自检 + 修复 + 复查）持有索引写锁，与手动的修复/上传/构建互斥
     with _index_write_section():
         max_rounds = int(vector_db_config.get("health_auto_repair_max_rounds", 3))
         report = index_health.check()
@@ -196,7 +170,6 @@ def _auto_heal_report() -> dict:
                 print("[索引自愈] 无法连接 Milvus，跳过本轮修复")
                 break
             try:
-                # repair() 内部自带一次全新 check，返回修复摘要 + 修复后报告
                 report = index_health.repair()
                 repair = report.get("repair") or {}
                 print(f"[索引自愈] 修复完成：{_format_repair_summary(repair)}")
@@ -217,10 +190,6 @@ async def _scheduled_health_loop():
     next_run = 0.0
     was_leader = False
     while True:
-        # 每轮都重新核验持锁状态，不能只在"还不是 leader"时才争锁：
-        # leader 的专用连接若被 PG 重启/网络抖动静默断开，服务端已释放咨询锁、
-        # 别的 worker 可能已接管，本进程必须立即退出，否则会出现两个 leader 同时自愈。
-        # try_acquire 在已持有时会做一次 SELECT 1 往返来暴露这种静默断开。
         is_leader = await asyncio.to_thread(guard.try_acquire)
         if is_leader != was_leader:
             print(
@@ -241,12 +210,10 @@ async def _scheduled_health_loop():
         next_run = time.monotonic() + interval
 
 
-# ---------- 请求模型 ----------
 
 class ChatRequest(BaseModel):
     message: str = Field(max_length=CHAT_MESSAGE_MAX_CHARS)
     thread_id: str = Field(max_length=CHAT_THREAD_ID_MAX_CHARS)
-    # 默认开启「仅知识库」：零训练知识、零联网、仅凭知识库回答；关闭后为通用模式
     kb_only: bool = True
 
 
@@ -274,7 +241,6 @@ class AppendMessageRequest(BaseModel):
     status: str | None = None
 
 
-# ---------- 认证依赖 ----------
 
 def get_current_user(authorization: str = Header(None)) -> dict:
     """从 Authorization header 中解析 JWT，验签后复核账号存续与角色。
@@ -304,21 +270,18 @@ def require_admin(user: dict = Depends(get_current_user)) -> dict:
     return user
 
 
-# ---------- 健康检查 ----------
 
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
 
 
-# ---------- 账户 API ----------
 
 @app.post("/api/auth/register")
 def api_register(req: RegisterRequest, request: Request):
     client_ip = request.client.host if request.client else None
     result = register(req.username, req.password, client_ip)
     if not result["ok"]:
-        # 限流用 429，与"参数不合法"的 400 区分开
         raise HTTPException(
             status_code=429 if result.get("rate_limited") else 400, detail=result["error"]
         )
@@ -330,7 +293,6 @@ def api_login(req: LoginRequest, request: Request):
     client_ip = request.client.host if request.client else None
     result = login(req.username, req.password, client_ip)
     if not result["ok"]:
-        # 限流用 429，与"用户名或密码错误"的 401 区分开
         raise HTTPException(
             status_code=429 if result.get("rate_limited") else 401, detail=result["error"]
         )
@@ -342,7 +304,6 @@ def api_me(user: dict = Depends(get_current_user)):
     return {"user": {"id": user["user_id"], "username": user["username"], "role": user["role"]}}
 
 
-# ---------- 会话管理 API（需登录） ----------
 
 @app.get("/api/conversations")
 def api_list_conversations(user: dict = Depends(get_current_user)):
@@ -351,8 +312,6 @@ def api_list_conversations(user: dict = Depends(get_current_user)):
 
 @app.post("/api/conversations")
 def api_create_conversation(req: CreateConversationRequest, user: dict = Depends(get_current_user)):
-    # 会话 id 一律由服务端生成：客户端不再能指定，既避免非法/他人 id 撞列宽或唯一约束，
-    # 也消除"用创建接口探测某个会话 id 是否存在"的信息泄露面
     conv_id = str(uuid.uuid4())
     if not create_conversation(user["user_id"], conv_id, req.title):
         raise HTTPException(status_code=500, detail="创建会话失败，请稍后重试")
@@ -370,7 +329,6 @@ def api_update_title(conv_id: str, req: UpdateTitleRequest, user: dict = Depends
 def api_append_message(conv_id: str, req: AppendMessageRequest, user: dict = Depends(get_current_user)):
     if req.role not in ("user", "assistant"):
         raise HTTPException(status_code=400, detail="非法的消息角色")
-    # status 直接写入数据库（messages.status VARCHAR(20)），不校验会让任意值/超长值进入或触发 500
     if req.status is not None and req.status not in MESSAGE_STATUS_VALUES:
         raise HTTPException(status_code=400, detail="非法的消息状态")
     if not append_message(user["user_id"], conv_id, req.role, req.content, req.status):
@@ -381,8 +339,6 @@ def api_append_message(conv_id: str, req: AppendMessageRequest, user: dict = Dep
 @app.delete("/api/conversations/{conv_id}")
 def api_delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
     thread_id = f"{user['user_id']}:{conv_id}"
-    # 先清理 LangGraph 检查点（瞬时故障自动重试 3 次）；
-    # 仍失败则中止删除并返回 500，会话与检查点均保留，避免"会话已删但检查点残留"
     last_err = None
     for attempt in range(3):
         try:
@@ -396,14 +352,11 @@ def api_delete_conversation(conv_id: str, user: dict = Depends(get_current_user)
     if last_err is not None:
         raise HTTPException(status_code=500, detail="清理会话上下文失败，请稍后重试")
     if not delete_conversation(user["user_id"], conv_id):
-        # 会话不存在：删除不存在的检查点线程为幂等操作，直接返回 404
         raise HTTPException(status_code=404, detail="会话不存在")
     return {"message": "ok"}
 
 
-# ---------- 对话 API（需登录） ----------
 
-# 单用户并发对话槽位：user_id -> {token: 起始时刻}
 _chat_slots: dict[int, dict[int, float]] = {}
 _chat_slot_seq = itertools.count(1)
 _chat_slots_lock = threading.Lock()
@@ -445,7 +398,6 @@ def _release_chat_slot(user_id: int, token: int) -> None:
 async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="消息不能为空")
-    # 按用户限流：单次调用会触发多轮 LLM 与外部 API，无限制时可被单账号刷额度与线程池
     if not await asyncio.to_thread(
         check_rate, "chat", str(user["user_id"]), CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_SECONDS
     ):
@@ -455,8 +407,6 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=429, detail="并发回答数过多，请等待当前回答完成")
 
     async def generate():
-        # 上游是同步生成器（模型流式输出），必须在工作线程里逐段拉取，
-        # 不能在事件循环里阻塞迭代；逐块 await 也保证"客户端中止"的取消能送达本生成器
         stream = agent.ask_deep_agent(req.message, f"{user['user_id']}:{req.thread_id}", kb_only=req.kb_only)
         sentinel = object()
 
@@ -474,19 +424,12 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
         except Exception as e:
-            # 异常细节只落服务端日志：直接回传会泄露内部主机名、连接信息与上游错误原文
             print(f"[对话流] 回答失败 thread={user['user_id']}:{req.thread_id}: {e}")
             yield f"data: {json.dumps({'error': '服务处理异常，请稍后重试'}, ensure_ascii=False)}\n\n"
         finally:
-            # 客户端中止（点"停止"或断开连接）时 Starlette 会取消本生成器：
-            # 必须是"异步"生成器，取消才会在 await 点送达并走到这里；同步生成器被取消时
-            # finally 不会执行（只能等 GC 或 30 分钟兜底），槽位不释放——中止几次后
-            # 就会误报"并发回答数过多"。这里先尽力关闭上游以停止模型调用，再释放槽位。
             try:
                 stream.close()
             except ValueError:
-                # 工作线程正卡在 next() 上时 close 会报"already executing"；
-                # 该线程返回后上游随引用释放自行结束，不强求
                 pass
             except Exception as e:
                 print(f"[对话流] 关闭上游生成器失败（已忽略）: {e}")
@@ -495,17 +438,14 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-# ---------- 知识库 API（仅管理员） ----------
 
 @app.get("/api/files")
 def list_files(user: dict = Depends(require_admin)):
     os.makedirs(knowledge_dir, exist_ok=True)
     files = list_files_with_allowed_type(knowledge_dir, tuple(allowed_types))
-    # md5.txt 只读一次按集合比对，避免逐文件重新扫描整个记录文件
     indexed_set = read_md5_set()
     items = []
     for f in files:
-        # MD5 按 (大小, mtime) 命中缓存，未改动的文件不会重复整读
         md5_hex = get_file_md5_hex(f)
         indexed = bool(md5_hex) and md5_hex in indexed_set
         items.append({"name": os.path.basename(f), "path": f, "indexed": indexed})
@@ -542,18 +482,9 @@ async def upload_files(files: list[UploadFile] = File(...), user: dict = Depends
         try:
             dest = os.path.join(knowledge_dir, name)
             overwritten = os.path.exists(dest)
-            # 先分块写临时文件（无扩展名，不会被扫描入库，且边写边校验大小上限），
-            # 成功后再删旧向量并原子替换。
-            # 写 tmp 或删向量失败：旧文件/旧向量/旧记录均不受影响；
-            # 原子替换失败：磁盘旧文件保留，向量与记录已清理，处于干净的
-            # 「未入库」状态（非场景1/3 异态），重新构建即可恢复
             tmp_path = os.path.join(knowledge_dir, f".tmp_{uuid.uuid4().hex}")
             try:
                 await _write_upload_to(f, tmp_path)
-                # 删旧向量 → 原子替换 → 入库闭环（写入后当场校验，失败会删向量重建复验），
-                # 整段持索引写锁：多 worker 下别的进程可能正在修复/构建，不加锁会并发写向量与 md5.txt。
-                # 该段含外部嵌入调用与向量写入，阻塞时间长，必须放线程执行，
-                # 否则上传期间会冻结所有用户的流式回答
                 index_result = await asyncio.to_thread(_replace_and_index, tmp_path, dest, overwritten)
             finally:
                 if os.path.exists(tmp_path):
@@ -567,12 +498,9 @@ async def upload_files(files: list[UploadFile] = File(...), user: dict = Depends
                 "error": None if index_result["ok"] else index_result["error"],
             })
         except TimeoutError as e:
-            # 索引写锁等待超时：别的进程正持锁做长操作，别让这个请求长时间无响应
             print(f"[知识库] 上传失败 name={name}: 等待索引写锁超时（{e}）")
             errors.append({"name": name, "error": "索引正被其他操作占用，请稍后重试"})
         except Exception as e:
-            # 预期外异常的原文只写日志（可能含绝对路径、Milvus 连接信息）；
-            # 文件级入库失败原因已在 index_result["error"] 中分类返回
             print(f"[知识库] 上传失败 name={name}: {e}")
             errors.append({"name": name, "error": "上传失败，详见服务端日志"})
     return {"uploaded": uploaded, "errors": errors}
@@ -586,24 +514,15 @@ def delete_file(filename: str, user: dict = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="文件不存在")
     try:
         with _index_write_section():
-            # 先取 md5 再删磁盘文件：删完就取不到了，而删向量与记录时都需要它。
-            # 顺序也很关键——先删文件，失败时向量与记录都还没动，状态完全未变；
-            # 若反过来先删向量与记录，os.remove 失败（Windows 下文件被占用）就会留下
-            # 「文件还在、却已未入库」——这既不是 missing_vectors 也不是明明缺记录，
-            # 自检不会认、也不会修，提示却写着"删除失败"，对管理员是误导。
             md5_hex = get_file_md5_hex(file_path)
             os.remove(file_path)
-            # 文件已删；此处若失败只会留下 ghost 向量（磁盘无对应文件），
-            # 属于自检能识别并按 ghost_vectors 清理的状态
             vector_store.delete_file(file_path, md5_hex)
         return {"message": f"已删除: {safe_name}"}
     except TimeoutError as e:
         print(f"[知识库] 删除失败 name={safe_name}: 等待索引写锁超时（{e}）")
         raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
     except Exception as e:
-        # 异常细节只落服务端日志：直接回传会泄露 Milvus 连接串、主机名与上游错误原文
         if os.path.exists(file_path):
-            # 磁盘文件还在，说明失败在"删文件"这一步，索引侧尚未改动
             print(f"[知识库] 删除失败 name={safe_name}: 磁盘文件未删除，向量与入库记录未改动（{e}）")
             raise HTTPException(status_code=500, detail="删除文件失败，请确认文件未被其他程序占用后重试")
         print(f"[知识库] 删除后清理失败 name={safe_name}: 磁盘文件已删除，向量与入库记录未清理（{e}），需执行索引修复")
@@ -636,10 +555,6 @@ def get_index_health(refresh: bool = False, user: dict = Depends(require_admin))
     """返回最近一次自检报告；refresh=1 时立即执行一次全新检查。"""
     if refresh or _health_report is None or time.monotonic() - _health_report_at > HEALTH_REPORT_TTL_SECONDS:
         try:
-            # 只读自检用共享锁：与正在进行的写（上传/删除/构建/修复）互斥，
-            # 避免读到写了一半的状态；多个并发自检彼此不阻塞。
-            # 等待带上限（INDEX_READ_LOCK_TIMEOUT_SECONDS）：写持锁时长不可控，
-            # 无限等待会让检查请求长时间无响应并占住线程池线程与 PG 连接
             with shared_section(PG_CONN, _PG_LOCK_KEY_INDEX_WRITE, INDEX_READ_LOCK_TIMEOUT_SECONDS):
                 _set_health_report(index_health.check())
         except TimeoutError as e:
@@ -670,8 +585,6 @@ def repair_index_health(user: dict = Depends(require_admin)):
 
 if __name__ == "__main__":
     import uvicorn
-    # 生产不使用 reload（文件监听会额外起进程并拖慢吞吐）。
-    # workers>1 时每个进程各自持有连接池，启动检查会核算 PG 连接总量。
     uvicorn.run(
         "api_server:app",
         host=os.getenv("HOST", "0.0.0.0"),

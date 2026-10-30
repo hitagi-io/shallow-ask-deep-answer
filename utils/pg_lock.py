@@ -11,8 +11,6 @@ from contextlib import contextmanager
 
 import psycopg
 
-# 启动期 DDL 串行化锁键：建检查点表（main_deep_agent）与建业务表（auth.init_db）共用，
-# 多 worker 同时启动时避免并发 DDL 冲突
 PG_LOCK_KEY_SETUP = 0x64656571
 
 
@@ -30,7 +28,6 @@ def exclusive_section(conninfo: str, lock_key: int, timeout_seconds: float | Non
             if timeout_seconds is None:
                 cur.execute("SELECT pg_advisory_lock(%s)", (lock_key,))
             else:
-                # 用 set_config 而不是 SET：SET 不接受参数占位符
                 cur.execute(
                     "SELECT set_config('lock_timeout', %s, false)",
                     (str(int(timeout_seconds * 1000)),),
@@ -99,10 +96,6 @@ class SingleInstanceGuard:
     def try_acquire(self) -> bool:
         """尝试成为执行者；已持有时先用一次轻量往返确认会话仍然有效。"""
         if self._held and self._conn is not None and not self._conn.closed:
-            # 不能只凭 _held 直接返回 True：连接若被静默断开（网络抖动、PG 重启、
-            # 中间设备断开空闲连接），服务端的会话级锁已释放、别的进程可能已获得，
-            # 而本进程仍以为自己是执行者 —— 会出现两个 leader 同时跑定时任务。
-            # 这里做一次往返探测，连接已死则关闭并重新竞争。
             try:
                 with self._conn.cursor() as cur:
                     cur.execute("SELECT 1")
@@ -113,11 +106,9 @@ class SingleInstanceGuard:
                 except Exception:
                     pass
                 self._conn = None
-        # 连接已断开时锁随会话释放，需要重新竞争
         self._held = False
         try:
             if self._conn is None or self._conn.closed:
-                # 专用长连接：锁的存续完全跟随该会话
                 self._conn = psycopg.connect(self._conninfo, autocommit=True)
             with self._conn.cursor() as cur:
                 cur.execute("SELECT pg_try_advisory_lock(%s)", (self._lock_key,))

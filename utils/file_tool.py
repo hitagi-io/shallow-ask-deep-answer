@@ -6,16 +6,9 @@ from os import listdir
 from langchain_community.document_loaders import TextLoader, PyPDFLoader, Docx2txtLoader
 from utils.path_tool import get_abs_path
 
-# md5.txt 的全局读写锁，index_health 等模块复用同一把锁，防止并发读写损坏文件
 md5_lock = threading.RLock()
 
-# 日志约定：只输出异常与一次性状态变更（如目录自动创建）；逐文件例行成功状态、
-# 幂等空操作（如删除本就不存在的入库记录）一律不打印——这些调用在构建/自检时按文件数放大，
-# 会把日志刷掉。统一格式为 "[模块] 事件 path=...: 详情"。
 
-# 文件 MD5 缓存：路径 -> (大小, mtime_ns, md5)
-# 列表接口、健康自检等会反复对同一批文件求 MD5，按 stat 命中可避免每次重读整个文件；
-# 文件被改动后大小或 mtime 变化即自动失效重算。
 _md5_cache: dict[str, tuple[int, int, str]] = {}
 _md5_cache_lock = threading.Lock()
 _MD5_CACHE_MAX_ENTRIES = 20000
@@ -88,12 +81,10 @@ def remove_file_md5_hex_from_file(md5_hex):
     md5txt_file_path = get_abs_path(os.path.join("md5.txt"))
     with md5_lock:
         if not os.path.exists(md5txt_file_path):
-            # md5.txt 尚不存在时删除记录属幂等空操作，不打印
             return
         with open(md5txt_file_path, "r", encoding='utf-8') as f:
             lines = f.readlines()
         new_lines = [line for line in lines if line.strip() != md5_hex]
-        # 原子替换：先写临时文件再 rename，避免中途失败截断损坏 md5.txt
         tmp_path = md5txt_file_path + ".tmp"
         with open(tmp_path, "w", encoding='utf-8') as f:
             f.writelines(new_lines)
@@ -133,5 +124,4 @@ def choose_loader(file_path):
     elif ext == ".docx":
         return docx_loader
     else:
-        # 调用方（VectorStore.index_file）会返回"不支持的文件类型"并记录失败，此处不再重复打印
         return
