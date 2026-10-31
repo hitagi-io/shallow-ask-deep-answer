@@ -11,7 +11,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, R
 
 import anyio
 import psycopg
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from main_deep_agent import MainDeepAgent, PG_CHECKPOINT_POOL_MAX
@@ -69,6 +69,9 @@ CHAT_GENERATION_STALE_SECONDS = max(
 )
 
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+# 就绪检查的依赖探测超时（秒）：PG 建连与 Milvus RPC 都受此限制，避免探针长期占用线程池。
+READINESS_TIMEOUT_SECONDS = max(float(os.getenv("READINESS_TIMEOUT_SECONDS", "3")), 0.5)
 
 
 
@@ -287,9 +290,54 @@ def require_admin(user: dict = Depends(get_current_user)) -> dict:
 
 
 
+def _probe_postgres() -> dict:
+    """独立建连执行 SELECT 1，不占用业务连接池。"""
+    started = time.perf_counter()
+    try:
+        with psycopg.connect(
+            PG_CONN, connect_timeout=max(int(READINESS_TIMEOUT_SECONDS), 1)
+        ) as conn:
+            conn.execute("SELECT 1")
+        return {"ok": True, "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
+    except Exception as e:
+        print(f"[就绪检查] PostgreSQL 不可用: {e}")
+        return {
+            "ok": False,
+            "error": "数据库不可用",
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+
+
+def _probe_milvus() -> dict:
+    """复用检索实际使用的 Milvus 连接做一次轻量调用。"""
+    started = time.perf_counter()
+    try:
+        vector_store.vector_store.client.list_collections(timeout=READINESS_TIMEOUT_SECONDS)
+        return {"ok": True, "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
+    except Exception as e:
+        print(f"[就绪检查] Milvus 不可用: {e}")
+        return {
+            "ok": False,
+            "error": "向量库不可用",
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+
+
 @app.get("/api/health")
 def health():
+    """存活检查：只证明进程能响应请求，不探测任何外部依赖。"""
     return {"status": "ok"}
+
+
+@app.get("/api/health/ready")
+def readiness():
+    """就绪检查：探测 PostgreSQL 与 Milvus，任一不可用返回 503。"""
+    checks = {"postgres": _probe_postgres(), "milvus": _probe_milvus()}
+    ready = all(item["ok"] for item in checks.values())
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "ready" if ready else "not_ready", "checks": checks},
+    )
 
 
 

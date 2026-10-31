@@ -118,7 +118,7 @@ python -c "import secrets; print(secrets.token_hex(32))"
 python api_server.py
 ```
 
-默认监听 `0.0.0.0:8000`，启动时会自动初始化数据库。健康检查接口为 `GET /api/health`。
+默认监听 `0.0.0.0:8000`，启动时会自动初始化数据库。存活检查为 `GET /api/health`（只表示进程可响应）；就绪检查为 `GET /api/health/ready`，会探测 PostgreSQL 与 Milvus，任一不可用返回 503，适合用于容器 `readinessProbe`。
 
 在另一个终端启动前端：
 
