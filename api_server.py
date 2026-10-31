@@ -152,13 +152,15 @@ def _index_write_section():
     return exclusive_section(PG_CONN, _PG_LOCK_KEY_INDEX_WRITE, INDEX_WRITE_LOCK_TIMEOUT_SECONDS)
 
 
-def _replace_and_index(tmp_path: str, dest: str, overwritten: bool) -> dict:
-    """原子替换 + 入库，整段持有索引写锁。"""
+def _replace_and_index(tmp_path: str, dest: str) -> dict:
+    """原子替换 + 入库，整段持有索引写锁。
+
+    "是否存在同名文件"与替换、入库在同一互斥段内判定，并发上传同名文件时
+    后进入者能看到前一个请求的落地结果，不会把覆盖误判成新建。
+    新版本入库并校验通过后才清理旧向量；失败则回滚磁盘文件，旧索引保持可用。
+    """
     with _index_write_section():
-        if overwritten:
-            vector_store.delete_file(dest)
-        os.replace(tmp_path, dest)
-        return vector_store.index_file(dest)
+        return vector_store.replace_file(dest, tmp_path)
 
 
 def _format_repair_summary(repair: dict) -> str:
@@ -695,11 +697,10 @@ async def upload_files(files: list[UploadFile] = File(...), user: dict = Depends
             continue
         try:
             dest = os.path.join(knowledge_dir, name)
-            overwritten = os.path.exists(dest)
             tmp_path = os.path.join(knowledge_dir, f".tmp_{uuid.uuid4().hex}")
             try:
                 await _write_upload_to(f, tmp_path)
-                index_result = await asyncio.to_thread(_replace_and_index, tmp_path, dest, overwritten)
+                index_result = await asyncio.to_thread(_replace_and_index, tmp_path, dest)
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
@@ -707,7 +708,7 @@ async def upload_files(files: list[UploadFile] = File(...), user: dict = Depends
                 print(f"[知识库] 入库失败 name={name}: {index_result['error']}")
             uploaded.append({
                 "name": name,
-                "overwritten": overwritten,
+                "overwritten": index_result["overwritten"],
                 "indexed": index_result["ok"],
                 "error": None if index_result["ok"] else index_result["error"],
             })

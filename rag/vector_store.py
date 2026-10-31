@@ -3,6 +3,7 @@ from __future__ import annotations
 import os.path
 import time
 import threading
+import uuid
 from langchain_community.embeddings import DashScopeEmbeddings
 import langchain_community.embeddings.dashscope as _dashscope_embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -93,7 +94,7 @@ class VectorStore:
         return failures
 
 
-    def index_file(self, file_path: str) -> dict:
+    def index_file(self, file_path: str, previous_pks: list | None = None) -> dict:
         """单文件入库闭环：切分 → 写入向量 → 写 md5 记录 → 立即校验。
 
         校验标准：Milvus 中该 source 的条数 == 切块数，且 md5.txt 含该记录；
@@ -101,8 +102,12 @@ class VectorStore:
         `_INDEX_MAX_ATTEMPTS` 次。成功返回 {'ok': True, 'chunks': n}；
         失败返回 {'ok': False, 'error': ...}，不抛异常。每个文件入库
         自己构成一个小闭环，不依赖定时自检兜底。
+
+        `previous_pks` 为覆盖上传时旧版本已占用的主键：校验只统计本次新增的
+        向量，失败清理也只删本次新增的部分，旧版本在切换完成前保持可检索。
         """
         file_path = get_abs_path(file_path)
+        previous = set(previous_pks or ())
         # 写向量、MD5 记录和校验必须在同一把进程内锁下完成。
         with self._store_lock:
             md5_hex = get_file_md5_hex(file_path)
@@ -125,7 +130,7 @@ class VectorStore:
                 try:
                     self.vector_store.add_documents(split_doc)
                     add_file_md5_hex_to_file(md5_hex)
-                    if self._verify_indexed(file_path, md5_hex, len(split_doc)):
+                    if self._verify_indexed(file_path, md5_hex, len(split_doc), previous):
                         return {"file": file_path, "chunks": len(split_doc), "ok": True, "error": None}
                     last_err = f"校验未通过（Milvus 条数 ≠ 切块数 {len(split_doc)}）"
                 except Exception as e:
@@ -134,29 +139,34 @@ class VectorStore:
                         f"[向量库] 入库失败 name={os.path.basename(file_path)}"
                         f" 第 {attempt}/{_INDEX_MAX_ATTEMPTS} 次尝试: {e}"
                     )
-                self.delete_by_source(file_path)
+                self._delete_added_pks(file_path, previous)
                 if check_file_md5_hex_in_file(md5_hex):
                     remove_file_md5_hex_from_file(md5_hex)
                 if attempt < _INDEX_MAX_ATTEMPTS:
                     time.sleep(_INDEX_RETRY_SLEEP)
             return {"file": file_path, "chunks": None, "ok": False, "error": last_err}
 
-    def _verify_indexed(self, file_path: str, md5_hex: str, expected_chunks: int) -> bool:
+    def _verify_indexed(
+        self, file_path: str, md5_hex: str, expected_chunks: int,
+        previous_pks: set | None = None,
+    ) -> bool:
         """校验单文件入库结果：md5 记录存在 且 Milvus 条数 == 切块数。
 
+        `previous_pks` 是覆盖上传时旧版本占用的主键，校验只统计本次新增的向量。
         Milvus Bounded 一致性下刚插入的数据可能短暂不可见，
         首次计数不符时 flush 后复验一次，避免误判重建。
         """
         if not check_file_md5_hex_in_file(md5_hex):
             return False
-        if self._count_vectors(file_path) == expected_chunks:
+        if self._count_new_vectors(file_path, previous_pks) == expected_chunks:
             return True
         self._flush_milvus()
-        return self._count_vectors(file_path) == expected_chunks
+        return self._count_new_vectors(file_path, previous_pks) == expected_chunks
 
-    def _count_vectors(self, file_path: str) -> int:
-        """返回 Milvus 中该 source 的向量条数。"""
-        return len(self.pks_by_source(file_path))
+    def _count_new_vectors(self, file_path: str, previous_pks: set | None = None) -> int:
+        """返回该 source 下不属于 previous_pks 的向量条数（即本次新增部分）。"""
+        previous = previous_pks or set()
+        return sum(1 for pk in self.pks_by_source(file_path) if pk not in previous)
 
     def _flush_milvus(self) -> None:
         """强制 Milvus 写入磁盘，使刚插入的数据对后续 query 可见。"""
@@ -190,10 +200,19 @@ class VectorStore:
 
     def delete_by_source(self, file_path: str) -> int:
         """按 source 删除该文件的全部向量（分批，避免单次请求过大），返回删除条数。"""
-        pks = self.pks_by_source(file_path)
+        return self._delete_pks(self.pks_by_source(file_path))
+
+    def _delete_pks(self, pks: list) -> int:
+        """按主键分批删除向量，返回删除条数。"""
         for i in range(0, len(pks), self._ITER_BATCH_SIZE):
             self.vector_store.delete(ids=pks[i:i + self._ITER_BATCH_SIZE])
         return len(pks)
+
+    def _delete_added_pks(self, file_path: str, previous_pks: set | None = None) -> int:
+        """只删除本次新增的向量，保留 previous_pks 中的旧版本向量。"""
+        previous = previous_pks or set()
+        pks = [pk for pk in self.pks_by_source(file_path) if pk not in previous]
+        return self._delete_pks(pks)
 
     def _another_file_with_same_content(self, file_path: str, md5_hex: str) -> str | None:
         """返回知识库中另一份内容相同的文件路径；不存在则返回 None。
@@ -260,3 +279,102 @@ class VectorStore:
                 else:
                     add_file_md5_hex_to_file(md5_hex)
                     print(f"[向量库] 同内容副本重建向量失败 name={os.path.basename(survivor)}: {result['error']}")
+
+    def replace_file(self, file_path: str, tmp_path: str) -> dict:
+        """覆盖上传：新版本先入库校验，通过后再清理旧版本；失败回滚磁盘文件。
+
+        相比"先删旧向量再入库新版本"，旧版本向量在新版本校验通过前始终保留，
+        入库失败时磁盘文件与旧索引一起回滚，检索侧不会出现不可用窗口。
+        是否存在同名文件在锁内判定，并发上传不会把覆盖误判成新建。
+        返回 {'file', 'chunks', 'ok', 'error', 'overwritten'}。
+        """
+        file_path = get_abs_path(file_path)
+        with self._store_lock:
+            new_md5 = get_file_md5_hex(tmp_path)
+            existed = os.path.isfile(file_path)
+            if new_md5 is None:
+                return {
+                    "file": file_path, "chunks": None, "ok": False,
+                    "error": "MD5 计算失败", "overwritten": existed,
+                }
+
+            old_md5 = get_file_md5_hex(file_path) if existed else None
+            old_pks = self.pks_by_source(file_path)
+
+            # 内容未变且已入库：只需替换磁盘文件，向量与入库记录保持不动
+            if existed and old_md5 == new_md5 and check_file_md5_hex_in_file(new_md5):
+                os.replace(tmp_path, file_path)
+                return {
+                    "file": file_path, "chunks": None, "ok": True,
+                    "error": None, "overwritten": True,
+                }
+
+            backup = os.path.join(os.path.dirname(file_path), f".bak_{uuid.uuid4().hex}")
+            if existed:
+                os.replace(file_path, backup)
+            try:
+                os.replace(tmp_path, file_path)
+            except Exception:
+                if existed:
+                    os.replace(backup, file_path)
+                raise
+
+            try:
+                result = self.index_file(file_path, previous_pks=old_pks)
+            except Exception as e:
+                print(f"[向量库] 覆盖上传入库异常 name={os.path.basename(file_path)}: {e}")
+                result = {
+                    "file": file_path, "chunks": None, "ok": False,
+                    "error": _INDEX_FAIL_GENERIC,
+                }
+
+            if not result["ok"]:
+                # 回滚：只删新版本新增的向量，旧版本向量与记录保持可检索
+                try:
+                    self._delete_added_pks(file_path, set(old_pks))
+                except Exception as e:
+                    print(f"[向量库] 覆盖上传清理新版本向量失败 name={os.path.basename(file_path)}: {e}")
+                if existed:
+                    try:
+                        os.replace(backup, file_path)
+                    except Exception as e:
+                        print(
+                            f"[向量库] 覆盖上传回滚磁盘文件失败 name={os.path.basename(file_path)}: {e}"
+                            f"（旧索引仍保留，建议执行索引修复）"
+                        )
+                return {**result, "overwritten": existed}
+
+            # 切换生效版本：新版本已入库并通过校验，清理旧版本向量与过期入库记录
+            try:
+                deleted_old = self._delete_pks(old_pks)
+                if old_md5 and old_md5 != new_md5:
+                    survivor = self._another_file_with_same_content(file_path, old_md5)
+                    if survivor is None:
+                        remove_file_md5_hex_from_file(old_md5)
+                    elif deleted_old:
+                        # 旧内容的向量原本挂在本文件 source 上，已随旧版本删除；
+                        # 只保留记录而不重建副本向量会让副本"显示已入库、实际检索不到"，
+                        # 因此与 delete_file 一致：改挂到存活副本上。
+                        remove_file_md5_hex_from_file(old_md5)
+                        reindex = self.index_file(survivor)
+                        if reindex["ok"]:
+                            print(f"[向量库] 覆盖后已用同内容副本重建向量 name={os.path.basename(survivor)}")
+                        else:
+                            add_file_md5_hex_to_file(old_md5)
+                            print(
+                                f"[向量库] 覆盖后同内容副本重建向量失败 "
+                                f"name={os.path.basename(survivor)}: {reindex['error']}"
+                            )
+            except Exception as e:
+                print(f"[向量库] 覆盖上传清理旧版本失败 name={os.path.basename(file_path)}: {e}")
+                return {
+                    **result, "ok": False, "overwritten": existed,
+                    "error": "新版本已入库，但旧版本向量清理失败，请重试上传",
+                }
+
+            if existed:
+                try:
+                    os.remove(backup)
+                except OSError as e:
+                    print(f"[向量库] 删除备份文件失败 path={backup}: {e}")
+            return {**result, "overwritten": existed}
