@@ -4,8 +4,8 @@ import json
 import time
 import uuid
 import asyncio
-import itertools
 import threading
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, Request
 
@@ -38,6 +38,9 @@ from auth import (
     touch_generation,
     finish_generation,
     delete_conversation_guarded,
+    acquire_chat_slot,
+    bind_chat_slot_generation,
+    release_chat_slot,
 )
 
 # 流式回答也占用线程池；该值应覆盖预期的同时在线流数。
@@ -375,57 +378,50 @@ def api_delete_conversation(conv_id: str, user: dict = Depends(get_current_user)
 
 
 
-_chat_slots: dict[int, dict[int, dict]] = {}
-_chat_slot_seq = itertools.count(1)
-_chat_slots_lock = threading.Lock()
+# 跨进程计数由 chat_slots 租约表承担；本映射只保存本进程内的取消回调，用于在
+# 租约被清理（可能由其他 worker 触发）时及时停止仍然存活的上游生成。
+_chat_slot_cancels: dict[str, Callable[[], None]] = {}
+_chat_slot_cancels_lock = threading.Lock()
 
 
-def _acquire_chat_slot(user_id: int) -> int | None:
-    """占用一个对话并发槽，返回槽位 token；已达上限返回 None。
+async def _acquire_chat_slot(user_id: int) -> dict:
+    """占用一个跨进程对话并发槽位，返回 {"token", "reaped"}；token 为 None 表示已达上限。
 
-    占用时间达到 CHAT_SLOT_MAX_AGE_SECONDS 的槽位会被移除，并在释放锁之后通知
-    对应任务取消。仅移除槽位记录而不终止任务，会使已超时任务继续占用模型请求
-    与线程资源。
+    达到 CHAT_SLOT_MAX_AGE_SECONDS 或绑定任务已结束/心跳超时的租约会被清理；
+    跨进程取消已由数据库写入 cancel_requested，本进程内的对应任务还需通过
+    本地回调立即停止，否则会继续占用模型请求与线程资源。
     """
-    now = time.monotonic()
-    expired_cancels = []
-    with _chat_slots_lock:
-        slots: dict[int, dict] = {}
-        for token, info in _chat_slots.get(user_id, {}).items():
-            if now - info["started"] < CHAT_SLOT_MAX_AGE_SECONDS:
-                slots[token] = info
-            else:
-                expired_cancels.append(info.get("cancel"))
-        token = None
-        if len(slots) < MAX_CONCURRENT_CHAT_PER_USER:
-            token = next(_chat_slot_seq)
-            slots[token] = {"started": now, "cancel": None}
-        _chat_slots[user_id] = slots
-    for cancel in expired_cancels:
+    lease = await asyncio.to_thread(
+        acquire_chat_slot,
+        user_id,
+        MAX_CONCURRENT_CHAT_PER_USER,
+        CHAT_SLOT_MAX_AGE_SECONDS,
+        CHAT_GENERATION_STALE_SECONDS,
+    )
+    for token in lease["reaped"]:
+        with _chat_slot_cancels_lock:
+            cancel = _chat_slot_cancels.pop(token, None)
         if cancel is not None:
             try:
                 cancel()
             except Exception as e:
                 print(f"[对话流] 取消超时槽位任务失败（已忽略）: {e}")
-    return token
+    return lease
 
 
-def _bind_chat_slot_cancel(user_id: int, token: int, cancel) -> None:
-    """把槽位与生成任务的取消入口绑定，槽位超时清理时可以真正停止任务。"""
-    with _chat_slots_lock:
-        info = _chat_slots.get(user_id, {}).get(token)
-        if info is not None:
-            info["cancel"] = cancel
+def _bind_chat_slot_cancel(token: str, cancel) -> None:
+    """把租约与生成任务的取消入口绑定，租约清理时可以停止本进程内的任务。"""
+    with _chat_slot_cancels_lock:
+        _chat_slot_cancels[token] = cancel
 
 
-def _release_chat_slot(user_id: int, token: int) -> None:
-    with _chat_slots_lock:
-        slots = _chat_slots.get(user_id)
-        if not slots:
-            return
-        slots.pop(token, None)
-        if not slots:
-            _chat_slots.pop(user_id, None)
+async def _release_chat_slot(user_id: int, token: str) -> None:
+    with _chat_slot_cancels_lock:
+        _chat_slot_cancels.pop(token, None)
+    try:
+        await asyncio.to_thread(release_chat_slot, user_id, token)
+    except Exception as e:
+        print(f"[对话流] 释放并发槽位失败（将由租约过期清理）: {e}")
 
 
 def _sse(payload: dict) -> str:
@@ -455,7 +451,12 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     ):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
 
-    slot = _acquire_chat_slot(user["user_id"])
+    try:
+        lease = await _acquire_chat_slot(user["user_id"])
+    except Exception as e:
+        print(f"[对话流] 获取并发槽位失败 user={user['user_id']}: {e}")
+        raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
+    slot = lease["token"]
     if slot is None:
         raise HTTPException(status_code=429, detail="并发回答数过多，请等待当前回答完成")
 
@@ -471,21 +472,21 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
             CHAT_GENERATION_STALE_SECONDS,
         )
     except Exception as e:
-        _release_chat_slot(user["user_id"], slot)
+        await _release_chat_slot(user["user_id"], slot)
         print(f"[对话流] 登记生成任务失败 thread={req.thread_id}: {e}")
         raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
 
     if begun["status"] == "not_found":
-        _release_chat_slot(user["user_id"], slot)
+        await _release_chat_slot(user["user_id"], slot)
         raise HTTPException(status_code=404, detail="会话不存在或已被删除")
     if begun["status"] == "busy":
-        _release_chat_slot(user["user_id"], slot)
+        await _release_chat_slot(user["user_id"], slot)
         raise HTTPException(status_code=409, detail="当前会话已有回答正在生成，请稍后再试")
 
     if begun["status"] == "replay":
         generation = begun["generation"]
         if generation["status"] == "running":
-            _release_chat_slot(user["user_id"], slot)
+            await _release_chat_slot(user["user_id"], slot)
             raise HTTPException(status_code=409, detail="该请求正在生成中，请稍后再试")
 
         async def replay():
@@ -509,9 +510,18 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                         "replayed": True,
                     })
             finally:
-                _release_chat_slot(user["user_id"], slot)
+                with anyio.CancelScope(shield=True):
+                    await _release_chat_slot(user["user_id"], slot)
 
         return StreamingResponse(replay(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+    # 租约与生成任务关联：租约过期时其他 worker 可通过 cancel_requested 停止该任务。
+    try:
+        await asyncio.to_thread(
+            bind_chat_slot_generation, user["user_id"], slot, begun["generation_id"]
+        )
+    except Exception as e:
+        print(f"[对话流] 关联并发槽位与生成任务失败 gen={begun['generation_id']}: {e}")
 
     user_message_id = begun["user_message_id"]
     generation_id = begun["generation_id"]
@@ -551,7 +561,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 ),
                 cancel_event=cancel_event,
             )
-            _bind_chat_slot_cancel(user["user_id"], slot, bridge.stop)
+            _bind_chat_slot_cancel(slot, bridge.stop)
             heartbeat = asyncio.create_task(_generation_heartbeat(generation_id, bridge))
 
             yield _sse({"type": "start", "user_message_id": user_message_id})
@@ -629,7 +639,8 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     await finalize()
                 except Exception as e:
                     print(f"[对话流] 保存生成结果失败 gen={generation_id}: {e}")
-            _release_chat_slot(user["user_id"], slot)
+            with anyio.CancelScope(shield=True):
+                await _release_chat_slot(user["user_id"], slot)
 
     return StreamingResponse(generate(), media_type="text/event-stream", headers=SSE_HEADERS)
 

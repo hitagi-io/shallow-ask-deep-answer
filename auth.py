@@ -4,6 +4,7 @@ import re
 import random
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -42,6 +43,9 @@ LOGIN_ACCOUNT_IP_WINDOW_SECONDS = int(os.getenv("LOGIN_ACCOUNT_IP_WINDOW_SECONDS
 USER_CACHE_TTL_SECONDS = int(os.getenv("USER_CACHE_TTL_SECONDS", "30"))
 REGISTER_RATE_LIMIT = int(os.getenv("REGISTER_RATE_LIMIT", "5"))
 REGISTER_RATE_WINDOW_SECONDS = int(os.getenv("REGISTER_RATE_WINDOW_SECONDS", "3600"))
+
+# 对话并发槽位的跨进程咨询锁命名空间（二参数形式：classid, user_id）。
+_CHAT_SLOT_LOCK_CLASS = 0x64656573
 
 
 _pool: ConnectionPool | None = None
@@ -155,6 +159,18 @@ def init_db():
                     "CREATE INDEX IF NOT EXISTS idx_rate_limits_attempted_at "
                     "ON rate_limits (attempted_at)"
                 )
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS chat_slots (
+                        token         VARCHAR(64) PRIMARY KEY,
+                        user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        generation_id BIGINT,
+                        started_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_chat_slots_user "
+                    "ON chat_slots (user_id)"
+                )
             conn.commit()
         finally:
             _put_conn(conn)
@@ -256,6 +272,20 @@ _RATE_PURGE_PROBABILITY = 0.01
 _RATE_RETENTION = timedelta(hours=2)
 
 
+def _rate_lock_key(scope: str, key: str) -> int:
+    """限流键对应的咨询锁 key；哈希碰撞只会让无关的键短暂串行，不影响正确性。"""
+    digest = hashlib.blake2b(
+        f"rate-limit:{scope}:{key}".encode("utf-8"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big") & 0x7FFFFFFFFFFFFFFF
+
+
+def _rate_lock_keys(cur, pairs: list[tuple[str, str]]) -> None:
+    """按固定顺序获取多个限流键的事务级咨询锁，避免并发请求之间形成死锁。"""
+    for lock_key in sorted({_rate_lock_key(scope, key) for scope, key in pairs}):
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+
+
 def _rate_exceeded(cur, scope: str, key: str, limit: int, window_seconds: int, now: datetime) -> bool:
     """在已有游标上判断 key 在窗口期内的记录数是否已达上限。"""
     cur.execute(
@@ -276,21 +306,29 @@ def _rate_record(cur, scope: str, key: str, now: datetime) -> None:
         cur.execute("DELETE FROM rate_limits WHERE attempted_at <= %s", (now - _RATE_RETENTION,))
 
 
+def _rate_consume(cur, scope: str, key: str, limit: int, window_seconds: int, now: datetime) -> bool:
+    """原子地「检查并记录」一次尝试：先获取该限流键的事务级咨询锁。"""
+    _rate_lock_keys(cur, [(scope, key)])
+    if _rate_exceeded(cur, scope, key, limit, window_seconds, now):
+        return False
+    _rate_record(cur, scope, key, now)
+    return True
+
+
 def check_rate(scope: str, key: str, limit: int, window_seconds: int) -> bool:
     """记录并检查 key 在窗口期内的尝试次数，超限返回 False。
 
-    以数据库为计数载体：并发安全、多进程部署下同样生效，
-    且不依赖长期驻留内存的字典。
+    以数据库为计数载体，并在同一事务内按 (scope, key) 持有事务级咨询锁：
+    检查与插入因此成为原子操作，多进程部署下同一限流键也只会放行到上限，
+    且不依赖长期驻留内存的字典。锁在事务提交/回滚时自动释放。
     """
     conn = _get_conn()
     try:
         now = datetime.now()
         with conn.cursor(row_factory=dict_row) as cur:
-            if _rate_exceeded(cur, scope, key, limit, window_seconds, now):
-                return False
-            _rate_record(cur, scope, key, now)
+            allowed = _rate_consume(cur, scope, key, limit, window_seconds, now)
         conn.commit()
-        return True
+        return allowed
     finally:
         _put_conn(conn)
 
@@ -346,19 +384,24 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
 
     conn = _get_conn()
     try:
+        checks = [
+            ("login_acct", username, LOGIN_ACCOUNT_RATE_LIMIT, LOGIN_ACCOUNT_RATE_WINDOW_SECONDS),
+        ]
+        if ip:
+            checks.append(("login_ip", ip, LOGIN_IP_RATE_LIMIT, LOGIN_IP_RATE_WINDOW_SECONDS))
+        if acct_ip_key:
+            checks.append(
+                ("login_fail_ip", acct_ip_key,
+                 LOGIN_ACCOUNT_IP_MAX_ATTEMPTS, LOGIN_ACCOUNT_IP_WINDOW_SECONDS)
+            )
+
         with conn.cursor(row_factory=dict_row) as cur:
-            checks = [
-                ("login_acct", username, LOGIN_ACCOUNT_RATE_LIMIT, LOGIN_ACCOUNT_RATE_WINDOW_SECONDS),
-            ]
-            if ip:
-                checks.append(("login_ip", ip, LOGIN_IP_RATE_LIMIT, LOGIN_IP_RATE_WINDOW_SECONDS))
-            if acct_ip_key:
-                checks.append(
-                    ("login_fail_ip", acct_ip_key,
-                     LOGIN_ACCOUNT_IP_MAX_ATTEMPTS, LOGIN_ACCOUNT_IP_WINDOW_SECONDS)
-                )
+            # 三个限流键一次性加锁、按固定顺序获取：检查与记录在同一临界区内
+            # 完成，并发登录请求无法同时读到「未超限」的计数而全部放行。
+            _rate_lock_keys(cur, [(scope, key) for scope, key, _, _ in checks])
             for scope, key, limit, window in checks:
                 if _rate_exceeded(cur, scope, key, limit, window, now):
+                    conn.rollback()
                     return {"ok": False, "error": "尝试过于频繁，请稍后再试", "rate_limited": True}
 
             _rate_record(cur, "login_acct", username, now)
@@ -370,27 +413,35 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
                 (username,),
             )
             row = cur.fetchone()
-            if not row:
-                conn.commit()
-                return {"ok": False, "error": "用户名或密码错误"}
+        # 密码校验耗时较长，先提交并释放咨询锁，避免同一账号/IP 的正常请求排队等待。
+        conn.commit()
 
-            if not _verify_password(password, row["password"]):
-                if acct_ip_key:
-                    _rate_record(cur, "login_fail_ip", acct_ip_key, now)
-                conn.commit()
-                return {"ok": False, "error": "用户名或密码错误"}
+        if not row:
+            return {"ok": False, "error": "用户名或密码错误"}
 
-            conn.commit()
-            token = _create_token(row["id"], row["username"], row["role"])
-            return {
-                "ok": True,
-                "token": token,
-                "user": {
-                    "id": row["id"],
-                    "username": row["username"],
-                    "role": row["role"],
-                },
-            }
+        if not _verify_password(password, row["password"]):
+            if acct_ip_key:
+                # 失败计数在独立事务内原子「检查并记录」，并发失败也不会超过上限。
+                with conn.cursor(row_factory=dict_row) as cur:
+                    allowed = _rate_consume(
+                        cur, "login_fail_ip", acct_ip_key,
+                        LOGIN_ACCOUNT_IP_MAX_ATTEMPTS, LOGIN_ACCOUNT_IP_WINDOW_SECONDS, now,
+                    )
+                conn.commit()
+                if not allowed:
+                    return {"ok": False, "error": "尝试过于频繁，请稍后再试", "rate_limited": True}
+            return {"ok": False, "error": "用户名或密码错误"}
+
+        token = _create_token(row["id"], row["username"], row["role"])
+        return {
+            "ok": True,
+            "token": token,
+            "user": {
+                "id": row["id"],
+                "username": row["username"],
+                "role": row["role"],
+            },
+        }
     finally:
         _put_conn(conn)
 
@@ -717,5 +768,113 @@ def delete_conversation_guarded(
     except Exception:
         conn.rollback()
         raise
+    finally:
+        _put_conn(conn)
+
+
+def acquire_chat_slot(
+    user_id: int,
+    limit: int,
+    max_age_seconds: int,
+    stale_seconds: float,
+) -> dict:
+    """跨进程占用一个对话并发槽位（数据库租约），超额时 token 为 None。
+
+    计数以 chat_slots 表为唯一来源：按 user_id 持有事务级咨询锁后，先清理失效
+    租约再判定剩余数量并插入，多个 worker/实例因此共享同一上限。失效租约分两类：
+    超过 max_age_seconds 的租约，以及绑定的生成任务已结束或心跳超时
+    stale_seconds 的租约；后者对应的运行中任务会被写入 cancel_requested，
+    由持有该任务的心跳循环停止上游生成，避免只删租约而任务继续占用资源。
+
+    返回 {"token": str | None, "reaped": [失效租约 token]}，reaped 供调用方
+    取消本进程内仍然存活的任务。
+    """
+    conn = _get_conn()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(%s, %s)",
+                (_CHAT_SLOT_LOCK_CLASS, user_id),
+            )
+            cur.execute(
+                """
+                SELECT s.token, s.generation_id,
+                       s.started_at <= now() - make_interval(secs => %s) AS lease_expired,
+                       s.generation_id IS NOT NULL AND (
+                           g.id IS NULL
+                           OR g.status <> 'running'
+                           OR g.heartbeat_at <= now() - make_interval(secs => %s)
+                       ) AS generation_dead
+                FROM chat_slots s
+                LEFT JOIN generations g ON g.id = s.generation_id
+                WHERE s.user_id = %s
+                ORDER BY s.started_at
+                """,
+                (max_age_seconds, stale_seconds, user_id),
+            )
+            rows = cur.fetchall()
+
+            reaped = [
+                row["token"]
+                for row in rows
+                if row["lease_expired"] or row["generation_dead"]
+            ]
+            cancel_ids = [
+                row["generation_id"]
+                for row in rows
+                if row["generation_id"] is not None
+                and (row["lease_expired"] or row["generation_dead"])
+            ]
+            if reaped:
+                cur.execute(
+                    "DELETE FROM chat_slots WHERE user_id = %s AND token = ANY(%s)",
+                    (user_id, reaped),
+                )
+            if cancel_ids:
+                cur.execute(
+                    "UPDATE generations SET cancel_requested = TRUE "
+                    "WHERE id = ANY(%s) AND status = 'running'",
+                    (cancel_ids,),
+                )
+
+            token = None
+            if len(rows) - len(reaped) < limit:
+                token = uuid.uuid4().hex
+                cur.execute(
+                    "INSERT INTO chat_slots (token, user_id) VALUES (%s, %s)",
+                    (token, user_id),
+                )
+        conn.commit()
+        return {"token": token, "reaped": reaped}
+    finally:
+        _put_conn(conn)
+
+
+def bind_chat_slot_generation(user_id: int, token: str, generation_id: int) -> bool:
+    """把租约与生成任务关联，使租约过期时能跨进程请求该任务停止生成。"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE chat_slots SET generation_id = %s WHERE token = %s AND user_id = %s",
+                (generation_id, token, user_id),
+            )
+            bound = cur.rowcount > 0
+        conn.commit()
+        return bound
+    finally:
+        _put_conn(conn)
+
+
+def release_chat_slot(user_id: int, token: str) -> None:
+    """释放租约；进程异常退出时未释放的租约由后续 acquire 按过期规则清理。"""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM chat_slots WHERE token = %s AND user_id = %s",
+                (token, user_id),
+            )
+        conn.commit()
     finally:
         _put_conn(conn)
