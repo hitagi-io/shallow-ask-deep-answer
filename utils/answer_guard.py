@@ -3,7 +3,8 @@
 两种模式（与前端「仅知识库」开关一一对应）：
 - kb_only=True（默认，严格模式）：事实性内容只能来自知识库。子代理在出口由代码根据
   检索 artifact 生成结构化报告；本模块只认结构报告，不扫描任何失败短句。模型文本
-  先缓冲，只有拿到 status=ok 且来源可校验的回合才放行，否则输出固定文案并丢弃文本。
+  先缓冲，拿到 status=ok 且来源可校验的回合才增量放行；回合结束时再校验引用，
+  校验失败则用 replace 事件用固定文案整段替换已下发内容。
 - kb_only=False（通用模式）：模型自身知识 + 必要时联网搜索，没有固定文案约定；
   本模块只过滤工具消息（并记录联网异常标记），模型文本实时透传。
 
@@ -41,7 +42,8 @@ class AnswerGuard:
     """仅知识库模式的单回合输出判定器。
 
     调用方（guarded_stream）负责从流中取出消息并区分工具消息与文本消息；
-    本类只维护回合状态，finish() 返回"此刻应发给用户的内容"（None 表示无可输出）。
+    本类维护回合状态：拿到 status=ok 报告后允许增量放行，finish() 返回最终
+    校验动作（追加来源行 / 整段替换 / 无输出）。
     """
 
     def __init__(self) -> None:
@@ -53,6 +55,8 @@ class AnswerGuard:
         self._task_call_ids: set[str] = set()
         self._direct_call_ids: set[str] = set()
         self._seen_tools: list[str] = []
+        # status=ok 报告到达后进入增量放行：后续文本边生成边下发
+        self._releasing = False
 
 
     def note_tool_call(self, tool_name: str | None, tool_call_id: str | None = None) -> None:
@@ -64,13 +68,25 @@ class AnswerGuard:
         elif tool_name == "mark_direct_answer" and tool_call_id:
             self._direct_call_ids.add(tool_call_id)
 
+    def begin_release(self) -> str | None:
+        """进入增量放行；返回此前已缓冲、需要一次性补发的文本。"""
+        if self.terminated or self._releasing:
+            return None
+        self._releasing = True
+        pending = self._buffer_text()
+        return pending or None
+
     def feed_tool(
         self,
         text: str,
         tool_name: str | None = None,
         tool_call_id: str | None = None,
-    ) -> None:
-        """处理一条工具消息：只接受结构化报告/直答声明，不解析失败短句。"""
+    ) -> str | None:
+        """处理一条工具消息：只接受结构化报告/直答声明，不解析失败短句。
+
+        返回 None（无状态变化）、"generating"（可进入生成阶段）或
+        "release"（拿到 status=ok 报告，可开始增量放行）。
+        """
         if self.terminated:
             return
         text = text or ""
@@ -87,7 +103,7 @@ class AnswerGuard:
                 or tool_name not in (None, "task")
             ):
                 print("[兜底] 结构化检索报告没有匹配的 task 调用，已忽略")
-                return
+                return None
             report["task_call_id"] = tool_call_id
             self._reports.append(report)
             sources = "、".join(report["sources"][:CITATION_SOURCE_LIMIT]) or "-"
@@ -96,7 +112,7 @@ class AnswerGuard:
                 f"reason={report.get('reason') or '-'} sources={sources} "
                 f"task_call={tool_call_id or '-'}"
             )
-            return
+            return "release" if report["status"] == STATUS_OK else "generating"
 
         if looks_like_report(text):
             print("[兜底] 结构化检索报告解析失败，本回合按无有效证据处理")
@@ -109,20 +125,29 @@ class AnswerGuard:
                 or tool_name not in (None, "mark_direct_answer")
             ):
                 print("[兜底] 直答声明没有匹配的 mark_direct_answer 调用，已忽略")
-                return
+                return None
             self._direct_category = category
             print(f"[兜底] 已声明直答分支 category={category}")
+            return "generating"
+        return None
 
-    def feed_text(self, text: str) -> None:
-        """缓冲模型文本，回合结束时统一校验后再放行。"""
+    def feed_text(self, text: str) -> str | None:
+        """缓冲模型文本；已进入增量放行时返回应立刻下发的增量。"""
         if self.terminated or not text:
-            return
-        self._buffer.append(text)
-
-    def finish(self) -> str | None:
-        """回合结束（流耗尽）时的唯一放行点。"""
-        if self.terminated:
             return None
+        self._buffer.append(text)
+        return text if self._releasing else None
+
+    def finish(self) -> tuple[str, str]:
+        """回合结束（流耗尽）时的唯一放行点。
+
+        返回 (action, text)：
+        - ("append", suffix)：在已下发内容后追加后缀（如补发的来源行）；
+        - ("replace", text)：整段替换为 text（固定文案或完整回答）；
+        - ("none", "")：无可输出。
+        """
+        if self.terminated:
+            return ("none", "")
 
         ok_reports = [report for report in self._reports if report["status"] == STATUS_OK]
         if ok_reports:
@@ -144,10 +169,10 @@ class AnswerGuard:
                 return self._terminate("unverified", "已声明直答但本轮仍调用了 task")
             tools = f"（已见工具：{'、'.join(self._seen_tools)}）" if self._seen_tools else ""
             return self._terminate("unverified", f"无检索证据且未声明可直接回答{tools}")
-        return None
+        return ("none", "")
 
 
-    def _finish_with_evidence(self, ok_reports: list[dict]) -> str | None:
+    def _finish_with_evidence(self, ok_reports: list[dict]) -> tuple[str, str]:
         text = self._buffer_text()
         if not text.strip():
             return self._terminate("unverified", "检索成功但本轮没有可校验的回答文本")
@@ -169,31 +194,33 @@ class AnswerGuard:
 
         self._buffer.clear()
         if cited:
-            return text
-        return (
-            f"{body}\n\n参考来源（内部知识库）："
+            return ("replace", text)
+        suffix = (
+            "\n\n参考来源（内部知识库）："
             f"{'、'.join(sources[:CITATION_SOURCE_LIMIT])}"
         )
+        # 已增量下发的正文保持不变，只把缺失的来源行追加到末尾
+        return ("append", suffix) if self._releasing else ("replace", f"{body}{suffix}")
 
-    def _finish_direct(self) -> str | None:
+    def _finish_direct(self) -> tuple[str, str]:
         text = self._buffer_text()
         if not text.strip():
-            return None
+            return ("none", "")
         _, cited = split_answer_and_citations(text)
         if cited:
             return self._terminate("unverified", "直答分支不应出现来源标注")
         self._buffer.clear()
-        return text
+        return ("replace", text)
 
     def _buffer_text(self) -> str:
         return "".join(self._buffer)
 
-    def _terminate(self, winner: str, reason: str) -> str:
+    def _terminate(self, winner: str, reason: str) -> tuple[str, str]:
         dropped = len(self._buffer_text())
         self._buffer.clear()
         self.terminated = True
         print(f"[兜底] {reason}，已输出固定文案并拦截模型文本 {dropped} 字")
-        return _COPY_BY_WINNER[winner]
+        return ("replace", _COPY_BY_WINNER[winner])
 
 
 
@@ -237,27 +264,60 @@ def _tool_calls(chunk) -> list[tuple[str | None, str | None]]:
 
 
 def _general_stream(raw_stream, should_stop=None):
-    """通用模式：不做文案接管，仅过滤工具消息。"""
+    """通用模式：文本实时透传，仅过滤工具消息，并按工具调用下发阶段提示。"""
+    phase = ""
+
+    def phase_event(name: str) -> dict | None:
+        nonlocal phase
+        if name == phase:
+            return None
+        phase = name
+        return {"type": "phase", "phase": name}
+
+    event = phase_event("thinking")
+    if event:
+        yield event
+
     for item in raw_stream:
         if should_stop is not None and should_stop():
             return
         chunk = item[0] if isinstance(item, (tuple, list)) and len(item) == 2 else item
-        text = _chunk_text(chunk)
+
+        next_phase = None
+        for name, _ in _tool_calls(chunk):
+            if name:
+                next_phase = "searching" if name == "tavily_search" else "working"
+
         if getattr(chunk, "type", "") == "tool":
+            event = phase_event("generating")
+            if event:
+                yield event
             continue
+
+        text = _chunk_text(chunk)
         if text:
             yield text
+        if next_phase:
+            event = phase_event(next_phase)
+            if event:
+                yield event
 
 
 def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
     """把 Agent 的原始消息流包装为"用户可见文本流"。
 
-    严格模式先缓冲全部模型文本，回合结束后依据结构化报告统一裁决：
-    有有效证据才放行，并校验回答中的来源引用；降级回合由本函数直接产出固定文案。
+    严格模式先缓冲模型文本；拿到 status=ok 报告后进入增量放行（边生成边下发），
+    回合结束时校验来源引用：无引用时补发"参考来源"行，校验失败则下发 replace
+    事件用固定文案整段替换已下发内容。没有有效证据的回合始终只输出固定文案。
 
-    should_stop 为取消判定（threading.Event.is_set）。kb 模式因为要缓冲全部文本，
-    外层无法在缓冲过程中察觉取消，必须在读取上游消息的循环里主动检查，
-    否则停止/断连后仍会把整个模型流读完。
+    输出元素协议：
+    - str：正常文本增量；
+    - {"type": "phase", "phase": ...}：阶段提示（thinking / retrieving / generating）；
+    - {"type": "replace", "content": ...}：用新内容整段替换此前已下发文本。
+
+    should_stop 为取消判定（threading.Event.is_set）。kb 模式需要读取上游消息，
+    外层无法在读取过程中察觉取消，必须在循环里主动检查，否则停止/断连后仍会把
+    整个模型流读完。
 
     无论正常结束、异常还是调用方 close()，都在 finally 里显式关闭原始流，
     保证取消能继续传播到 LangGraph / 模型请求，而不是只停在外层包装器。
@@ -268,26 +328,72 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
             return
 
         guard = AnswerGuard()
+        emitted: list[str] = []
+        phase = ""
+
+        def phase_event(name: str) -> dict | None:
+            nonlocal phase
+            if name == phase:
+                return None
+            phase = name
+            return {"type": "phase", "phase": name}
+
+        event = phase_event("thinking")
+        if event:
+            yield event
+
         for item in raw_stream:
             if should_stop is not None and should_stop():
                 return
             chunk = item[0] if isinstance(item, (tuple, list)) and len(item) == 2 else item
+
+            next_phase = None
             for name, call_id in _tool_calls(chunk):
                 guard.note_tool_call(name, call_id)
+                if name == "task":
+                    next_phase = "retrieving"
+
             if getattr(chunk, "type", "") == "tool":
-                guard.feed_tool(
+                hint = guard.feed_tool(
                     _chunk_text(chunk),
                     getattr(chunk, "name", None),
                     getattr(chunk, "tool_call_id", None),
                 )
+                if hint:
+                    next_phase = "generating"
+                    event = phase_event(next_phase)
+                    if event:
+                        yield event
+                    if hint == "release":
+                        pending = guard.begin_release()
+                        if pending:
+                            emitted.append(pending)
+                            yield pending
                 continue
-            guard.feed_text(_chunk_text(chunk))
+
+            delta = guard.feed_text(_chunk_text(chunk))
+            if delta:
+                emitted.append(delta)
+                yield delta
+            if next_phase:
+                event = phase_event(next_phase)
+                if event:
+                    yield event
 
         if should_stop is not None and should_stop():
             return
-        emit = guard.finish()
-        if emit:
-            yield emit
+        action, text = guard.finish()
+        if action == "none" or not text:
+            return
+
+        emitted_text = "".join(emitted)
+        if action == "append":
+            yield text
+        elif not emitted_text:
+            yield text
+        elif emitted_text != text:
+            # 已下发内容与最终校验结果不一致（引用越界、降级文案等），整段替换
+            yield {"type": "replace", "content": text}
     finally:
         close = getattr(raw_stream, "close", None)
         if close is not None:

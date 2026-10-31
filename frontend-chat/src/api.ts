@@ -197,6 +197,8 @@ export interface StreamOutcome {
 interface StreamEvent {
   type?: string
   content?: string
+  /** type === 'phase' 时的阶段名（thinking / retrieving / generating） */
+  phase?: string
   status?: string
   error?: string
   message_id?: number | null
@@ -216,6 +218,8 @@ export async function streamChat(
   message: string,
   kbOnly: boolean,
   onChunk: (text: string) => void,
+  onReplace: (text: string) => void,
+  onPhase: (phase: string) => void,
   signal: AbortSignal,
 ): Promise<StreamOutcome> {
   let res: Response
@@ -259,6 +263,16 @@ export async function streamChat(
     }
     if (data.type === 'start') {
       started = true
+      return null
+    }
+    if (data.type === 'phase') {
+      started = true
+      if (data.phase) onPhase(data.phase)
+      return null
+    }
+    if (data.type === 'replace') {
+      started = true
+      onReplace(data.content || '')
       return null
     }
     if (data.type === 'chunk') {

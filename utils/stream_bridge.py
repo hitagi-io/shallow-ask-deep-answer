@@ -10,7 +10,12 @@ Agent 的流式接口是同步生成器，只能在独立线程里拉取。直�
 - `stop()` 只设置线程安全的事件，生产线程在下一个 `next()` 返回后退出，
   并在自己的线程里 `close()` 生成器，从而把 GeneratorExit 传给上游模型流。
 
-事件类型：("chunk", text) / ("end", None) / ("cancelled", None) / ("error", exc)。
+事件类型：("chunk", text) / ("replace", text) / ("phase", phase) / ("end", None)
+/ ("cancelled", None) / ("error", exc)。
+
+上游生成器可产出 str（普通文本增量）或 dict：
+- {"type": "replace", "content": text}：整段替换已下发内容；
+- {"type": "phase", "phase": name}：阶段提示。
 """
 
 from __future__ import annotations
@@ -45,11 +50,20 @@ class StreamBridge:
 
     def _run(self) -> None:
         try:
-            for chunk in self._stream:
+            for item in self._stream:
                 if self._stopped.is_set():
                     self._emit("cancelled")
                     return
-                self._emit("chunk", chunk)
+                if isinstance(item, dict):
+                    event_type = item.get("type")
+                    if event_type == "phase":
+                        self._emit("phase", str(item.get("phase") or ""))
+                        continue
+                    if event_type == "replace":
+                        self._emit("replace", str(item.get("content") or ""))
+                        continue
+                    item = str(item)
+                self._emit("chunk", item)
             if self._stopped.is_set():
                 self._emit("cancelled")
             else:

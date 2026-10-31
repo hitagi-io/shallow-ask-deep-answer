@@ -573,6 +573,13 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                         if kind == "chunk":
                             parts.append(payload)
                             yield _sse({"type": "chunk", "content": payload})
+                        elif kind == "replace":
+                            # 严格模式终校验失败：整段替换已下发内容，落库也以新内容为准
+                            parts.clear()
+                            parts.append(payload)
+                            yield _sse({"type": "replace", "content": payload})
+                        elif kind == "phase":
+                            yield _sse({"type": "phase", "phase": payload})
                         elif kind == "end":
                             terminal = {
                                 "status": "completed",

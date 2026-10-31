@@ -85,6 +85,14 @@ const input = ref('')
 const isProcessing = ref(false)
 const isThinking = ref(false)
 const thinkingSeconds = ref(0)
+const thinkingPhase = ref('')
+const PHASE_LABELS: Record<string, string> = {
+  thinking: '正在思考',
+  retrieving: '正在检索知识库',
+  searching: '正在联网搜索',
+  working: '正在使用工具',
+  generating: '正在生成回答',
+}
 let thinkingTimer: number | null = null
 let thinkingStartTime = 0
 const chatArea = ref<HTMLElement | null>(null)
@@ -207,6 +215,7 @@ async function sendMessage() {
   input.value = ''
   resetInputHeight()
   thinkingStartTime = Date.now()
+  thinkingPhase.value = ''
   isProcessing.value = true
   isThinking.value = true
   scrollToBottom()
@@ -232,6 +241,8 @@ async function sendMessage() {
     const outcome = await streamChat(
       convId, requestId, text, kbOnly.value,
       chunk => { if (isThinking.value) { captureThinkingTime(); isThinking.value = false } conv.messages[idx].content += chunk; scrollToBottom() },
+      text => { if (isThinking.value) { captureThinkingTime(); isThinking.value = false } conv.messages[idx].content = text; scrollToBottom() },
+      phase => { if (isThinking.value) thinkingPhase.value = PHASE_LABELS[phase] || '' },
       ac.signal,
     )
     captureThinkingTime()
@@ -274,6 +285,7 @@ async function sendMessage() {
   } finally {
     isProcessing.value = false
     isThinking.value = false
+    thinkingPhase.value = ''
     scrollToBottom()
     if (streamAbort === ac) streamAbort = null
   }
@@ -765,7 +777,7 @@ onUnmounted(() => {
                   <span class="thinking-dot"></span>
                   <span class="thinking-dot" style="animation-delay:0.15s"></span>
                   <span class="thinking-dot" style="animation-delay:0.3s"></span>
-                  <span class="thinking-text">处理中...... {{ formatTime(thinkingSeconds) }}</span>
+                  <span class="thinking-text">{{ thinkingPhase || '处理中' }}...... {{ formatTime(thinkingSeconds) }}</span>
                 </div>
                 <div v-if="msg.role === 'assistant' && !(isThinking && !msg.content && i === current.messages.length - 1)" class="bubble markdown-body" v-html="renderMarkdown(bubbleText(msg))"></div>
                 <div v-if="msg.role === 'assistant' && msg.thinkingTime != null && msg.content" class="thinking-time">· 处理耗时 {{ formatTime(msg.thinkingTime) }}</div>
