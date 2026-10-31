@@ -6,9 +6,9 @@ import {
   fetchConversations,
   createConversationApi,
   updateConversationTitle,
-  appendMessageApi,
   deleteConversationApi,
   streamChat,
+  newRequestId,
   getUser,
   clearAuth,
   setUnauthorizedHandler,
@@ -22,6 +22,7 @@ import {
   fetchIndexHealth,
   repairIndexHealth,
   type Conversation,
+  type Message,
   type UserInfo,
   type FileItem,
   type HealthReport,
@@ -145,6 +146,15 @@ function scrollToBottom() {
 
 function renderMarkdown(text: string) { return DOMPurify.sanitize(marked.parse(text) as string) }
 
+// 空内容时按终态给出占位文案：服务端只保存模型实际输出，不拼接展示标记
+function bubbleText(msg: Message) {
+  if (msg.content) return msg.content
+  if (msg.status === 'error') return '（生成失败）'
+  if (msg.status === 'cancelled') return '（已取消）'
+  if (msg.status === 'completed') return '（未收到回复）'
+  return ''
+}
+
 async function newConversation() {
   if (isProcessing.value) return
   try {
@@ -162,10 +172,16 @@ function selectConversation(id: string) {
   sidebarOpen.value = false
 }
 
-function deleteConversation(id: string) {
+async function deleteConversation(id: string) {
   if (isProcessing.value) return
+  // 先由服务端确认删除：运行中的会话会返回 409，本地不能抢先移除
+  try {
+    await deleteConversationApi(id)
+  } catch (e) {
+    handlePersistError('删除会话', e)
+    return
+  }
   delete conversations.value[id]
-  deleteConversationApi(id).catch(e => handlePersistError('删除会话', e))
   const ids = Object.keys(conversations.value)
   if (ids.length === 0) {
     newConversation()
@@ -177,13 +193,16 @@ function deleteConversation(id: string) {
 async function sendMessage() {
   const text = input.value.trim()
   if (!text || isProcessing.value) return
-  const conv = conversations.value[currentId.value]
+  const convId = currentId.value
+  const conv = conversations.value[convId]
   if (!conv) return
+
+  // 本地先乐观展示；服务端在/stream 接口中原子写入用户消息，客户端不再单独提交
   conv.messages.push({ role: 'user', content: text })
-  appendMessageApi(currentId.value, 'user', text).catch(e => handlePersistError('保存用户消息', e))
+  const userIdx = conv.messages.length - 1
   if (conv.messages.length === 1) {
     conv.title = text.length > 20 ? text.slice(0, 20) + '...' : text
-    updateConversationTitle(currentId.value, conv.title).catch(e => handlePersistError('更新标题', e))
+    updateConversationTitle(convId, conv.title).catch(e => handlePersistError('更新标题', e))
   }
   input.value = ''
   resetInputHeight()
@@ -192,7 +211,7 @@ async function sendMessage() {
   isThinking.value = true
   scrollToBottom()
 
-  const assistantMsg = { role: 'assistant' as const, content: '', status: 'streaming' as const }
+  const assistantMsg: Message = { role: 'assistant', content: '', status: 'streaming' }
   conv.messages.push(assistantMsg)
   const idx = conv.messages.length - 1
 
@@ -202,47 +221,60 @@ async function sendMessage() {
     }
   }
 
-  // 流结束/出错时仅写入数据库一次，避免 streamChat 的 onDone 被多次触发造成重复消息
-  let assistantPersisted = false
-  const persistAssistant = () => {
-    if (assistantPersisted) return
-    assistantPersisted = true
-    appendMessageApi(
-      currentId.value, 'assistant', conv.messages[idx].content, conv.messages[idx].status,
-    ).catch(e => handlePersistError('保存回复', e))
-  }
-
   // 上一次可能仍在途（正常情况下已被 isProcessing 挡住），先取消再开启新的
   streamAbort?.abort()
   const ac = new AbortController()
   streamAbort = ac
+  // 幂等键：网络重试复用同一个值，服务端不会重复写入消息或重复生成
+  const requestId = newRequestId()
 
   try {
-    await streamChat(
-      text, currentId.value,
+    const outcome = await streamChat(
+      convId, requestId, text, kbOnly.value,
       chunk => { if (isThinking.value) { captureThinkingTime(); isThinking.value = false } conv.messages[idx].content += chunk; scrollToBottom() },
-      () => { captureThinkingTime(); conv.messages[idx].status = 'completed'; isProcessing.value = false; isThinking.value = false; if (!conv.messages[idx].content) conv.messages[idx].content = '（未收到回复）'; scrollToBottom(); persistAssistant() },
-      err => { captureThinkingTime(); conv.messages[idx].status = 'error'; conv.messages[idx].content = `错误: ${err}`; isProcessing.value = false; isThinking.value = false; scrollToBottom(); persistAssistant() },
-      kbOnly.value,
       ac.signal,
     )
-  } catch {
     captureThinkingTime()
-    if (ac.signal.aborted) {
-      // 主动取消（401 / 退出登录 / 组件卸载 / 用户点击停止）：连接已断开，不当作网络错误
+
+    if (!outcome.started) {
+      // 服务端没有接受本次请求（会话已删除、会话被占用或校验失败）：
+      // 回滚本地乐观消息，避免展示数据库中不存在的问答
+      conv.messages.splice(userIdx, 2)
+      if (!ac.signal.aborted) {
+        input.value = text
+        resetInputHeight()
+      }
+      handlePersistError('发送消息', new Error(outcome.error || '请求未被服务端接受'))
+      return
+    }
+
+    if (outcome.messageId != null) conv.messages[idx].id = outcome.messageId
+    if (outcome.status === 'completed') {
       conv.messages[idx].status = 'completed'
-      conv.messages[idx].content = conv.messages[idx].content
-        ? `${conv.messages[idx].content}\n\n（已取消）`
-        : '（已取消）'
+      if (!conv.messages[idx].content) conv.messages[idx].content = '（未收到回复）'
+    } else if (outcome.status === 'cancelled') {
+      conv.messages[idx].status = 'cancelled'
     } else {
       conv.messages[idx].status = 'error'
-      conv.messages[idx].content = '网络错误，请检查连接后重试'
+      if (!conv.messages[idx].content) {
+        conv.messages[idx].content = `错误: ${outcome.error || '生成失败'}`
+      }
     }
+    scrollToBottom()
+  } catch (e) {
+    captureThinkingTime()
+    if (ac.signal.aborted) {
+      conv.messages[idx].status = 'cancelled'
+    } else {
+      conv.messages[idx].status = 'error'
+      if (!conv.messages[idx].content) conv.messages[idx].content = '网络错误，请检查连接后重试'
+    }
+    handlePersistError('发送消息', e)
+    scrollToBottom()
+  } finally {
     isProcessing.value = false
     isThinking.value = false
     scrollToBottom()
-    persistAssistant()
-  } finally {
     if (streamAbort === ac) streamAbort = null
   }
 }
@@ -263,12 +295,13 @@ const fileInput = ref<HTMLInputElement | null>(null)
 // 正在删除的文件名：非空时禁用删除按钮并在该行显示"删除中..."，避免重复点击
 const deletingName = ref('')
 
-// ---------- 对话持久化失败提示 ----------
+// ---------- 操作失败提示 ----------
 const persistNotice = ref('')
 let persistNoticeTimer: number | null = null
 function handlePersistError(op: string, e: unknown) {
-  console.error(`[持久化失败] ${op}:`, e)
-  persistNotice.value = '消息保存失败，刷新页面可能丢失最新内容'
+  console.error(`[操作失败] ${op}:`, e)
+  const detail = e instanceof Error && e.message ? e.message : ''
+  persistNotice.value = detail ? `${op}失败：${detail}` : `${op}失败，请稍后重试`
   if (persistNoticeTimer !== null) clearTimeout(persistNoticeTimer)
   persistNoticeTimer = window.setTimeout(() => { persistNotice.value = '' }, 5000)
 }
@@ -734,8 +767,11 @@ onUnmounted(() => {
                   <span class="thinking-dot" style="animation-delay:0.3s"></span>
                   <span class="thinking-text">处理中...... {{ formatTime(thinkingSeconds) }}</span>
                 </div>
-                <div v-if="msg.role === 'assistant' && !(isThinking && !msg.content && i === current.messages.length - 1)" class="bubble markdown-body" v-html="renderMarkdown(msg.content || '')"></div>
+                <div v-if="msg.role === 'assistant' && !(isThinking && !msg.content && i === current.messages.length - 1)" class="bubble markdown-body" v-html="renderMarkdown(bubbleText(msg))"></div>
                 <div v-if="msg.role === 'assistant' && msg.thinkingTime != null && msg.content" class="thinking-time">· 处理耗时 {{ formatTime(msg.thinkingTime) }}</div>
+                <div v-if="msg.role === 'assistant' && (msg.status === 'cancelled' || msg.status === 'error') && msg.content" class="message-note" :class="msg.status">
+                  {{ msg.status === 'cancelled' ? '· 已取消' : '· 回答未完成' }}
+                </div>
                 <div v-if="msg.role === 'user'" class="bubble">{{ msg.content }}</div>
                 <span v-if="isProcessing && !isThinking && i === current.messages.length - 1 && msg.role === 'assistant'" class="cursor">▌</span>
               </div>
@@ -960,6 +996,8 @@ onUnmounted(() => {
 .thinking-dot { width: 4px; height: 4px; background: #777; border-radius: 50%; animation: pulse 1.3s infinite; }
 .thinking-text { color: var(--muted); font-size: 12px; margin-left: 6px; }
 .thinking-time { font-size: 11px; color: #898989; margin-top: 10px; }
+.message-note { font-size: 11px; color: #898989; margin-top: 10px; }
+.message-note.error { color: var(--danger); }
 .cursor { animation: pulse 1s infinite; }
 .input-bar { padding: 12px 32px 16px; }
 .input-inner { display: flex; flex-direction: column; max-width: 768px; margin: 0 auto; border: 1px solid #dedede; border-radius: 17px; padding: 14px 16px 12px; box-shadow: 0 4px 20px #00000005; background: white; }

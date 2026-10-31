@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import random
@@ -5,6 +6,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+import psycopg
 from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -107,6 +109,35 @@ def init_db():
                         created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+                cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS generation_id BIGINT")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_messages_conversation "
+                    "ON messages (conversation_id, id)"
+                )
+                # 生成任务：业务消息与模型上下文之外的第三份状态，记录每次生成的
+                # 幂等键、归属、终态和关联消息，供重放、互斥与中断补偿使用。
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS generations (
+                        id                  BIGSERIAL PRIMARY KEY,
+                        conversation_id     VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                        user_id             INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        request_id          VARCHAR(64) NOT NULL,
+                        status              VARCHAR(16) NOT NULL DEFAULT 'running'
+                            CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
+                        cancel_requested    BOOLEAN NOT NULL DEFAULT FALSE,
+                        error               TEXT,
+                        user_message_id     BIGINT,
+                        assistant_message_id BIGINT,
+                        heartbeat_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE (conversation_id, request_id)
+                    );
+                """)
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_generations_running "
+                    "ON generations (conversation_id) WHERE status = 'running'"
+                )
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS rate_limits (
                         id           BIGSERIAL PRIMARY KEY,
@@ -372,7 +403,7 @@ def list_conversations(user_id: int) -> list[dict]:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                SELECT c.id, c.title, m.role, m.content, m.status
+                SELECT c.id, c.title, m.id AS message_id, m.role, m.content, m.status
                 FROM conversations c
                 LEFT JOIN messages m ON m.conversation_id = c.id
                 WHERE c.user_id = %s
@@ -390,7 +421,12 @@ def list_conversations(user_id: int) -> list[dict]:
                 order.append(cid)
             if r["role"] is not None:
                 convs[cid]["messages"].append(
-                    {"role": r["role"], "content": r["content"], "status": r["status"]}
+                    {
+                        "id": r["message_id"],
+                        "role": r["role"],
+                        "content": r["content"],
+                        "status": r["status"],
+                    }
                 )
         return [convs[cid] for cid in order]
     finally:
@@ -430,40 +466,256 @@ def update_conversation_title(user_id: int, conv_id: str, title: str) -> bool:
         _put_conn(conn)
 
 
-def append_message(user_id: int, conv_id: str, role: str, content: str, status: str | None) -> bool:
+def _conversation_lock_key(conv_id: str) -> int:
+    """会话级咨询锁 key：让登记生成任务与删除会话共享同一把跨进程锁。"""
+    digest = hashlib.blake2b(
+        f"chat-generation:{conv_id}".encode("utf-8"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big") & 0x7FFFFFFFFFFFFFFF
+
+
+_GENERATION_REPLAY_QUERY = """
+    SELECT g.id, g.status, g.error, g.user_message_id, g.assistant_message_id,
+           m.content AS assistant_content
+    FROM generations g
+    LEFT JOIN messages m ON m.id = g.assistant_message_id
+    WHERE g.conversation_id = %s AND g.request_id = %s
+"""
+
+
+def _reap_stale_generations(cur, conv_id: str, stale_seconds: float) -> int:
+    """将长时间未更新心跳时间戳的运行中生成任务置为 failed，并补写一条中断提示消息。
+
+    进程异常退出或重启时，生成任务无法自行结束；心跳时间戳停止更新后，
+    由后续请求在同一事务内执行补偿，避免 generations 中的任务长期停留在
+    running 状态。
+    """
+    cur.execute(
+        "SELECT id, assistant_message_id FROM generations "
+        "WHERE conversation_id = %s AND status = 'running' "
+        "AND heartbeat_at < now() - make_interval(secs => %s) "
+        "FOR UPDATE",
+        (conv_id, stale_seconds),
+    )
+    rows = cur.fetchall()
+    for row in rows:
+        message_id = row["assistant_message_id"]
+        if message_id is None:
+            cur.execute(
+                "INSERT INTO messages (conversation_id, role, content, status, generation_id) "
+                "VALUES (%s, 'assistant', %s, 'error', %s) RETURNING id",
+                (conv_id, "（回答中断）", row["id"]),
+            )
+            message_id = cur.fetchone()["id"]
+        cur.execute(
+            "UPDATE generations SET status = 'failed', error = %s, "
+            "assistant_message_id = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+            ("生成中断：服务异常或进程重启", message_id, row["id"]),
+        )
+    if rows:
+        print(f"[会话] 已将 {len(rows)} 个超时未更新的生成任务标记为失败 conv={conv_id}")
+    return len(rows)
+
+
+def begin_generation(
+    user_id: int,
+    conv_id: str,
+    request_id: str,
+    content: str,
+    stale_seconds: float,
+) -> dict:
+    """登记一次生成任务，并原子写入用户消息。
+
+    同一会话同时只允许一个运行中的任务（由数据库部分唯一索引保证），
+    同一 request_id 重复到达时返回既有任务，供调用方幂等重放。
+
+    返回：
+    - {"status": "started", "generation_id": ..., "user_message_id": ...}
+    - {"status": "replay", "generation": {...}}
+    - {"status": "busy"}
+    - {"status": "not_found"}：会话不存在或不属于当前用户
+    """
     conn = _get_conn()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
+            # 与删除会话共用同一把事务级咨询锁，避免「登记—删除」互相穿插
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
             cur.execute(
-                "SELECT id FROM conversations WHERE id = %s AND user_id = %s",
+                "SELECT id FROM conversations WHERE id = %s AND user_id = %s FOR SHARE",
                 (conv_id, user_id),
             )
-            if not cur.fetchone():
-                return False
+            if cur.fetchone() is None:
+                conn.rollback()
+                return {"status": "not_found"}
+
+            _reap_stale_generations(cur, conv_id, stale_seconds)
+
+            cur.execute(_GENERATION_REPLAY_QUERY, (conv_id, request_id))
+            existing = cur.fetchone()
+            if existing is not None:
+                conn.commit()
+                return {"status": "replay", "generation": existing}
+
+            try:
+                cur.execute(
+                    "INSERT INTO generations (conversation_id, user_id, request_id) "
+                    "VALUES (%s, %s, %s) RETURNING id",
+                    (conv_id, user_id, request_id),
+                )
+                generation_id = cur.fetchone()["id"]
+            except psycopg.errors.UniqueViolation:
+                # 并发登记：可能是其他请求占用了运行位，也可能是同一 request_id 同时到达
+                conn.rollback()
+                with conn.cursor(row_factory=dict_row) as cur2:
+                    cur2.execute(_GENERATION_REPLAY_QUERY, (conv_id, request_id))
+                    existing = cur2.fetchone()
+                    cur2.execute(
+                        "SELECT id FROM conversations WHERE id = %s AND user_id = %s",
+                        (conv_id, user_id),
+                    )
+                    conv_exists = cur2.fetchone() is not None
+                conn.commit()
+                if existing is not None:
+                    return {"status": "replay", "generation": existing}
+                return {"status": "busy" if conv_exists else "not_found"}
+
             cur.execute(
-                "INSERT INTO messages (conversation_id, role, content, status) VALUES (%s, %s, %s, %s)",
-                (conv_id, role, content, status),
+                "INSERT INTO messages (conversation_id, role, content, generation_id) "
+                "VALUES (%s, 'user', %s, %s) RETURNING id",
+                (conv_id, content, generation_id),
+            )
+            user_message_id = cur.fetchone()["id"]
+            cur.execute(
+                "UPDATE generations SET user_message_id = %s WHERE id = %s",
+                (user_message_id, generation_id),
             )
             cur.execute(
                 "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = %s",
                 (conv_id,),
             )
         conn.commit()
-        return True
+        return {
+            "status": "started",
+            "generation_id": generation_id,
+            "user_message_id": user_message_id,
+        }
     finally:
         _put_conn(conn)
 
 
-def delete_conversation(user_id: int, conv_id: str) -> bool:
+def touch_generation(generation_id: int) -> dict | None:
+    """更新生成任务的心跳时间戳；任务已结束或被取消时返回停止信号。"""
     conn = _get_conn()
     try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE generations SET heartbeat_at = CURRENT_TIMESTAMP "
+                "WHERE id = %s AND status = 'running' "
+                "RETURNING cancel_requested",
+                (generation_id,),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        if row is None:
+            return None
+        return {"running": True, "cancel_requested": bool(row["cancel_requested"])}
+    finally:
+        _put_conn(conn)
+
+
+def finish_generation(
+    generation_id: int,
+    status: str,
+    message_status: str,
+    content: str,
+    error: str | None,
+) -> int | None:
+    """将生成任务置为终态并写入助手消息（终态：completed / failed / cancelled）。
+
+    只有仍处于 running 的任务会被处理；已被补偿流程处理过的任务直接跳过，
+    因此重复调用不会产生重复消息。
+    """
+    conn = _get_conn()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT conversation_id, status FROM generations WHERE id = %s FOR UPDATE",
+                (generation_id,),
+            )
+            row = cur.fetchone()
+            if row is None or row["status"] != "running":
+                conn.rollback()
+                return None
+            cur.execute(
+                "INSERT INTO messages (conversation_id, role, content, status, generation_id) "
+                "VALUES (%s, 'assistant', %s, %s, %s) RETURNING id",
+                (row["conversation_id"], content, message_status, generation_id),
+            )
+            message_id = cur.fetchone()["id"]
+            cur.execute(
+                "UPDATE generations SET status = %s, error = %s, assistant_message_id = %s, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (status, error, message_id, generation_id),
+            )
+        # 不更新 conversations：会话的 updated_at 已在登记用户消息时刷新，
+        # 这里只锁 generations 行，避免与删除会话（先锁 conversations 再锁 generations）
+        # 形成锁顺序反转。
+        conn.commit()
+        return message_id
+    finally:
+        _put_conn(conn)
+
+
+def delete_conversation_guarded(
+    user_id: int,
+    conv_id: str,
+    stale_seconds: float,
+    cleanup,
+) -> str:
+    """删除会话：与生成任务共用会话锁，运行中的任务会先收到取消请求并拒绝本次删除。
+
+    cleanup 在持锁事务内执行（用于清理 LangGraph 检查点），失败时整体回滚，
+    业务数据保持原样。返回 'deleted' | 'busy' | 'not_found'。
+    """
+    conn = _get_conn()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
+            cur.execute(
+                "SELECT id FROM conversations WHERE id = %s AND user_id = %s FOR UPDATE",
+                (conv_id, user_id),
+            )
+            if cur.fetchone() is None:
+                conn.rollback()
+                return "not_found"
+
+            _reap_stale_generations(cur, conv_id, stale_seconds)
+            cur.execute(
+                "SELECT id FROM generations "
+                "WHERE conversation_id = %s AND status = 'running' LIMIT 1",
+                (conv_id,),
+            )
+            if cur.fetchone() is not None:
+                cur.execute(
+                    "UPDATE generations SET cancel_requested = TRUE "
+                    "WHERE conversation_id = %s AND status = 'running'",
+                    (conv_id,),
+                )
+                conn.commit()
+                return "busy"
+
+        # 检查点清理可能包含重试等待，放在同一持锁事务内完成：
+        # 期间其他进程无法登记新的生成任务；失败则回滚，业务数据不受影响。
+        cleanup()
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM conversations WHERE id = %s AND user_id = %s",
                 (conv_id, user_id),
             )
-            changed = cur.rowcount > 0
         conn.commit()
-        return changed
+        return "deleted"
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         _put_conn(conn)

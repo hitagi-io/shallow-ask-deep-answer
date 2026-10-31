@@ -236,9 +236,11 @@ def _tool_calls(chunk) -> list[tuple[str | None, str | None]]:
     ]
 
 
-def _general_stream(raw_stream):
+def _general_stream(raw_stream, should_stop=None):
     """通用模式：不做文案接管，仅过滤工具消息。"""
     for item in raw_stream:
+        if should_stop is not None and should_stop():
+            return
         chunk = item[0] if isinstance(item, (tuple, list)) and len(item) == 2 else item
         text = _chunk_text(chunk)
         if getattr(chunk, "type", "") == "tool":
@@ -247,33 +249,52 @@ def _general_stream(raw_stream):
             yield text
 
 
-def guarded_stream(raw_stream, kb_only: bool = True):
+def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
     """把 Agent 的原始消息流包装为"用户可见文本流"。
 
     严格模式先缓冲全部模型文本，回合结束后依据结构化报告统一裁决：
     有有效证据才放行，并校验回答中的来源引用；降级回合由本函数直接产出固定文案。
+
+    should_stop 为取消判定（threading.Event.is_set）。kb 模式因为要缓冲全部文本，
+    外层无法在缓冲过程中察觉取消，必须在读取上游消息的循环里主动检查，
+    否则停止/断连后仍会把整个模型流读完。
+
+    无论正常结束、异常还是调用方 close()，都在 finally 里显式关闭原始流，
+    保证取消能继续传播到 LangGraph / 模型请求，而不是只停在外层包装器。
     """
-    if not kb_only:
-        yield from _general_stream(raw_stream)
-        return
+    try:
+        if not kb_only:
+            yield from _general_stream(raw_stream, should_stop=should_stop)
+            return
 
-    guard = AnswerGuard()
-    for item in raw_stream:
-        chunk = item[0] if isinstance(item, (tuple, list)) and len(item) == 2 else item
-        for name, call_id in _tool_calls(chunk):
-            guard.note_tool_call(name, call_id)
-        if getattr(chunk, "type", "") == "tool":
-            guard.feed_tool(
-                _chunk_text(chunk),
-                getattr(chunk, "name", None),
-                getattr(chunk, "tool_call_id", None),
-            )
-            continue
-        guard.feed_text(_chunk_text(chunk))
+        guard = AnswerGuard()
+        for item in raw_stream:
+            if should_stop is not None and should_stop():
+                return
+            chunk = item[0] if isinstance(item, (tuple, list)) and len(item) == 2 else item
+            for name, call_id in _tool_calls(chunk):
+                guard.note_tool_call(name, call_id)
+            if getattr(chunk, "type", "") == "tool":
+                guard.feed_tool(
+                    _chunk_text(chunk),
+                    getattr(chunk, "name", None),
+                    getattr(chunk, "tool_call_id", None),
+                )
+                continue
+            guard.feed_text(_chunk_text(chunk))
 
-    emit = guard.finish()
-    if emit:
-        yield emit
+        if should_stop is not None and should_stop():
+            return
+        emit = guard.finish()
+        if emit:
+            yield emit
+    finally:
+        close = getattr(raw_stream, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception as e:
+                print(f"[兜底] 关闭上游消息流失败（已忽略）: {e}")
 
 
 def _merge_sources(reports: list[dict]) -> list[str]:

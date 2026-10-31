@@ -1,3 +1,7 @@
+# 单次模型请求超时（秒）与失败重试次数。超时保证取消后残留的上游线程能自行退出。
+llm_request_timeout_seconds: 120
+llm_max_retries: 1
+
 rag_summary_model: "deepseek-v4.1-flash-1017"
 rag_summary_model_provider: "openai"
 rag_summary_model_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"

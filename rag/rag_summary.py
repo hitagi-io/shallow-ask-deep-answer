@@ -63,7 +63,10 @@ rag_summary_agent = create_agent(
     model=init_chat_model(
         model=agent_config["rag_summary_model"],
         model_provider=agent_config["rag_summary_model_provider"],
-        base_url=agent_config["rag_summary_model_base_url"]),
+        base_url=agent_config["rag_summary_model_base_url"],
+        timeout=float(agent_config.get("llm_request_timeout_seconds", 120)),
+        max_retries=int(agent_config.get("llm_max_retries", 1)),
+    ),
     tools=[do_retrieval],
     system_prompt=render_summary_prompt(),
 )

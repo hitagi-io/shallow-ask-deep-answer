@@ -139,6 +139,8 @@ class MainDeepAgent:
             model=agent_config["main_agent_model"],
             model_provider=agent_config["main_agent_model_provider"],
             base_url=agent_config["main_agent_model_base_url"],
+            timeout=float(agent_config.get("llm_request_timeout_seconds", 120)),
+            max_retries=int(agent_config.get("llm_max_retries", 1)),
         )
         self._pg_pool = ConnectionPool(
             conninfo=_PG_CONNECTION_STRING,
@@ -184,11 +186,11 @@ class MainDeepAgent:
             middleware=self._middleware(self.general_prompt),
         )
 
-    def ask_deep_agent(self, query, thread_id, kb_only=True):
+    def ask_deep_agent(self, query, thread_id, kb_only=True, should_stop=None):
         agent = self._kb_only_agent if kb_only else self._general_agent
         raw_stream = agent.stream(
             {"messages": [{"role": "human", "content": query}]},
             config={"configurable": {"thread_id": thread_id}},
             stream_mode="messages",
         )
-        yield from guarded_stream(raw_stream, kb_only=kb_only)
+        yield from guarded_stream(raw_stream, kb_only=kb_only, should_stop=should_stop)

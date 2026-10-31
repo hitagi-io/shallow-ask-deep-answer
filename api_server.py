@@ -21,6 +21,7 @@ from utils.file_tool import list_files_with_allowed_type, get_file_md5_hex, read
 from utils.config_loader import vector_db_config
 from utils.path_tool import get_abs_path
 from utils.pg_lock import SingleInstanceGuard, exclusive_section, shared_section
+from utils.stream_bridge import StreamBridge
 from auth import (
     PG_CONN,
     PG_POOL_MAX,
@@ -33,8 +34,10 @@ from auth import (
     list_conversations,
     create_conversation,
     update_conversation_title,
-    append_message,
-    delete_conversation,
+    begin_generation,
+    touch_generation,
+    finish_generation,
+    delete_conversation_guarded,
 )
 
 # 流式回答也占用线程池；该值应覆盖预期的同时在线流数。
@@ -45,12 +48,24 @@ ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "false").lower() in ("1", "true",
 CHAT_MESSAGE_MAX_CHARS = int(os.getenv("CHAT_MESSAGE_MAX_CHARS", "8000"))
 CHAT_THREAD_ID_MAX_CHARS = 128
 CONV_TITLE_MAX_CHARS = 255   # 与 conversations.title VARCHAR(255) 对齐
-MESSAGE_STATUS_VALUES = ("streaming", "completed", "error")
 
 CHAT_RATE_LIMIT = int(os.getenv("CHAT_RATE_LIMIT", "30"))
 CHAT_RATE_WINDOW_SECONDS = int(os.getenv("CHAT_RATE_WINDOW_SECONDS", "60"))
 MAX_CONCURRENT_CHAT_PER_USER = int(os.getenv("MAX_CONCURRENT_CHAT_PER_USER", "3"))
 CHAT_SLOT_MAX_AGE_SECONDS = int(os.getenv("CHAT_SLOT_MAX_AGE_SECONDS", "1800"))
+
+# 端到端生成截止时间：超过后服务端将该任务置为 failed，不再无限等待模型。
+CHAT_STREAM_DEADLINE_SECONDS = int(os.getenv("CHAT_STREAM_DEADLINE_SECONDS", "300"))
+# 生成任务存活检测：后台协程按此间隔更新 generations.heartbeat_at；超过
+# CHAT_GENERATION_STALE_SECONDS 未更新的运行中任务，视为所属进程已异常退出，
+# 由下一次请求在同一事务内置为 failed 并补写中断提示。
+CHAT_GENERATION_HEARTBEAT_SECONDS = int(os.getenv("CHAT_GENERATION_HEARTBEAT_SECONDS", "10"))
+CHAT_GENERATION_STALE_SECONDS = max(
+    int(os.getenv("CHAT_GENERATION_STALE_SECONDS", "120")),
+    CHAT_GENERATION_HEARTBEAT_SECONDS * 3,
+)
+
+SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
 
@@ -214,6 +229,8 @@ async def _scheduled_health_loop():
 class ChatRequest(BaseModel):
     message: str = Field(max_length=CHAT_MESSAGE_MAX_CHARS)
     thread_id: str = Field(max_length=CHAT_THREAD_ID_MAX_CHARS)
+    # 客户端生成的幂等键：同一会话内重复提交不会重复写消息或重复生成
+    request_id: str = Field(pattern=r"^[0-9a-zA-Z_-]{8,64}$")
     kb_only: bool = True
 
 
@@ -233,12 +250,6 @@ class CreateConversationRequest(BaseModel):
 
 class UpdateTitleRequest(BaseModel):
     title: str = Field(max_length=CONV_TITLE_MAX_CHARS)
-
-
-class AppendMessageRequest(BaseModel):
-    role: str
-    content: str
-    status: str | None = None
 
 
 
@@ -325,39 +336,46 @@ def api_update_title(conv_id: str, req: UpdateTitleRequest, user: dict = Depends
     return {"message": "ok"}
 
 
-@app.post("/api/conversations/{conv_id}/messages")
-def api_append_message(conv_id: str, req: AppendMessageRequest, user: dict = Depends(get_current_user)):
-    if req.role not in ("user", "assistant"):
-        raise HTTPException(status_code=400, detail="非法的消息角色")
-    if req.status is not None and req.status not in MESSAGE_STATUS_VALUES:
-        raise HTTPException(status_code=400, detail="非法的消息状态")
-    if not append_message(user["user_id"], conv_id, req.role, req.content, req.status):
-        raise HTTPException(status_code=404, detail="会话不存在")
-    return {"message": "ok"}
+def _purge_thread_checkpoints(thread_id: str) -> None:
+    """删除会话对应的 LangGraph 检查点，最多重试 3 次；失败抛异常触发事务回滚。"""
+    for attempt in range(3):
+        try:
+            agent.checkpointer.delete_thread(thread_id)
+            return
+        except Exception as e:
+            print(f"[会话] 清理检查点失败 thread={thread_id}（第 {attempt + 1} 次尝试）: {e}")
+            if attempt < 2:
+                time.sleep(0.5)
+    raise RuntimeError("清理会话上下文失败")
 
 
 @app.delete("/api/conversations/{conv_id}")
 def api_delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
+    """删除会话：与生成任务互斥，运行中的回答会先收到取消信号，本次删除返回 409。
+
+    检查点清理与会话删除放在同一个持锁事务里：清理失败时整体回滚，
+    不会出现「上下文已删、业务会话还在」的状态。
+    """
     thread_id = f"{user['user_id']}:{conv_id}"
-    last_err = None
-    for attempt in range(3):
-        try:
-            agent.checkpointer.delete_thread(thread_id)
-            last_err = None
-            break
-        except Exception as e:
-            last_err = e
-            print(f"[会话] 清理检查点失败 thread={thread_id}（第 {attempt + 1} 次尝试）: {e}")
-            time.sleep(0.5)
-    if last_err is not None:
+    try:
+        result = delete_conversation_guarded(
+            user["user_id"],
+            conv_id,
+            CHAT_GENERATION_STALE_SECONDS,
+            lambda: _purge_thread_checkpoints(thread_id),
+        )
+    except Exception as e:
+        print(f"[会话] 删除失败 conv={conv_id}: {e}")
         raise HTTPException(status_code=500, detail="清理会话上下文失败，请稍后重试")
-    if not delete_conversation(user["user_id"], conv_id):
+    if result == "not_found":
         raise HTTPException(status_code=404, detail="会话不存在")
+    if result == "busy":
+        raise HTTPException(status_code=409, detail="回答正在生成，已请求取消，请稍后再试")
     return {"message": "ok"}
 
 
 
-_chat_slots: dict[int, dict[int, float]] = {}
+_chat_slots: dict[int, dict[int, dict]] = {}
 _chat_slot_seq = itertools.count(1)
 _chat_slots_lock = threading.Lock()
 
@@ -365,23 +383,39 @@ _chat_slots_lock = threading.Lock()
 def _acquire_chat_slot(user_id: int) -> int | None:
     """占用一个对话并发槽，返回槽位 token；已达上限返回 None。
 
-    顺带清理超过 CHAT_SLOT_MAX_AGE_SECONDS 的槽位，作为兜底：正常路径下槽位由
-    流式生成器的 finally 释放（客户端中止时异步生成器会被 Starlette 取消并必定
-    走到 finally）；该超时只用于极端情况，避免槽位泄漏后该用户被长期限流。
+    占用时间达到 CHAT_SLOT_MAX_AGE_SECONDS 的槽位会被移除，并在释放锁之后通知
+    对应任务取消。仅移除槽位记录而不终止任务，会使已超时任务继续占用模型请求
+    与线程资源。
     """
     now = time.monotonic()
+    expired_cancels = []
     with _chat_slots_lock:
-        slots = {
-            token: started for token, started in _chat_slots.get(user_id, {}).items()
-            if now - started < CHAT_SLOT_MAX_AGE_SECONDS
-        }
-        if len(slots) >= MAX_CONCURRENT_CHAT_PER_USER:
-            _chat_slots[user_id] = slots
-            return None
-        token = next(_chat_slot_seq)
-        slots[token] = now
+        slots: dict[int, dict] = {}
+        for token, info in _chat_slots.get(user_id, {}).items():
+            if now - info["started"] < CHAT_SLOT_MAX_AGE_SECONDS:
+                slots[token] = info
+            else:
+                expired_cancels.append(info.get("cancel"))
+        token = None
+        if len(slots) < MAX_CONCURRENT_CHAT_PER_USER:
+            token = next(_chat_slot_seq)
+            slots[token] = {"started": now, "cancel": None}
         _chat_slots[user_id] = slots
-        return token
+    for cancel in expired_cancels:
+        if cancel is not None:
+            try:
+                cancel()
+            except Exception as e:
+                print(f"[对话流] 取消超时槽位任务失败（已忽略）: {e}")
+    return token
+
+
+def _bind_chat_slot_cancel(user_id: int, token: int, cancel) -> None:
+    """把槽位与生成任务的取消入口绑定，槽位超时清理时可以真正停止任务。"""
+    with _chat_slots_lock:
+        info = _chat_slots.get(user_id, {}).get(token)
+        if info is not None:
+            info["cancel"] = cancel
 
 
 def _release_chat_slot(user_id: int, token: int) -> None:
@@ -394,6 +428,24 @@ def _release_chat_slot(user_id: int, token: int) -> None:
             _chat_slots.pop(user_id, None)
 
 
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _generation_heartbeat(generation_id: int, bridge: StreamBridge) -> None:
+    """按固定间隔更新生成任务的心跳时间戳；任务已结束或被取消时停止上游生成。"""
+    while True:
+        await asyncio.sleep(CHAT_GENERATION_HEARTBEAT_SECONDS)
+        try:
+            state = await asyncio.to_thread(touch_generation, generation_id)
+        except Exception as e:
+            print(f"[对话流] 更新生成任务心跳时间戳失败 gen={generation_id}: {e}")
+            continue
+        if state is None or not state["running"] or state["cancel_requested"]:
+            bridge.stop()
+            return
+
+
 @app.post("/api/chat/stream")
 async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     if not req.message.strip():
@@ -402,40 +454,184 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         check_rate, "chat", str(user["user_id"]), CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_SECONDS
     ):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+
     slot = _acquire_chat_slot(user["user_id"])
     if slot is None:
         raise HTTPException(status_code=429, detail="并发回答数过多，请等待当前回答完成")
 
-    async def generate():
-        stream = agent.ask_deep_agent(req.message, f"{user['user_id']}:{req.thread_id}", kb_only=req.kb_only)
-        sentinel = object()
+    # 服务端统一登记生成任务并写入用户消息：会话必须存在且属于当前用户；
+    # 同一会话只允许一个运行中任务，同一 request_id 重复提交按幂等重放处理。
+    try:
+        begun = await asyncio.to_thread(
+            begin_generation,
+            user["user_id"],
+            req.thread_id,
+            req.request_id,
+            req.message,
+            CHAT_GENERATION_STALE_SECONDS,
+        )
+    except Exception as e:
+        _release_chat_slot(user["user_id"], slot)
+        print(f"[对话流] 登记生成任务失败 thread={req.thread_id}: {e}")
+        raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
 
-        def _next_chunk():
+    if begun["status"] == "not_found":
+        _release_chat_slot(user["user_id"], slot)
+        raise HTTPException(status_code=404, detail="会话不存在或已被删除")
+    if begun["status"] == "busy":
+        _release_chat_slot(user["user_id"], slot)
+        raise HTTPException(status_code=409, detail="当前会话已有回答正在生成，请稍后再试")
+
+    if begun["status"] == "replay":
+        generation = begun["generation"]
+        if generation["status"] == "running":
+            _release_chat_slot(user["user_id"], slot)
+            raise HTTPException(status_code=409, detail="该请求正在生成中，请稍后再试")
+
+        async def replay():
             try:
-                return next(stream)
-            except StopIteration:
-                return sentinel
+                if generation["status"] == "completed":
+                    content = generation.get("assistant_content") or ""
+                    if content:
+                        yield _sse({"type": "chunk", "content": content})
+                    yield _sse({
+                        "type": "done",
+                        "message_id": generation["assistant_message_id"],
+                        "user_message_id": generation["user_message_id"],
+                        "replayed": True,
+                    })
+                else:
+                    yield _sse({
+                        "type": "error",
+                        "status": "cancelled" if generation["status"] == "cancelled" else "error",
+                        "error": generation.get("error") or "该请求已结束，请重新发送",
+                        "message_id": generation["assistant_message_id"],
+                        "replayed": True,
+                    })
+            finally:
+                _release_chat_slot(user["user_id"], slot)
+
+        return StreamingResponse(replay(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+    user_message_id = begun["user_message_id"]
+    generation_id = begun["generation_id"]
+    thread_key = f"{user['user_id']}:{req.thread_id}"
+
+    async def generate():
+        parts: list[str] = []
+        # 默认按取消处理：客户端断开或任务被外部取消时进入该分支
+        terminal = {"status": "cancelled", "message_status": "cancelled", "error": None}
+        finalized = False
+        bridge: StreamBridge | None = None
+        heartbeat: asyncio.Task | None = None
+
+        async def finalize() -> int | None:
+            nonlocal finalized
+            with anyio.CancelScope(shield=True):
+                message_id = await anyio.to_thread.run_sync(
+                    finish_generation,
+                    generation_id,
+                    terminal["status"],
+                    terminal["message_status"],
+                    "".join(parts),
+                    terminal["error"],
+                )
+            finalized = True
+            return message_id
 
         try:
-            while True:
-                chunk = await anyio.to_thread.run_sync(_next_chunk)
-                if chunk is sentinel:
-                    break
-                yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
-        except Exception as e:
-            print(f"[对话流] 回答失败 thread={user['user_id']}:{req.thread_id}: {e}")
-            yield f"data: {json.dumps({'error': '服务处理异常，请稍后重试'}, ensure_ascii=False)}\n\n"
-        finally:
+            # 共享取消事件：桥接层 stop() 后，kb 模式的缓冲循环也会停止读取上游
+            cancel_event = threading.Event()
+            bridge = StreamBridge(
+                agent.ask_deep_agent(
+                    req.message,
+                    thread_key,
+                    kb_only=req.kb_only,
+                    should_stop=cancel_event.is_set,
+                ),
+                cancel_event=cancel_event,
+            )
+            _bind_chat_slot_cancel(user["user_id"], slot, bridge.stop)
+            heartbeat = asyncio.create_task(_generation_heartbeat(generation_id, bridge))
+
+            yield _sse({"type": "start", "user_message_id": user_message_id})
+
             try:
-                stream.close()
-            except ValueError:
-                pass
+                async with asyncio.timeout(CHAT_STREAM_DEADLINE_SECONDS):
+                    while True:
+                        kind, payload = await bridge.receive()
+                        if kind == "chunk":
+                            parts.append(payload)
+                            yield _sse({"type": "chunk", "content": payload})
+                        elif kind == "end":
+                            terminal = {
+                                "status": "completed",
+                                "message_status": "completed",
+                                "error": None,
+                            }
+                            break
+                        elif kind == "cancelled":
+                            terminal = {
+                                "status": "cancelled",
+                                "message_status": "cancelled",
+                                "error": "回答已取消",
+                            }
+                            break
+                        else:
+                            raise payload
+            except TimeoutError:
+                terminal = {
+                    "status": "failed",
+                    "message_status": "error",
+                    "error": "回答超时，请稍后重试",
+                }
+                print(f"[对话流] 回答超时 thread={thread_key}（{CHAT_STREAM_DEADLINE_SECONDS}s）")
             except Exception as e:
-                print(f"[对话流] 关闭上游生成器失败（已忽略）: {e}")
+                terminal = {
+                    "status": "failed",
+                    "message_status": "error",
+                    "error": "服务处理异常，请稍后重试",
+                }
+                print(f"[对话流] 回答失败 thread={thread_key}: {e}")
+
+            try:
+                message_id = await finalize()
+            except Exception as e:
+                print(f"[对话流] 保存生成结果失败 gen={generation_id}: {e}")
+                yield _sse({
+                    "type": "error",
+                    "status": "error",
+                    "error": "回答已结束，但保存失败，请刷新后重试",
+                })
+                return
+
+            if terminal["status"] == "completed":
+                yield _sse({
+                    "type": "done",
+                    "message_id": message_id,
+                    "user_message_id": user_message_id,
+                })
+            else:
+                yield _sse({
+                    "type": "error",
+                    "status": terminal["status"],
+                    "error": terminal["error"],
+                    "message_id": message_id,
+                })
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+            if bridge is not None:
+                bridge.stop()
+            if not finalized:
+                # 客户端断开 / 任务被取消：在 shield 中完成状态落库，避免清理被取消打断
+                try:
+                    await finalize()
+                except Exception as e:
+                    print(f"[对话流] 保存生成结果失败 gen={generation_id}: {e}")
             _release_chat_slot(user["user_id"], slot)
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(generate(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 
