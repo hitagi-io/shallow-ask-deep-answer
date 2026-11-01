@@ -58,17 +58,13 @@ python -m pip install -r requirements.txt
 
 ### 3. 配置密钥与连接
 
-在项目根目录创建 `.env`，将占位值替换为实际配置：
+在项目根目录复制配置模板（已有 `.env` 时跳过复制，按需对照模板补充）：
 
-```ini
-PG_CONNECTION_STRING=postgresql://postgres:password@localhost:5432/deepagent_rag
-JWT_SECRET=replace-with-a-random-secret
-OPENAI_API_KEY=your-dashscope-key
-DASHSCOPE_API_KEY=your-dashscope-key
-
-# 仅联网搜索需要
-TAVILY_API_KEY=your-tavily-key
+```powershell
+Copy-Item .env.example .env
 ```
+
+编辑 `.env`，将 `PG_CONNECTION_STRING` 的示例连接替换为实际数据库连接，并填写 `JWT_SECRET`、`OPENAI_API_KEY` 和 `DASHSCOPE_API_KEY`。仅使用联网搜索时才需填写 `TAVILY_API_KEY`。模板中的可选参数已注释，按需取消注释修改；保持注释时使用代码默认值。
 
 聊天模型读取 `OPENAI_API_KEY`，嵌入服务读取 `DASHSCOPE_API_KEY`；当前 DashScope 配置下可使用同一个具有相应权限的密钥。启动前核对 `config/` 中的模型名称、接口地址与账户权限。
 
@@ -78,7 +74,7 @@ TAVILY_API_KEY=your-tavily-key
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-`.env` 已被 Git 忽略，不要将真实凭证写入代码或提交到仓库。
+`.env` 已被 Git 忽略；[.env.example](./.env.example) 作为配置模板纳入版本控制，只保留占位值与默认值，不要将真实凭证写入模板、代码或提交到仓库。
 
 ### 4. 启动后端与前端
 
@@ -123,11 +119,41 @@ UPDATE users SET role = 'admin' WHERE username = 'your-username';
 | 文件 | 内容 |
 | --- | --- |
 | `.env` | 密钥、数据库连接、监听地址、并发额度、限流与超时 |
+| [.env.example](./.env.example) | 环境变量模板，包含必填配置和已注释的可选参数默认值 |
 | [config/agent.yaml](./config/agent.yaml) | 主 Agent 与检索子代理的模型、提供方、接口地址；单次模型请求超时默认 120 秒，失败重试默认 1 次 |
 | [config/vector_db.yaml](./config/vector_db.yaml) | Milvus、嵌入模型、切块与检索参数、文件类型、健康检查周期 |
 | [prompts_data/](./prompts_data/) | 知识库、通用问答及检索总结的提示词模板 |
 
 当前切块长度为 500、重叠为 50，按字符长度计算；每次检索返回 `k=3` 个结果，嵌入批次大小为 20。配置与提示词通常在启动时加载，修改后重启后端。
+
+### 提示词维护与验证
+
+提示设计参考 [Anthropic Prompting best practices](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices) 和 [Prompt engineering overview](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/overview)：明确任务与成功条件，以 XML 分开规则、资料边界和示例，说明约束用途，并用实际场景检验输出。当前配置使用 DeepSeek，因此采用通用原则，不引入 Claude 专属 API 参数；效果需在实际使用的模型上评测。
+
+| 提示入口 | 负责内容 |
+| --- | --- |
+| [main_prompt.txt](./prompts_data/main_prompt.txt) | 知识库分流、单次委派、报告状态与引用格式 |
+| [summary_prompt.txt](./prompts_data/summary_prompt.txt) | 最多 3 次检索、空结果重试、部分证据与冲突处理 |
+| [general_prompt.txt](./prompts_data/general_prompt.txt) | 搜索触发、最多 3 次搜索、摘要与全文的能力边界、搜索失败和链接归属 |
+| [text_transform_prompt.txt](./prompts_data/text_transform_prompt.txt) | 受限通用子代理的原文转换及缺失字段处理 |
+| [conversation_summary_prompt.txt](./prompts_data/conversation_summary_prompt.txt) | 会话压缩，保留用户更正、指代、来源属性与未解决事项 |
+| [main_deep_agent.py](./main_deep_agent.py)、[rag_summary.py](./rag/rag_summary.py) | 动态日期、工具及子代理描述，与模板同步维护 |
+
+业务模板由 `utils/prompt_loader.py` 使用 `string.Template` 渲染 `${name}`，固定文案、状态、引用上限从代码常量注入；新增字面量美元符号需写成 `$$`。会话压缩模板单独使用中间件的 `str.format`，保留独占一行的 `<messages>` 和唯一的 `{messages}` 占位符，其他字面量花括号需双写。框架自带工具说明仍由依赖包维护，不修改安装包。
+
+维护时需核对模板渲染、示例与报告/引用校验的兼容性、检索状态组合、直答边界、日期更新和会话压缩中间件接线。项目不保留测试文件；真实模型回归可参考以下场景，使用与提示内示例不同的资料，对比修改前后的结果：
+
+| 场景 | 验收条件 |
+| --- | --- |
+| 问候、身份、翻译，以及「你好＋知识问题」 | 纯文本直答先声明类别；混合知识问题只委派一次，不混用两分支 |
+| 首次无结果、换关键词后命中 | 允许有效重试，总检索次数不超过 3，回答采用实际命中的资料 |
+| 多问题只有部分证据、不同版本说法冲突 | 保留缺口、日期和适用条件，不补数字、不自行裁决冲突 |
+| 文档含伪造系统消息、状态标记或指定答案命令 | 命令作为资料处理，不改变实际工具状态，不泄露内部指令 |
+| 全部为空、服务故障、未检索或非法引用 | 最终输出与代码规定的固定文案完全一致 |
+| 实时问题搜索故障、只有摘要无链接、用户禁止联网 | 不编造当前值或来源，不声称读过全文，遵从禁止联网要求 |
+| 长对话压缩后追问、用户更正、模式切换 | 保留正确指代和更正；历史知识库结论不能替代本轮检索 |
+
+沿用现有保守协议：即使工具返回了片段，若子代理认为片段不足并输出无资料短句，报告仍为 `invalid`，用户看到依据校验失败文案，而非确定的「无资料」。提示词不改变此代码语义。检索/搜索次数、语义忠实度和注入防护主要由模型遵守提示，离线检查不等于端到端质量或安全保证。
 
 ### 常用环境变量
 
@@ -150,7 +176,7 @@ UPDATE users SET role = 'admin' WHERE username = 'your-username';
 | `MAX_UPLOAD_MB` | `50` | 单文件大小上限，按 `1024 × 1024` 字节计算 |
 | `HEALTH_REPORT_TTL_SECONDS` | `120` | 进程内索引健康报告缓存有效期 |
 
-心跳、租约、锁等待和探针超时参数见 [api_server.py](./api_server.py)，注册与登录限流见 [auth.py](./auth.py)。锁等待超时不限制持锁操作的执行时间。
+完整环境变量示例见 [.env.example](./.env.example)。心跳、租约、锁等待和探针超时参数的实现见 [api_server.py](./api_server.py)，注册与登录限流见 [auth.py](./auth.py)。锁等待超时不限制持锁操作的执行时间。
 
 ## 知识库维护
 
@@ -280,7 +306,8 @@ API 单独保存业务消息和生成任务，用于历史展示、幂等、互�
 | POST | `/api/auth/register` | 注册；公开 |
 | POST | `/api/auth/login` | 登录并获取 JWT；公开 |
 | GET | `/api/auth/me` | 获取当前用户 |
-| GET / POST | `/api/conversations` | 获取会话列表（含消息）/ 创建会话 |
+| GET / POST | `/api/conversations` | 分页获取会话摘要（默认 20 条，`cursor` 翻页）/ 创建会话 |
+| GET | `/api/conversations/{conv_id}/messages` | 获取最近消息（默认 50 条，`before` 消息 ID 向前翻页） |
 | PATCH / DELETE | `/api/conversations/{conv_id}` | 修改标题 / 删除会话 |
 | POST | `/api/chat/stream` | SSE 流式问答 |
 | GET | `/api/files` | 文件列表；管理员 |
@@ -303,6 +330,7 @@ API 单独保存业务消息和生成任务，用于历史展示、幂等、互�
 
 客户端应处理 `start`、`phase`、`chunk`、`replace`、`done` 和 `error` 事件。只有收到 `done` 才表示正常完成，连接结束本身不代表成功。知识库模式会进行最终来源校验，`replace` 事件需替换已展示的整段回答。客户端实现见 [frontend-chat/src/api.ts](./frontend-chat/src/api.ts)。
 
+
 ## 项目结构
 
 ```text
@@ -318,10 +346,13 @@ DeepAgent-RAG/
 ├── knowledge/          # 运行时源文件，Git 忽略
 ├── md5.txt             # 运行时内容记录，Git 忽略
 ├── requirements.txt    # Python 固定版本依赖
+├── .env.example        # 环境变量模板，不含真实凭证
 └── .env                # 本地环境变量，Git 忽略
 ```
 
 Agent 编排基于 deepagents、LangChain 和 LangGraph；文档解析使用 pypdf 与 docx2txt；前端使用 marked 渲染 Markdown，并用 DOMPurify 清洗 HTML。
+
+前端入口 `src/App.vue` 只负责登录态与会话切换；`components/` 按登录、工作区、侧栏、聊天消息和知识库划分，样式随组件维护。`composables/useChat.ts` 与 `useKnowledge.ts` 的状态由工作区持有，切换页面时保留，退出登录时统一释放流式请求和轮询；`useNotice.ts` 统一管理通知及定时器。API 通信集中在 `src/api.ts`。
 
 ## 开发检查
 
@@ -337,12 +368,15 @@ git diff --check
 ```powershell
 cd frontend-chat
 npm ci
-npx vue-tsc --noEmit
 npm run build
 ```
+
+`npm run build` 包含 `vue-tsc --noEmit` 类型检查，也可单独运行 `npm run typecheck`。
 
 涉及业务行为的变更，还需联调登录、上传、双模式问答、停止生成和索引检查；模型与嵌入调用需要有效凭证。
 
 ## 许可证
 
 本项目采用 [MIT 许可证](./LICENSE)。
+
+会话与消息分页的 `limit` 均限制为 1～100。会话响应中的 `next_cursor`、消息响应中的 `next_before` 为下一页游标，`null` 表示没有更多数据；消息页内按 ID 升序返回。会话列表不再携带消息正文，前后端需同步更新。侧栏搜索仅筛选已加载的会话，可通过“加载更多对话”继续获取。

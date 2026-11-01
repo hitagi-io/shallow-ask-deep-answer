@@ -7,10 +7,8 @@ __pycache__/
 *.egg-info/
 .installed.cfg
 *.egg
-md5.txt
 
 # Virtual Environments
-.env/
 .venv/
 venv/
 env/
@@ -34,21 +32,25 @@ logs/
 # Node
 node_modules/
 frontend-chat/dist/
+*.tsbuildinfo
 
 # Config
 .env
-*.local
+.env.*
+!.env.example
 
 # Knowledge base
-knowledge/
-
-# Streamlit
-.streamlit/
+/knowledge/
+/md5.txt
+/md5.txt.tmp
 
 # Testing and Linting
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 
 # Jupyter Notebook

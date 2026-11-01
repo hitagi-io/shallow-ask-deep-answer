@@ -7,12 +7,18 @@ export interface Message {
   content: string
   thinkingTime?: number
   status?: MessageStatus
+  kbOnly?: boolean
 }
 
 export interface Conversation {
   id: string
   title: string
   messages: Message[]
+  messagesLoaded?: boolean
+  nextBefore?: number | null
+  messagesLoading?: boolean
+  messagesError?: string
+  updatedAt?: string
 }
 
 export interface UserInfo {
@@ -67,7 +73,7 @@ function authHeaders(): Record<string, string> {
 // 401 统一回调：由应用层注册（清空登录态并展示登录页）
 let unauthorizedHandler: (() => void) | null = null
 
-export function setUnauthorizedHandler(fn: () => void) {
+export function setUnauthorizedHandler(fn: (() => void) | null) {
   unauthorizedHandler = fn
 }
 
@@ -77,8 +83,9 @@ export function setUnauthorizedHandler(fn: () => void) {
  * 登录接口不使用它——那里的 401 表示账号密码错误，而非会话过期。
  */
 async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+  const token = getToken()
   const res = await fetch(input, init)
-  if (res.status === 401) {
+  if (res.status === 401 && token === getToken()) {
     clearAuth()
     unauthorizedHandler?.()
   }
@@ -104,8 +111,7 @@ export async function apiRegister(username: string, password: string): Promise<v
     body: JSON.stringify({ username, password }),
   })
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}))
-    throw new Error(data.detail || '注册失败')
+    throw new Error(await errorMessage(res, '注册失败'))
   }
 }
 
@@ -116,8 +122,7 @@ export async function apiLogin(username: string, password: string): Promise<User
     body: JSON.stringify({ username, password }),
   })
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}))
-    throw new Error(data.detail || '登录失败')
+    throw new Error(await errorMessage(res, '登录失败'))
   }
   const data = await res.json()
   saveAuth(data.token, data.user)
@@ -133,15 +138,24 @@ export async function apiMe(): Promise<UserInfo> {
 
 // ---------- conversation API ----------
 
-export async function fetchConversations(): Promise<Record<string, Conversation>> {
-  const res = await apiFetch('/api/conversations', { headers: authHeaders() })
+export async function fetchConversations(cursor?: string | null): Promise<{
+  conversations: Omit<Conversation, 'messages'>[]; next_cursor: string | null
+}> {
+  const query = new URLSearchParams({ limit: '20' })
+  if (cursor) query.set('cursor', cursor)
+  const res = await apiFetch(`/api/conversations?${query}`, { headers: authHeaders() })
   if (!res.ok) throw new Error(await errorMessage(res, '获取会话列表失败'))
-  const data = await res.json()
-  const convs: Record<string, Conversation> = {}
-  for (const c of data.conversations as Conversation[]) {
-    convs[c.id] = c
-  }
-  return convs
+  return res.json()
+}
+
+export async function fetchMessages(id: string, before?: number | null): Promise<{
+  messages: Message[]; next_before: number | null
+}> {
+  const query = new URLSearchParams({ limit: '50' })
+  if (before != null) query.set('before', String(before))
+  const res = await apiFetch(`/api/conversations/${encodeURIComponent(id)}/messages?${query}`, { headers: authHeaders() })
+  if (!res.ok) throw new Error(await errorMessage(res, '获取消息失败'))
+  return res.json()
 }
 
 export async function createConversationApi(title: string): Promise<Conversation> {
@@ -151,7 +165,7 @@ export async function createConversationApi(title: string): Promise<Conversation
     body: JSON.stringify({ title }),
   })
   if (!res.ok) throw new Error(await errorMessage(res, '创建会话失败'))
-  return res.json()
+  return { ...(await res.json()), updatedAt: new Date().toISOString(), messagesLoaded: true, nextBefore: null }
 }
 
 export async function updateConversationTitle(id: string, title: string): Promise<void> {
@@ -333,13 +347,30 @@ export async function fetchFiles(): Promise<FileItem[]> {
   return data.files
 }
 
-export async function uploadFiles(files: File[]): Promise<{
+export async function uploadFiles(files: File[], onUploaded?: () => void, signal?: AbortSignal): Promise<{
   uploaded: { name: string; overwritten: boolean; indexed: boolean; error: string | null }[]
   errors: { name: string; error: string }[]
 }> {
   const form = new FormData()
   files.forEach(f => form.append('files', f))
-  const res = await apiFetch('/api/files/upload', { method: 'POST', headers: authHeaders(), body: form })
+  const token = getToken()
+  const res = await new Promise<Response>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', '/api/files/upload')
+    for (const [key, value] of Object.entries(authHeaders())) xhr.setRequestHeader(key, value)
+    const abort = () => xhr.abort()
+    xhr.upload.onload = () => onUploaded?.()
+    xhr.onload = () => {
+      if (xhr.status === 401 && getToken() === token) { clearAuth(); unauthorizedHandler?.() }
+      resolve(new Response(xhr.responseText, { status: xhr.status }))
+    }
+    xhr.onerror = () => reject(new Error('上传连接失败，请检查网络'))
+    xhr.onabort = () => reject(new DOMException('上传已取消', 'AbortError'))
+    xhr.onloadend = () => signal?.removeEventListener('abort', abort)
+    if (signal?.aborted) { reject(new DOMException('上传已取消', 'AbortError')); return }
+    signal?.addEventListener('abort', abort, { once: true })
+    xhr.send(form)
+  })
   if (!res.ok) throw new Error(await errorMessage(res, '上传失败'))
   return res.json()
 }

@@ -9,6 +9,7 @@ from utils.answer_guard import (
     SEARCH_ERROR_MARKER,
 )
 from utils.retrieval_protocol import (
+    CITATION_SOURCE_LIMIT,
     DIRECT_CATEGORIES,
     REPORT_PROTOCOL,
     RETRIEVAL_EMPTY_MARKER,
@@ -55,6 +56,7 @@ def render_main_prompt():
         copy_kb_miss=COPY_KB_MISS,
         copy_kb_unverified=COPY_KB_UNVERIFIED,
         direct_categories="、".join(DIRECT_CATEGORIES),
+        citation_source_limit=CITATION_SOURCE_LIMIT,
     )
 
 def render_summary_prompt():
@@ -65,6 +67,7 @@ def render_summary_prompt():
         sentinel_kb_miss=SENTINEL_KB_MISS,
         retrieval_error_marker=RETRIEVAL_ERROR_MARKER,
         retrieval_empty_marker=RETRIEVAL_EMPTY_MARKER,
+        citation_source_limit=CITATION_SOURCE_LIMIT,
     )
 
 def render_general_prompt():
@@ -74,3 +77,13 @@ def render_general_prompt():
         search_error_marker=SEARCH_ERROR_MARKER,
         search_empty_marker=SEARCH_EMPTY_MARKER,
     )
+
+
+def render_text_transform_prompt():
+    """渲染受限文本整理子代理提示词，复用协议中的无资料短句。"""
+    return _render('text_transform_prompt.txt', sentinel_kb_miss=SENTINEL_KB_MISS)
+
+
+def load_conversation_summary_prompt():
+    """保留 {messages}，由 SummarizationMiddleware 在运行时用 str.format 注入。"""
+    return load_prompts('conversation_summary_prompt.txt')

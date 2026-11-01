@@ -85,6 +85,22 @@ class RetrievalReport(BaseModel):
     retrieval_calls: list[dict]
 
 
+def build_retrieval_content(status: str, chunks: Sequence[tuple[str, str]]) -> str:
+    """模型可见的工具结果：代码状态与不可信资料分字段，转义嵌入的结构字符。"""
+    if status not in (STATUS_OK, STATUS_EMPTY, STATUS_ERROR):
+        raise ValueError(f"非法检索状态: {status}")
+    return json.dumps(
+        {
+            "status": status,
+            "documents": [
+                {"source": source, "content": content}
+                for source, content in chunks
+            ] if status == STATUS_OK else [],
+        },
+        ensure_ascii=False,
+    )
+
+
 def build_retrieval_artifact(
     status: str,
     query: str,

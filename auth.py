@@ -1,3 +1,5 @@
+import base64
+import json
 import hashlib
 import os
 import re
@@ -37,6 +39,7 @@ if not JWT_SECRET:
 JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "72"))
 
 USERNAME_MAX_LENGTH = 50
+PASSWORD_MAX_LENGTH = 128
 
 LOGIN_ACCOUNT_RATE_LIMIT = int(os.getenv("LOGIN_ACCOUNT_RATE_LIMIT", "10"))
 LOGIN_ACCOUNT_RATE_WINDOW_SECONDS = int(os.getenv("LOGIN_ACCOUNT_RATE_WINDOW_SECONDS", "60"))
@@ -119,6 +122,10 @@ def init_db():
                         created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_conversations_user_updated "
+                    "ON conversations (user_id, updated_at DESC, id DESC)"
+                )
                 cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS generation_id BIGINT")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_messages_conversation "
@@ -198,7 +205,9 @@ def _verify_password(password: str, stored: str) -> bool:
 
 
 def _validate_password(password: str) -> str | None:
-    """校验密码强度：至少 10 字符，含数字、英文字母、特殊符号。返回错误信息，通过则返回 None。"""
+    """校验密码长度与强度：10～128 字符，含数字、英文字母、特殊符号。"""
+    if len(password) > PASSWORD_MAX_LENGTH:
+        return f"密码最长 {PASSWORD_MAX_LENGTH} 个字符"
     problems = []
     if len(password) < 10:
         problems.append("至少10个字符")
@@ -371,6 +380,8 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
     爆破防护完全由上述三层限流承担，不做账号级锁定：否则攻击者只要知道用户名、
     故意输错密码，就能把真实用户踢下线。
     """
+    if len(password) > PASSWORD_MAX_LENGTH:
+        return {"ok": False, "error": f"密码最长 {PASSWORD_MAX_LENGTH} 个字符"}
     username = username.strip()
     if len(username) > USERNAME_MAX_LENGTH:
         return {"ok": False, "error": "用户名或密码错误"}
@@ -439,36 +450,67 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
 
 
 
-def list_conversations(user_id: int) -> list[dict]:
-    """返回用户所有会话（含消息），按最近更新倒序。"""
+def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None) -> dict:
+    """按更新时间和 ID 翻页，只返回会话摘要。游标保存原始数据库时间精度。"""
+    limit = max(1, min(limit, 100))
+    params: list = [user_id]
+    boundary = ""
+    if cursor:
+        try:
+            stamp, conv_id = json.loads(base64.b64decode(cursor, altchars=b"-_", validate=True))
+            stamp = datetime.fromisoformat(stamp)
+            if stamp.tzinfo is not None or not isinstance(conv_id, str) or not 1 <= len(conv_id) <= 36:
+                raise ValueError()
+        except (ValueError, TypeError, UnicodeError) as exc:
+            raise ValueError("无效的会话分页游标") from exc
+        boundary = " AND (updated_at, id) < (%s, %s)"
+        params.extend([stamp, conv_id])
+    params.append(limit + 1)
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                """
-                SELECT c.id, c.title, m.id AS message_id, m.role, m.content, m.status
-                FROM conversations c
-                LEFT JOIN messages m ON m.conversation_id = c.id
-                WHERE c.user_id = %s
-                ORDER BY c.updated_at DESC, c.id DESC, m.id ASC
-                """,
-                (user_id,),
+                "SELECT id, title, updated_at, "
+                "updated_at AT TIME ZONE current_setting('TIMEZONE') AS display_time "
+                "FROM conversations WHERE user_id = %s" + boundary +
+                " ORDER BY updated_at DESC, id DESC LIMIT %s", params,
             )
             rows = cur.fetchall()
-        convs: dict[str, dict] = {}
-        for r in rows:
-            cid = r["id"]
-            if cid not in convs:
-                convs[cid] = {"id": cid, "title": r["title"], "messages": []}
-            if r["role"] is not None:
-                convs[cid]["messages"].append(
-                    {
-                        "id": r["message_id"],
-                        "role": r["role"],
-                        "content": r["content"],
-                        "status": r["status"],
-                    }
-                )
-        return list(convs.values())
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit:
+        last = page[-1]
+        next_cursor = base64.urlsafe_b64encode(json.dumps(
+            [last["updated_at"].isoformat(), last["id"]]
+        ).encode()).decode()
+    return {
+        "conversations": [{"id": r["id"], "title": r["title"],
+                           "updatedAt": r["display_time"].isoformat()} for r in page],
+        "next_cursor": next_cursor,
+    }
+
+
+def list_messages(user_id: int, conv_id: str, limit: int = 50, before: int | None = None) -> dict | None:
+    """验证归属后按消息 ID 向前翻页，页内按时间正序返回。"""
+    limit = max(1, min(limit, 100))
+    with _connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id FROM conversations WHERE id = %s AND user_id = %s FOR SHARE",
+                        (conv_id, user_id))
+            if cur.fetchone() is None:
+                return None
+            params: list = [conv_id]
+            boundary = ""
+            if before is not None:
+                boundary = " AND id < %s"
+                params.append(before)
+            params.append(limit + 1)
+            cur.execute("SELECT id, role, content, status FROM messages WHERE conversation_id = %s" +
+                        boundary + " ORDER BY id DESC LIMIT %s", params)
+            rows = cur.fetchall()
+    page = rows[:limit]
+    return {"messages": list(reversed(page)),
+            "next_before": page[-1]["id"] if len(rows) > limit else None}
+
 
 
 def create_conversation(user_id: int, conv_id: str, title: str) -> bool:

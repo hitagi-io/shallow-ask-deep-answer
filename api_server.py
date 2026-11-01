@@ -7,7 +7,7 @@ import asyncio
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, Request, Query
 
 import anyio
 import psycopg
@@ -24,6 +24,7 @@ from utils.pg_lock import SingleInstanceGuard, exclusive_section, shared_section
 from utils.stream_bridge import StreamBridge
 from utils.logging_config import configure_logging, get_logger
 from auth import (
+    PASSWORD_MAX_LENGTH,
     PG_CONN,
     PG_POOL_MAX,
     init_db,
@@ -33,6 +34,7 @@ from auth import (
     verify_token,
     get_user_cached,
     list_conversations,
+    list_messages,
     create_conversation,
     update_conversation_title,
     begin_generation,
@@ -249,12 +251,12 @@ class ChatRequest(BaseModel):
 
 class RegisterRequest(BaseModel):
     username: str
-    password: str
+    password: str = Field(max_length=PASSWORD_MAX_LENGTH)
 
 
 class LoginRequest(BaseModel):
     username: str
-    password: str
+    password: str = Field(max_length=PASSWORD_MAX_LENGTH)
 
 
 class CreateConversationRequest(BaseModel):
@@ -375,8 +377,28 @@ def api_me(user: dict = Depends(get_current_user)):
 
 
 @app.get("/api/conversations")
-def api_list_conversations(user: dict = Depends(get_current_user)):
-    return {"conversations": list_conversations(user["user_id"])}
+def api_list_conversations(
+    limit: int = Query(20, ge=1, le=100),
+    cursor: str | None = Query(None, max_length=512),
+    user: dict = Depends(get_current_user),
+):
+    try:
+        return list_conversations(user["user_id"], limit, cursor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="无效的会话分页游标") from exc
+
+
+@app.get("/api/conversations/{conv_id}/messages")
+def api_list_messages(
+    conv_id: str,
+    limit: int = Query(50, ge=1, le=100),
+    before: int | None = Query(None, ge=1, le=9223372036854775807),
+    user: dict = Depends(get_current_user),
+):
+    result = list_messages(user["user_id"], conv_id, limit, before)
+    if result is None:
+        raise HTTPException(status_code=404, detail="会话不存在或已被删除")
+    return result
 
 
 @app.post("/api/conversations")
