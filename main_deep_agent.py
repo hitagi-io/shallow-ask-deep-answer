@@ -1,3 +1,5 @@
+"""主 Agent 装配：双模式提示词、工具和流式运行时策略。"""
+
 import os
 import threading
 from datetime import date
@@ -13,11 +15,14 @@ from utils.retrieval_protocol import SENTINEL_KB_MISS, build_direct_answer_conte
 from utils.config_loader import agent_config
 from utils.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
 from utils.prompt_loader import render_general_prompt, render_main_prompt
+from utils.logging_config import get_logger
 from rag.rag_summary import rag_summary_subagents
 from langchain_tavily import TavilySearch
 from langchain_core.tools import tool
 from dotenv import load_dotenv
 load_dotenv()
+
+logger = get_logger(__name__)
 
 _PG_CONNECTION_STRING = os.getenv(
     "PG_CONNECTION_STRING", "postgresql://postgres:postgres@localhost:5432/deepagent_rag"
@@ -32,20 +37,22 @@ _tavily_lock: threading.Lock = threading.Lock()
 STRICT_GENERAL_PURPOSE_SUBAGENT = {
     "name": "general-purpose",
     "description": (
-        "受限辅助子代理：仅处理不依赖外部事实的文本整理类任务。"
-        "凡涉及知识、事实、资料的问题，必须交给 rag_summary_subagents 处理。"
+        "受限文本整理子代理。仅处理不依赖外部事实的改写、提取、归类等任务；"
+        "凡涉及知识、事实或资料的问题，必须交给 rag_summary_subagents。"
     ),
     "system_prompt": (
-        "你是一个受限的辅助子代理：没有检索工具，也没有可用的知识来源。"
-        f"凡涉及事实、资料、知识的问题，一律只回复「{SENTINEL_KB_MISS}」，"
-        "不得使用自身训练知识作答；仅可执行不依赖外部事实的文本整理类任务。"
+        "<role>你是受限的文本整理子代理。</role>"
+        "<objective>只执行不依赖外部事实的改写、提取、归类或格式转换。</objective>"
+        "<constraints>你没有检索工具和可用知识来源。凡涉及事实、资料或知识的问题，"
+        f"一律只回复「{SENTINEL_KB_MISS}」；不得使用训练知识补充答案。不要编造来源，"
+        "不要描述内部流程。</constraints>"
     ),
     "tools": [],
 }
 
 
 def _inject_current_date(base_prompt: str) -> str:
-    """在系统提示末尾追加当天日期（每次模型调用现取，不固化为构建期快照）。"""
+    """在系统提示末尾追加当天日期；每次模型调用时读取，避免跨天后日期过期。"""
     return (
         f"{base_prompt}\n\n## 当前日期\n今天是 {date.today().isoformat()}（服务器本地日期）。"
         "理解「今天/最近/本周」等相对时间以此为准；事实性内容仍以工具检索结果为准。"
@@ -57,7 +64,7 @@ def build_date_prompt_middleware(static_prompt: str):
 
     deepagents 会把自定义提示词与基础提示词组装成一个完整系统提示随请求传递，
     这里在其末尾追加当天日期：既不改动组装结果（避免覆盖基础提示词），
-    又保证进程跨天运行时日期不过期。static_prompt 仅作为兜底。
+    又保证进程跨天运行时日期不过期。static_prompt 仅作为备用提示词。
     """
 
     def _prompt(request) -> str:
@@ -97,7 +104,7 @@ def tavily_search(query: str) -> str:
     try:
         resp = _get_tavily().invoke(query)
     except Exception as e:
-        print(f"[联网搜索] 搜索失败，已向模型返回故障标记: {e}")
+        logger.error(f"[联网搜索] 搜索请求失败，已向模型返回故障标记：{e}")
         return SEARCH_ERROR_MARKER
     results = resp.get("results") or []
     answer = (resp.get("answer") or "").strip()

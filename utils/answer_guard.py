@@ -1,9 +1,9 @@
-"""降级回答兜底：裁决"仅知识库"模式的流式输出，接管降级文案；通用模式仅过滤工具消息。
+"""回答输出校验：裁决“仅知识库”模式的流式输出，并处理降级响应；通用模式仅过滤工具消息。
 
 两种模式（与前端「仅知识库」开关一一对应）：
 - kb_only=True（默认，严格模式）：事实性内容只能来自知识库。子代理在出口由代码根据
   检索 artifact 生成结构化报告；本模块只认结构报告，不扫描任何失败短句。模型文本
-  先缓冲，拿到 status=ok 且来源可校验的回合才增量放行；回合结束时再校验引用，
+  先缓冲，当前回合拿到 status=ok 且来源可校验后才增量放行；回合结束时再校验引用，
   校验失败则用 replace 事件用固定文案整段替换已下发内容。
 - kb_only=False（通用模式）：模型自身知识 + 必要时联网搜索，没有固定文案约定；
   本模块只过滤工具消息（并记录联网异常标记），模型文本实时透传。
@@ -21,6 +21,9 @@ from utils.retrieval_protocol import (
     parse_retrieval_report,
     split_answer_and_citations,
 )
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 # 通用模式向模型传递的两种联网搜索状态。
 SEARCH_ERROR_MARKER = "__SEARCH_UNAVAILABLE__"
@@ -42,7 +45,7 @@ class AnswerGuard:
     """仅知识库模式的单回合输出判定器。
 
     调用方（guarded_stream）负责从流中取出消息并区分工具消息与文本消息；
-    本类维护回合状态：拿到 status=ok 报告后允许增量放行，finish() 返回最终
+    本类维护单回合状态：拿到 status=ok 报告后允许增量放行，finish() 返回最终
     校验动作（追加来源行 / 整段替换 / 无输出）。
     """
 
@@ -102,20 +105,20 @@ class AnswerGuard:
                 or tool_call_id not in self._task_call_ids
                 or tool_name not in (None, "task")
             ):
-                print("[兜底] 结构化检索报告没有匹配的 task 调用，已忽略")
+                logger.warning("[输出校验] 结构化检索报告未匹配到对应的 task 调用，已忽略该结果")
                 return None
             report["task_call_id"] = tool_call_id
             self._reports.append(report)
             sources = "、".join(report["sources"][:CITATION_SOURCE_LIMIT]) or "-"
-            print(
-                f"[兜底] 结构化检索报告 status={report['status']} "
+            logger.info(
+                f"[输出校验] 结构化检索报告 status={report['status']} "
                 f"reason={report.get('reason') or '-'} sources={sources} "
                 f"task_call={tool_call_id or '-'}"
             )
             return "release" if report["status"] == STATUS_OK else "generating"
 
         if looks_like_report(text):
-            print("[兜底] 结构化检索报告解析失败，本回合按无有效证据处理")
+            logger.error("[输出校验] 结构化检索报告解析失败，当前回合按无有效证据处理")
 
         category = parse_direct_answer_content(text)
         if category is not None:
@@ -124,10 +127,10 @@ class AnswerGuard:
                 or tool_call_id not in self._direct_call_ids
                 or tool_name not in (None, "mark_direct_answer")
             ):
-                print("[兜底] 直答声明没有匹配的 mark_direct_answer 调用，已忽略")
+                logger.warning("[输出校验] 直答声明未匹配到对应的 mark_direct_answer 调用，已忽略该结果")
                 return None
             self._direct_category = category
-            print(f"[兜底] 已声明直答分支 category={category}")
+            logger.info(f"[输出校验] 已确认直接回答分支 category={category}")
             return "generating"
         return None
 
@@ -139,7 +142,7 @@ class AnswerGuard:
         return text if self._releasing else None
 
     def finish(self) -> tuple[str, str]:
-        """回合结束（流耗尽）时的唯一放行点。
+        """流耗尽后执行最终校验，这是输出放行的唯一位置。
 
         返回 (action, text)：
         - ("append", suffix)：在已下发内容后追加后缀（如补发的来源行）；
@@ -206,9 +209,12 @@ class AnswerGuard:
         text = self._buffer_text()
         if not text.strip():
             return ("none", "")
-        _, cited = split_answer_and_citations(text)
-        if cited:
-            return self._terminate("unverified", "直答分支不应出现来源标注")
+        # rewrite / provided_text 要原样保留用户文本（其中可能自带“来源：”行），
+        # 只有问候与身份直答不允许出现来源标注。
+        if self._direct_category in ("greeting", "identity"):
+            _, cited = split_answer_and_citations(text)
+            if cited:
+                return self._terminate("unverified", "直答分支不应出现来源标注")
         self._buffer.clear()
         return ("replace", text)
 
@@ -219,7 +225,7 @@ class AnswerGuard:
         dropped = len(self._buffer_text())
         self._buffer.clear()
         self.terminated = True
-        print(f"[兜底] {reason}，已输出固定文案并拦截模型文本 {dropped} 字")
+        logger.warning(f"[输出校验] {reason}，已拦截模型生成的 {dropped} 个字符并返回固定文案")
         return ("replace", _COPY_BY_WINNER[winner])
 
 
@@ -307,8 +313,8 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
     """把 Agent 的原始消息流包装为"用户可见文本流"。
 
     严格模式先缓冲模型文本；拿到 status=ok 报告后进入增量放行（边生成边下发），
-    回合结束时校验来源引用：无引用时补发"参考来源"行，校验失败则下发 replace
-    事件用固定文案整段替换已下发内容。没有有效证据的回合始终只输出固定文案。
+    回合结束时校验来源引用：缺少引用时补发“参考来源”行，校验失败则下发 replace
+    事件，用固定文案整段替换已下发内容。没有有效证据的回合始终只输出固定文案。
 
     输出元素协议：
     - str：正常文本增量；
@@ -400,7 +406,7 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
             try:
                 close()
             except Exception as e:
-                print(f"[兜底] 关闭上游消息流失败（已忽略）: {e}")
+                logger.error(f"[输出校验] 关闭上游消息流失败，继续结束请求：{e}")
 
 
 def _merge_sources(reports: list[dict]) -> list[str]:

@@ -804,7 +804,7 @@ onUnmounted(() => {
                 <button :class="{ active: kbOnly }" :aria-pressed="kbOnly" :disabled="isProcessing" @click="kbOnly = true">知识库问答</button>
                 <button :class="{ active: !kbOnly }" :aria-pressed="!kbOnly" :disabled="isProcessing" @click="kbOnly = false">通用问答</button>
               </div>
-              <span class="mode-description">{{ kbOnly ? '依据内部资料回答' : '模型知识 · 按需联网' }}</span>
+              <span class="mode-description">{{ kbOnly ? '问候、身份询问、翻译改写等直接回答；其他问题检索内部资料' : '模型知识 · 按需联网' }}</span>
             </div>
             <div class="input-row">
               <textarea

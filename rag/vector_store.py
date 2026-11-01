@@ -12,6 +12,9 @@ from langchain_milvus import Milvus
 from utils.file_tool import list_files_with_allowed_type, get_file_md5_hex, check_file_md5_hex_in_file, choose_loader, \
     add_file_md5_hex_to_file, remove_file_md5_hex_from_file
 from utils.path_tool import get_abs_path
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -86,10 +89,10 @@ class VectorStore:
                         continue
                     result = self.index_file(f)
                     if not result["ok"]:
-                        print(f"[向量库] 入库失败 name={os.path.basename(f)}: {result['error']}")
+                        logger.error(f"[向量库] 入库失败 file={os.path.basename(f)}：{result['error']}")
                         failures.append({"file": f, "error": result["error"]})
                 except Exception as e:
-                    print(f"[向量库] 入库失败 name={os.path.basename(f)}: {e}")
+                    logger.error(f"[向量库] 入库失败 file={os.path.basename(f)}：{e}")
                     failures.append({"file": f, "error": _INDEX_FAIL_GENERIC})
         return failures
 
@@ -101,7 +104,7 @@ class VectorStore:
         两项任一不过即删除该文件全部向量与记录后重建复验，最多重试
         `_INDEX_MAX_ATTEMPTS` 次。成功返回 {'ok': True, 'chunks': n}；
         失败返回 {'ok': False, 'error': ...}，不抛异常。每个文件入库
-        自己构成一个小闭环，不依赖定时自检兜底。
+        每个文件的入库过程独立完成，不依赖定时健康检查结果。
 
         `previous_pks` 为覆盖上传时旧版本已占用的主键：校验只统计本次新增的
         向量，失败清理也只删本次新增的部分，旧版本在切换完成前保持可检索。
@@ -135,9 +138,9 @@ class VectorStore:
                     last_err = f"校验未通过（Milvus 条数 ≠ 切块数 {len(split_doc)}）"
                 except Exception as e:
                     last_err = _INDEX_FAIL_GENERIC
-                    print(
-                        f"[向量库] 入库失败 name={os.path.basename(file_path)}"
-                        f" 第 {attempt}/{_INDEX_MAX_ATTEMPTS} 次尝试: {e}"
+                    logger.error(
+                        f"[向量库] 入库失败 file={os.path.basename(file_path)}"
+                        f" 第 {attempt}/{_INDEX_MAX_ATTEMPTS} 次尝试：{e}"
                     )
                 self._delete_added_pks(file_path, previous)
                 if check_file_md5_hex_in_file(md5_hex):
@@ -177,7 +180,7 @@ class VectorStore:
     _ITER_BATCH_SIZE = 1000
 
     def pks_by_source(self, file_path: str) -> list:
-        """拉取某 source 的全部主键（校验、删除、自检共用）。"""
+        """拉取指定 source 的全部主键，供校验、删除和健康检查共用。"""
         vs = self.vector_store
         pk_field = getattr(vs, "_primary_field", "pk")
         escaped_path = file_path.replace('\\', '\\\\').replace('"', '\\"')
@@ -217,7 +220,7 @@ class VectorStore:
     def _another_file_with_same_content(self, file_path: str, md5_hex: str) -> str | None:
         """返回知识库中另一份内容相同的文件路径；不存在则返回 None。
 
-        内容级去重下，同内容文件共享一条入库记录与一组向量（向量挂在首个入库
+        内容级去重下，同内容文件共享一条索引记录与一组向量（向量挂在首个入库
         文件的 source 上）。md5 计算走缓存，重复调用开销可忽略。
         """
         norm_self = os.path.normcase(os.path.abspath(file_path))
@@ -236,13 +239,13 @@ class VectorStore:
         `md5_hex` 可由调用方传入：若调用方先删掉了磁盘文件（Windows 下文件被占用时
         删除会失败，先删文件能把失败挡在改动索引之前），文件已不在，本方法算不出 md5。
 
-        先删入库记录、再删向量；向量删除失败时回滚恢复入库记录，
+        先删索引记录、再删向量；向量删除失败时回滚恢复索引记录，
         保证失败后状态要么完整未删、要么"记录缺失+向量仍在"，均由
         index_health 按"重建记录"修复，而不是误把待删文件重新索引。
 
         若被删的正是"持有向量的那一份"（向量挂在其 source 上）而磁盘上还有同内容
         副本，则删完向量后立即以副本重新入库——否则会留下 missing_vectors：
-        界面显示"已入库"但实际检索不到，要等定时自检或手动修复才恢复。
+        界面会显示“已入库”，但实际无法检索，必须等待定时健康检查或手动修复才能恢复。
         """
         file_path = get_abs_path(file_path)
         if md5_hex is None:
@@ -263,10 +266,10 @@ class VectorStore:
                 if drop_record:
                     try:
                         add_file_md5_hex_to_file(md5_hex)
-                        print(f"[向量库] 删除向量失败，已恢复入库记录 name={os.path.basename(file_path)}")
+                        logger.error(f"[向量库] 删除向量失败，已恢复索引记录 file={os.path.basename(file_path)}")
                     except Exception as rollback_err:
-                        print(
-                            f"[向量库] 删除向量失败，恢复入库记录也失败 name={os.path.basename(file_path)}: "
+                        logger.error(
+                            f"[向量库] 删除向量失败，恢复索引记录也失败 file={os.path.basename(file_path)}："
                             f"{rollback_err}（可执行索引修复重建记录）"
                         )
                 raise
@@ -275,10 +278,10 @@ class VectorStore:
                 remove_file_md5_hex_from_file(md5_hex)
                 result = self.index_file(survivor)
                 if result["ok"]:
-                    print(f"[向量库] 已用同内容副本重建向量 name={os.path.basename(survivor)}")
+                    logger.info(f"[向量库] 已使用同内容副本重建向量 file={os.path.basename(survivor)}")
                 else:
                     add_file_md5_hex_to_file(md5_hex)
-                    print(f"[向量库] 同内容副本重建向量失败 name={os.path.basename(survivor)}: {result['error']}")
+                    logger.error(f"[向量库] 同内容副本重建向量失败 file={os.path.basename(survivor)}：{result['error']}")
 
     def replace_file(self, file_path: str, tmp_path: str) -> dict:
         """覆盖上传：新版本先入库校验，通过后再清理旧版本；失败回滚磁盘文件。
@@ -301,7 +304,7 @@ class VectorStore:
             old_md5 = get_file_md5_hex(file_path) if existed else None
             old_pks = self.pks_by_source(file_path)
 
-            # 内容未变且已入库：只需替换磁盘文件，向量与入库记录保持不动
+            # 内容未变且已入库：只需替换磁盘文件，向量与索引记录保持不动
             if existed and old_md5 == new_md5 and check_file_md5_hex_in_file(new_md5):
                 os.replace(tmp_path, file_path)
                 return {
@@ -322,7 +325,7 @@ class VectorStore:
             try:
                 result = self.index_file(file_path, previous_pks=old_pks)
             except Exception as e:
-                print(f"[向量库] 覆盖上传入库异常 name={os.path.basename(file_path)}: {e}")
+                logger.error(f"[向量库] 覆盖上传入库异常 file={os.path.basename(file_path)}：{e}")
                 result = {
                     "file": file_path, "chunks": None, "ok": False,
                     "error": _INDEX_FAIL_GENERIC,
@@ -333,18 +336,18 @@ class VectorStore:
                 try:
                     self._delete_added_pks(file_path, set(old_pks))
                 except Exception as e:
-                    print(f"[向量库] 覆盖上传清理新版本向量失败 name={os.path.basename(file_path)}: {e}")
+                    logger.error(f"[向量库] 覆盖上传清理新版本向量失败 file={os.path.basename(file_path)}：{e}")
                 if existed:
                     try:
                         os.replace(backup, file_path)
                     except Exception as e:
-                        print(
-                            f"[向量库] 覆盖上传回滚磁盘文件失败 name={os.path.basename(file_path)}: {e}"
+                        logger.info(
+                            f"[向量库] 覆盖上传回滚磁盘文件失败 file={os.path.basename(file_path)}：{e}"
                             f"（旧索引仍保留，建议执行索引修复）"
                         )
                 return {**result, "overwritten": existed}
 
-            # 切换生效版本：新版本已入库并通过校验，清理旧版本向量与过期入库记录
+            # 切换生效版本：新版本已入库并通过校验，清理旧版本向量与过期索引记录
             try:
                 deleted_old = self._delete_pks(old_pks)
                 if old_md5 and old_md5 != new_md5:
@@ -358,15 +361,15 @@ class VectorStore:
                         remove_file_md5_hex_from_file(old_md5)
                         reindex = self.index_file(survivor)
                         if reindex["ok"]:
-                            print(f"[向量库] 覆盖后已用同内容副本重建向量 name={os.path.basename(survivor)}")
+                            logger.info(f"[向量库] 覆盖后已使用同内容副本重建向量 file={os.path.basename(survivor)}")
                         else:
                             add_file_md5_hex_to_file(old_md5)
-                            print(
+                            logger.error(
                                 f"[向量库] 覆盖后同内容副本重建向量失败 "
-                                f"name={os.path.basename(survivor)}: {reindex['error']}"
+                                f"file={os.path.basename(survivor)}：{reindex['error']}"
                             )
             except Exception as e:
-                print(f"[向量库] 覆盖上传清理旧版本失败 name={os.path.basename(file_path)}: {e}")
+                logger.error(f"[向量库] 覆盖上传清理旧版本失败 file={os.path.basename(file_path)}：{e}")
                 return {
                     **result, "ok": False, "overwritten": existed,
                     "error": "新版本已入库，但旧版本向量清理失败，请重试上传",
@@ -376,5 +379,5 @@ class VectorStore:
                 try:
                     os.remove(backup)
                 except OSError as e:
-                    print(f"[向量库] 删除备份文件失败 path={backup}: {e}")
+                    logger.error(f"[向量库] 删除备份文件失败 file={backup}：{e}")
             return {**result, "overwritten": existed}

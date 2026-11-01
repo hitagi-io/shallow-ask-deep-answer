@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 PROTOCOL_VERSION = 1
 
-# 协议名由工具、提示词和兜底校验共同使用，修改时需同步三者。
+# 协议名由工具、提示词和输出校验共同使用，修改时需同步三者。
 RETRIEVAL_PROTOCOL = "kb_retrieval"
 REPORT_PROTOCOL = "kb_retrieval_report"
 DIRECT_ANSWER_PROTOCOL = "kb_direct_answer"
@@ -53,10 +53,17 @@ CITATION_SOURCE_LIMIT = 5
 QUERY_LOG_LIMIT = 500
 EVIDENCE_EXCERPT_CHARS = 120
 
+# 行首允许 Markdown 修饰（加粗、标题、列表、引用块），否则模型把来源行写成
+# "**参考来源（内部知识库）**：x.pdf" 时会绕过来源校验。
 _CITATION_LINE_RE = re.compile(
-    r"^[ \t]*(?:参考来源（内部知识库）|参考来源|来源)[ \t]*[：:][ \t]*(.+?)[ \t]*$"
+    r"^[ \t\u3000>#\-*+_]*"
+    r"(?:参考来源（内部知识库）|参考来源|来源)"
+    r"[ \t\u3000*_]*[：:][ \t\u3000]*(.+?)[ \t\u3000]*$"
 )
 _SOURCE_SEP_RE = re.compile(r"[、,，;；]|\s{2,}")
+_SOURCE_WRAPPERS = "`*_\"'“”‘’「」『』《》"
+_SOURCE_TRAILING_PUNCT = "。.,，;；"
+_SOURCE_LEADING_JUNK_RE = re.compile(r"^[-–—·•\s]+")
 
 
 
@@ -306,20 +313,32 @@ def looks_like_report(text: Any) -> bool:
 
 
 def split_answer_and_citations(text: str) -> tuple[str, list[str]]:
-    """把回答正文与“来源：…”行分开，并按首次出现顺序去重。"""
+    """把回答正文与末尾的“来源：…”引用块分开，并按首次出现顺序去重。
+
+    只把回答末尾连续的非空来源行当作引用块：用户在正文里提供的、或检索片段中
+    逐字引用的“来源：”行不是引用标注，不能据此判定越界；同时 Markdown 修饰过的
+    末尾来源行也必须被识别，否则会绕过来源校验。
+    """
     if not isinstance(text, str) or not text:
         return "", []
-    cited = []
-    kept = []
-    for line in text.replace("\r\n", "\n").split("\n"):
-        match = _CITATION_LINE_RE.match(line)
+    lines = text.replace("\r\n", "\n").split("\n")
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    start = end
+    blocks = []
+    while start:
+        match = _CITATION_LINE_RE.match(lines[start - 1])
         if not match:
-            kept.append(line)
-            continue
-        for name in _split_source_names(match.group(1)):
+            break
+        blocks.append(_split_source_names(match.group(1)))
+        start -= 1
+    cited = []
+    for names in reversed(blocks):
+        for name in names:
             if name and name not in cited:
                 cited.append(name)
-    body = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    body = re.sub(r"\n{3,}", "\n\n", "\n".join(lines[:start])).strip()
     return body, cited
 
 
@@ -411,10 +430,17 @@ def _split_source_names(value: str) -> list[str]:
 
 
 def _normalize_source_name(raw: str) -> str:
-    wrappers = "`*_\"'“”「」《》"
-    name = raw.strip().strip(wrappers)
-    name = re.sub(r"^[-–—·•\s]+", "", name)
-    return name.strip().strip(wrappers).rstrip("。.,，;；")
+    name = raw.strip()
+    # 包裹符与尾随标点会互相遮挡（如“《b.pdf》。”右端先遇到句号），
+    # 必须交替剥离到稳定，否则会得到"b.pdf》"这类不等于证据文件名的结果。
+    for _ in range(4):
+        before = name
+        name = _SOURCE_LEADING_JUNK_RE.sub("", name)
+        name = name.strip(_SOURCE_WRAPPERS)
+        name = name.rstrip(_SOURCE_TRAILING_PUNCT).strip()
+        if name == before:
+            break
+    return name
 
 
 def _excerpt(content: str) -> str:

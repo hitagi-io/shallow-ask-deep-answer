@@ -1,3 +1,5 @@
+"""知识库检索工具和基于证据的总结子代理。"""
+
 import os
 
 from deepagents import CompiledSubAgent
@@ -17,9 +19,12 @@ from utils.retrieval_protocol import (
 from utils.prompt_loader import render_summary_prompt
 from rag.vector_store import get_vector_store
 from utils.config_loader import agent_config
+from utils.logging_config import get_logger
 from langchain.agents import create_agent
 from dotenv import load_dotenv
 load_dotenv()
+
+logger = get_logger(__name__)
 
 
 
@@ -43,7 +48,7 @@ def do_retrieval(query):
         retriever = get_vector_store().get_retriever()
         docs = retriever.invoke(query)
     except Exception as e:
-        print(f"[知识库检索] 检索失败，已向子代理返回故障标记: {e}")
+        logger.error(f"[知识库检索] 检索请求失败，已向子代理返回故障标记：{e}")
         return RETRIEVAL_ERROR_MARKER, build_retrieval_artifact(STATUS_ERROR, query, [])
 
     chunks = []

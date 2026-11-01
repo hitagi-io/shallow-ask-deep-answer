@@ -1,4 +1,4 @@
-"""FastAPI 后端，为 Vue 前端提供对话与知识库 API，含账户系统。"""
+"""FastAPI 入口：账户、流式对话和知识库管理 API。"""
 import os
 import json
 import time
@@ -22,6 +22,7 @@ from utils.config_loader import vector_db_config
 from utils.path_tool import get_abs_path
 from utils.pg_lock import SingleInstanceGuard, exclusive_section, shared_section
 from utils.stream_bridge import StreamBridge
+from utils.logging_config import configure_logging, get_logger
 from auth import (
     PG_CONN,
     PG_POOL_MAX,
@@ -43,7 +44,11 @@ from auth import (
     release_chat_slot,
 )
 
-# 流式回答也占用线程池；该值应覆盖预期的同时在线流数。
+logger = get_logger(__name__)
+configure_logging()
+
+# AnyIO 默认线程池并发额度：用于同步路由、依赖及 anyio.to_thread.run_sync。
+# 上游流式生成使用独立线程，asyncio.to_thread 使用 asyncio 默认执行器，均不受此值限制。
 THREADPOOL_SIZE = int(os.getenv("THREADPOOL_SIZE", "200"))
 UVICORN_WORKERS = int(os.getenv("UVICORN_WORKERS", "1"))
 ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "false").lower() in ("1", "true", "yes")
@@ -84,21 +89,21 @@ def _warn_connection_budget() -> None:
             cur.execute("SHOW max_connections")
             max_conn = int(cur.fetchone()[0])
     except Exception as e:
-        print(f"[启动] 警告：读取 PG max_connections 失败，跳过连接预算核算: {e}")
+        logger.warning(f"[启动] 无法读取 PostgreSQL 的 max_connections，跳过连接预算检查：{e}")
         return
     detail = f"workers={UVICORN_WORKERS} × (检查点池 {PG_CHECKPOINT_POOL_MAX} + 业务池 {PG_POOL_MAX}) = {need}"
     if need > max_conn - 5:
         state = "超出" if need > max_conn else "接近"
-        print(f"[启动] 警告：PG 连接需求约 {need}，已{state} max_connections={max_conn}（{detail}）；"
-              f"请调大 max_connections 或调小池上限，否则高并发时会等待连接")
+        logger.warning(f"[启动] PostgreSQL 预计连接占用约 {need}，已{state}连接上限（max_connections={max_conn}；{detail}）。"
+              "建议提高 max_connections，或降低连接池上限。")
     else:
-        print(f"[启动] PG 连接预算充足：需求约 {need}，上限 {max_conn}（{detail}）")
+        logger.info(f"[启动] PostgreSQL 连接容量充足：预计占用 {need}，连接上限 {max_conn}（{detail}）")
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_SIZE
-    print(f"[启动] 线程池上限 {THREADPOOL_SIZE}，工作进程数 {UVICORN_WORKERS}")
+    logger.info(f"[启动] AnyIO 默认线程池并发额度为 {THREADPOOL_SIZE}，工作进程数为 {UVICORN_WORKERS}")
     _warn_connection_budget()
     task = asyncio.create_task(_scheduled_health_loop())
     yield
@@ -167,21 +172,21 @@ def _replace_and_index(tmp_path: str, dest: str) -> dict:
 
 
 def _format_repair_summary(repair: dict) -> str:
-    """格式化修复摘要，供定时自愈与手动修复共用同一套表述。"""
+    """格式化修复摘要，供定时自动修复和手动修复共用同一套表述。"""
     record_state = "已重建" if repair.get("md5_rebuilt") else "未变更"
     return (
         f"清理残留向量 {len(repair.get('ghost_deleted', []))} 个"
         f"（失败 {len(repair.get('ghost_errors', []))} 个），"
-        f"入库记录{record_state}，重索引 {len(repair.get('re_indexed', []))} 个"
+        f"索引记录{record_state}，重索引 {len(repair.get('re_indexed', []))} 个"
         f"（失败 {len(repair.get('re_index_failures', []))} 个）"
     )
 
 
 def _auto_heal_report() -> dict:
-    """索引自愈闭环：自检发现问题 → 自动修复 → 复查，直至自检通过或轮次耗尽。
+    """索引自动修复闭环：健康检查发现问题 → 自动修复 → 复查，直至检查通过或达到轮次上限。
 
     停止条件：report['healthy'] 为 True。Milvus 不可达或修复异常时立即终止，
-    等待下一轮自检再试。
+    等待下一轮健康检查再试。
     """
     with _index_write_section():
         max_rounds = int(vector_db_config.get("health_auto_repair_max_rounds", 3))
@@ -190,23 +195,23 @@ def _auto_heal_report() -> dict:
             if report.get("healthy"):
                 break
             if report.get("milvus_error"):
-                print("[索引自愈] 无法连接 Milvus，跳过本轮修复")
+                logger.warning("[索引自动修复] 无法连接 Milvus，本轮暂不执行修复")
                 break
             try:
                 report = index_health.repair()
                 repair = report.get("repair") or {}
-                print(f"[索引自愈] 修复完成：{_format_repair_summary(repair)}")
+                logger.info(f"[索引自动修复] 本轮修复完成：{_format_repair_summary(repair)}")
             except Exception as e:
-                print(f"[索引自愈] 修复失败: {e}")
+                logger.error(f"[索引自动修复] 执行失败：{e}")
                 break
         return report
 
 
 async def _scheduled_health_loop():
-    """定时自检 + 自愈。
+    """定时健康检查和自动修复。
 
     多 worker/多实例下必须只由一个进程执行，否则会重复修复、重复触发嵌入调用；
-    用 PG 会话级咨询锁选出唯一执行进程：只有获得锁的进程执行，持有者退出后其他进程自动接管。
+    使用 PostgreSQL 会话级咨询锁（advisory lock）选出唯一执行进程；持有者退出后，其他进程自动接管。
     """
     interval = max(int(vector_db_config.get("health_check_interval_hours", 6) * 3600), 600)
     guard = SingleInstanceGuard(PG_CONN, _PG_LOCK_KEY_HEALTH)
@@ -215,9 +220,9 @@ async def _scheduled_health_loop():
     while True:
         is_leader = await asyncio.to_thread(guard.try_acquire)
         if is_leader != was_leader:
-            print(
-                "[索引自检] 本进程已成为定时自检/自愈执行者" if is_leader
-                else "[索引自检] 已失去执行者身份（连接中断或锁被接管），暂停定时自检/自愈"
+            logger.info(
+                "[索引健康检查] 当前进程已获得定时检查和修复的执行权" if is_leader
+                else "[索引健康检查] 当前进程已失去执行权，暂停定时检查与修复"
             )
             was_leader = is_leader
         if not is_leader or time.monotonic() < next_run:
@@ -227,9 +232,9 @@ async def _scheduled_health_loop():
             report = await asyncio.to_thread(_auto_heal_report)
             _set_health_report(report)
             state = "健康" if report["healthy"] else f"发现 {len(report['issues'])} 类问题"
-            print(f"[索引自检] 完成：{state}（文件 {report['stats']['files']}，向量块 {report['stats']['chunks']}）")
+            logger.info(f"[索引健康检查] 检查完成：{state}（文件 {report['stats']['files']} 个，向量块 {report['stats']['chunks']} 个）")
         except Exception as e:
-            print(f"[索引自检] 执行失败: {e}")
+            logger.error(f"[索引健康检查] 执行失败：{e}")
         next_run = time.monotonic() + interval
 
 
@@ -300,7 +305,7 @@ def _probe_postgres() -> dict:
             conn.execute("SELECT 1")
         return {"ok": True, "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
     except Exception as e:
-        print(f"[就绪检查] PostgreSQL 不可用: {e}")
+        logger.error(f"[就绪检查] PostgreSQL 不可用：{e}")
         return {
             "ok": False,
             "error": "数据库不可用",
@@ -315,7 +320,7 @@ def _probe_milvus() -> dict:
         vector_store.vector_store.client.list_collections(timeout=READINESS_TIMEOUT_SECONDS)
         return {"ok": True, "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
     except Exception as e:
-        print(f"[就绪检查] Milvus 不可用: {e}")
+        logger.error(f"[就绪检查] Milvus 不可用：{e}")
         return {
             "ok": False,
             "error": "向量库不可用",
@@ -396,7 +401,7 @@ def _purge_thread_checkpoints(thread_id: str) -> None:
             agent.checkpointer.delete_thread(thread_id)
             return
         except Exception as e:
-            print(f"[会话] 清理检查点失败 thread={thread_id}（第 {attempt + 1} 次尝试）: {e}")
+            logger.error(f"[会话] 清理检查点失败 thread_id={thread_id}（第 {attempt + 1} 次尝试）：{e}")
             if attempt < 2:
                 time.sleep(0.5)
     raise RuntimeError("清理会话上下文失败")
@@ -418,7 +423,7 @@ def api_delete_conversation(conv_id: str, user: dict = Depends(get_current_user)
             lambda: _purge_thread_checkpoints(thread_id),
         )
     except Exception as e:
-        print(f"[会话] 删除失败 conv={conv_id}: {e}")
+        logger.error(f"[会话] 删除失败 conversation_id={conv_id}：{e}")
         raise HTTPException(status_code=500, detail="清理会话上下文失败，请稍后重试")
     if result == "not_found":
         raise HTTPException(status_code=404, detail="会话不存在")
@@ -455,7 +460,7 @@ async def _acquire_chat_slot(user_id: int) -> dict:
             try:
                 cancel()
             except Exception as e:
-                print(f"[对话流] 取消超时槽位任务失败（已忽略）: {e}")
+                logger.error(f"[对话流] 取消超时槽位任务失败（已忽略）：{e}")
     return lease
 
 
@@ -471,7 +476,7 @@ async def _release_chat_slot(user_id: int, token: str) -> None:
     try:
         await asyncio.to_thread(release_chat_slot, user_id, token)
     except Exception as e:
-        print(f"[对话流] 释放并发槽位失败（将由租约过期清理）: {e}")
+        logger.error(f"[对话流] 释放并发槽位失败（将由租约过期清理）：{e}")
 
 
 def _sse(payload: dict) -> str:
@@ -485,7 +490,7 @@ async def _generation_heartbeat(generation_id: int, bridge: StreamBridge) -> Non
         try:
             state = await asyncio.to_thread(touch_generation, generation_id)
         except Exception as e:
-            print(f"[对话流] 更新生成任务心跳时间戳失败 gen={generation_id}: {e}")
+            logger.error(f"[对话流] 更新生成任务心跳时间戳失败 generation_id={generation_id}：{e}")
             continue
         if state is None or not state["running"] or state["cancel_requested"]:
             bridge.stop()
@@ -504,7 +509,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     try:
         lease = await _acquire_chat_slot(user["user_id"])
     except Exception as e:
-        print(f"[对话流] 获取并发槽位失败 user={user['user_id']}: {e}")
+        logger.error(f"[对话流] 获取并发槽位失败 user_id={user['user_id']}：{e}")
         raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
     slot = lease["token"]
     if slot is None:
@@ -523,7 +528,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         )
     except Exception as e:
         await _release_chat_slot(user["user_id"], slot)
-        print(f"[对话流] 登记生成任务失败 thread={req.thread_id}: {e}")
+        logger.error(f"[对话流] 登记生成任务失败 thread_id={req.thread_id}：{e}")
         raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
 
     if begun["status"] == "not_found":
@@ -571,7 +576,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
             bind_chat_slot_generation, user["user_id"], slot, begun["generation_id"]
         )
     except Exception as e:
-        print(f"[对话流] 关联并发槽位与生成任务失败 gen={begun['generation_id']}: {e}")
+        logger.error(f"[对话流] 关联并发槽位与生成任务失败 generation_id={begun['generation_id']}：{e}")
 
     user_message_id = begun["user_message_id"]
     generation_id = begun["generation_id"]
@@ -652,19 +657,19 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                     "message_status": "error",
                     "error": "回答超时，请稍后重试",
                 }
-                print(f"[对话流] 回答超时 thread={thread_key}（{CHAT_STREAM_DEADLINE_SECONDS}s）")
+                logger.error(f"[对话流] 回答超时 thread_id={thread_key}（{CHAT_STREAM_DEADLINE_SECONDS}s）")
             except Exception as e:
                 terminal = {
                     "status": "failed",
                     "message_status": "error",
                     "error": "服务处理异常，请稍后重试",
                 }
-                print(f"[对话流] 回答失败 thread={thread_key}: {e}")
+                logger.error(f"[对话流] 回答失败 thread_id={thread_key}：{e}")
 
             try:
                 message_id = await finalize()
             except Exception as e:
-                print(f"[对话流] 保存生成结果失败 gen={generation_id}: {e}")
+                logger.error(f"[对话流] 保存生成结果失败 generation_id={generation_id}：{e}")
                 yield _sse({
                     "type": "error",
                     "status": "error",
@@ -695,7 +700,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                 try:
                     await finalize()
                 except Exception as e:
-                    print(f"[对话流] 保存生成结果失败 gen={generation_id}: {e}")
+                    logger.error(f"[对话流] 保存生成结果失败 generation_id={generation_id}：{e}")
             with anyio.CancelScope(shield=True):
                 await _release_chat_slot(user["user_id"], slot)
 
@@ -753,7 +758,7 @@ async def upload_files(files: list[UploadFile] = File(...), user: dict = Depends
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
             if not index_result["ok"]:
-                print(f"[知识库] 入库失败 name={name}: {index_result['error']}")
+                logger.error(f"[知识库] 入库失败 file={name}：{index_result['error']}")
             uploaded.append({
                 "name": name,
                 "overwritten": index_result["overwritten"],
@@ -761,10 +766,10 @@ async def upload_files(files: list[UploadFile] = File(...), user: dict = Depends
                 "error": None if index_result["ok"] else index_result["error"],
             })
         except TimeoutError as e:
-            print(f"[知识库] 上传失败 name={name}: 等待索引写锁超时（{e}）")
+            logger.error(f"[知识库] 上传失败 file={name}：等待索引写锁超时（{e}）")
             errors.append({"name": name, "error": "索引正被其他操作占用，请稍后重试"})
         except Exception as e:
-            print(f"[知识库] 上传失败 name={name}: {e}")
+            logger.error(f"[知识库] 上传失败 file={name}：{e}")
             errors.append({"name": name, "error": "上传失败，详见服务端日志"})
     return {"uploaded": uploaded, "errors": errors}
 
@@ -782,14 +787,14 @@ def delete_file(filename: str, user: dict = Depends(require_admin)):
             vector_store.delete_file(file_path, md5_hex)
         return {"message": f"已删除: {safe_name}"}
     except TimeoutError as e:
-        print(f"[知识库] 删除失败 name={safe_name}: 等待索引写锁超时（{e}）")
+        logger.error(f"[知识库] 删除失败 file={safe_name}：等待索引写锁超时（{e}）")
         raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
     except Exception as e:
         if os.path.exists(file_path):
-            print(f"[知识库] 删除失败 name={safe_name}: 磁盘文件未删除，向量与入库记录未改动（{e}）")
+            logger.error(f"[知识库] 删除失败 file={safe_name}：磁盘文件未删除，向量与索引记录未改动（{e}）")
             raise HTTPException(status_code=500, detail="删除文件失败，请确认文件未被其他程序占用后重试")
-        print(f"[知识库] 删除后清理失败 name={safe_name}: 磁盘文件已删除，向量与入库记录未清理（{e}），需执行索引修复")
-        raise HTTPException(status_code=500, detail="文件已删除，但向量/入库记录清理失败，请稍后执行一次「修复」")
+        logger.error(f"[知识库] 删除后清理失败 file={safe_name}：磁盘文件已删除，向量与索引记录未清理（{e}），需执行索引修复")
+        raise HTTPException(status_code=500, detail="文件已删除，但向量/索引记录清理失败，请稍后执行一次「修复」")
 
 
 @app.post("/api/vector/build")
@@ -798,51 +803,51 @@ def build_vector(user: dict = Depends(require_admin)):
         with _index_write_section():
             failures = vector_store.do_store()
     except TimeoutError as e:
-        print(f"[知识库] 构建失败: 等待索引写锁超时（{e}）")
+        logger.error(f"[知识库] 构建失败：等待索引写锁超时（{e}）")
         raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
     except Exception as e:
-        print(f"[知识库] 构建失败: {e}")
+        logger.error(f"[知识库] 构建失败：{e}")
         raise HTTPException(status_code=500, detail="构建失败，请稍后重试")
     if failures:
-        print(f"[知识库] 构建完成：{len(failures)} 个文件入库失败")
+        logger.error(f"[知识库] 构建完成：{len(failures)} 个文件入库失败")
         return {
             "message": f"构建完成，但有 {len(failures)} 个文件失败",
             "failures": failures,
         }
-    print("[知识库] 构建完成：无失败文件")
+    logger.info("[知识库] 构建完成，所有文件均已成功入库")
     return {"message": "构建完成"}
 
 
 @app.get("/api/index/health")
 def get_index_health(refresh: bool = False, user: dict = Depends(require_admin)):
-    """返回最近一次自检报告；refresh=1 时立即执行一次全新检查。"""
+    """返回最近一次健康检查报告；refresh=1 时立即执行一次检查。"""
     if refresh or _health_report is None or time.monotonic() - _health_report_at > HEALTH_REPORT_TTL_SECONDS:
         try:
             with shared_section(PG_CONN, _PG_LOCK_KEY_INDEX_WRITE, INDEX_READ_LOCK_TIMEOUT_SECONDS):
                 _set_health_report(index_health.check())
         except TimeoutError as e:
-            print(f"[索引健康] 自检失败: 等待索引写锁超时（{e}）")
+            logger.error(f"[索引健康检查] 检查失败：等待索引写锁超时（{e}）")
             raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
         except Exception as e:
-            print(f"[索引健康] 自检失败: {e}")
-            raise HTTPException(status_code=500, detail="自检失败，请稍后重试")
+            logger.error(f"[索引健康检查] 检查失败：{e}")
+            raise HTTPException(status_code=500, detail="健康检查失败，请稍后重试")
     return _health_report
 
 
 @app.post("/api/index/health/repair")
 def repair_index_health(user: dict = Depends(require_admin)):
-    """手动触发一致性修复：清理残留向量、重建入库记录、重索引向量丢失的文件。"""
+    """手动触发一致性修复：清理残留向量、重建索引记录、重索引向量丢失的文件。"""
     try:
         with _index_write_section():
             report = index_health.repair()
             _set_health_report(report)
     except TimeoutError as e:
-        print(f"[索引健康] 修复失败: 等待索引写锁超时（{e}）")
+        logger.error(f"[索引健康检查] 修复失败：等待索引写锁超时（{e}）")
         raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
     except Exception as e:
-        print(f"[索引健康] 修复失败: {e}")
+        logger.error(f"[索引健康检查] 修复失败：{e}")
         raise HTTPException(status_code=500, detail="修复失败，请稍后重试")
-    print(f"[索引健康] 修复完成：{_format_repair_summary(report.get('repair') or {})}")
+    logger.info(f"[索引健康检查] 修复完成：{_format_repair_summary(report.get('repair') or {})}")
     return _health_report
 
 

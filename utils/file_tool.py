@@ -5,6 +5,9 @@ import threading
 from os import listdir
 from langchain_community.document_loaders import TextLoader, PyPDFLoader, Docx2txtLoader
 from utils.path_tool import get_abs_path
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 md5_lock = threading.RLock()
 
@@ -18,10 +21,10 @@ def get_file_md5_hex(file_path):
     try:
         st = os.stat(file_path)
     except OSError as e:
-        print(f"[文件] 计算 MD5 失败 path={file_path}: {e}")
+        logger.error("[文件] 计算 MD5 失败 file=%s: %s", os.path.basename(file_path), e)
         return None
     if not stat.S_ISREG(st.st_mode):
-        print(f"[文件] 计算 MD5 失败 path={file_path}: 不是普通文件")
+        logger.error("[文件] 计算 MD5 失败 file=%s: 不是普通文件", os.path.basename(file_path))
         return None
 
     cache_key = os.path.normcase(file_path)
@@ -37,7 +40,7 @@ def get_file_md5_hex(file_path):
                 md5obj.update(chunk)
         md5_hex = md5obj.hexdigest()
     except OSError as e:
-        print(f"[文件] 计算 MD5 失败 path={file_path}: {e}")
+        logger.error("[文件] 计算 MD5 失败 file=%s: %s", os.path.basename(file_path), e)
         return None
 
     with _md5_cache_lock:
@@ -95,10 +98,10 @@ def list_files_with_allowed_type(dir_path,allowed_types:tuple[str]):
     files = []
     if not os.path.exists(abs_dir_path):
         os.makedirs(abs_dir_path)
-        print(f"[文件] 目录不存在，已自动创建 path={abs_dir_path}")
+        logger.info("[文件] 目录不存在，已自动创建 directory=%s", os.path.basename(abs_dir_path))
         return files
     if not os.path.isdir(abs_dir_path):
-        print(f"[文件] 路径不是目录 path={abs_dir_path}")
+        logger.warning("[文件] 目标路径不是目录 directory=%s", os.path.basename(abs_dir_path))
         return files
     for f in listdir(abs_dir_path):
         ext = os.path.splitext(f)[1].lower()

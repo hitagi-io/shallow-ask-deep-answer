@@ -1,12 +1,12 @@
 """索引一致性健康检查与修复。
 
 协调三份数据的一致性：
-- md5.txt          入库记录（文件 MD5 一行一个）
+- md5.txt          索引记录（文件 MD5 一行一个）
 - knowledge 目录   源文件
 - Milvus           向量数据（chunk 的 source 元数据 = 文件绝对路径）
 
 覆盖三类故障：
-1. md5.txt 损坏（knowledge、Milvus 正常）→ 以 Milvus 为准重建入库记录
+1. md5.txt 损坏（knowledge、Milvus 正常）→ 以 Milvus 为准重建索引记录
 2. knowledge 文件丢失（md5.txt、Milvus 正常）→ 清理残留向量 + 剔除孤立记录
 3. Milvus 向量丢失（md5.txt、knowledge 正常）→ 剔除记录并重新入库
 
@@ -22,6 +22,9 @@ from datetime import datetime
 from rag.vector_store import get_vector_store
 from utils.file_tool import list_files_with_allowed_type, get_file_md5_hex, md5_lock, read_md5_set
 from utils.config_loader import vector_db_config
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 from utils.path_tool import get_abs_path
 
 _ITER_BATCH_SIZE = 1000
@@ -46,7 +49,7 @@ def _milvus_source_counts(vector_store) -> dict:
 
     用 MilvusClient.query_iterator 游标翻页；不用 query() + 递增 offset，
     因为 query() 有 offset + limit ≤ 16384 的硬上限，数据量涨上去会直接报错
-    （invalid max query result window），导致整个自检/自愈抛异常。
+    （invalid max query result window），导致整个健康检查和自动修复抛异常。
     """
     vs = vector_store.vector_store
     client = vs.client
@@ -92,7 +95,7 @@ class IndexHealth:
         }
 
     def check(self) -> dict:
-        """只读自检，返回健康报告。不会修改任何数据。"""
+        """执行只读健康检查并返回报告，不修改任何数据。"""
         with self._lock:
             report = self._base_report()
             report["checked_at"] = datetime.now().isoformat(timespec="seconds")
@@ -105,7 +108,7 @@ class IndexHealth:
                 source_counts = _milvus_source_counts(self.vector_store)
             except Exception as e:
                 report["healthy"] = False
-                print(f"[索引健康] 自检失败，无法连接 Milvus: {e}")
+                logger.error(f"[索引健康检查] 检查失败，无法连接 Milvus：{e}")
                 report["milvus_error"] = "无法连接 Milvus，详情见服务端日志"
                 report["issues"].append({
                     "type": "milvus_unreachable", "severity": "error",
@@ -147,7 +150,7 @@ class IndexHealth:
                 report["healthy"] = False
                 report["issues"].append({
                     "type": "orphan_md5", "severity": "warn",
-                    "title": "入库记录存在孤立条目", "detail": "对应文件已丢失",
+                    "title": "索引记录存在孤立条目", "detail": "对应文件已丢失",
                     "count": len(orphan_hashes), "items": [h[:12] + "..." for h in orphan_hashes],
                 })
 
@@ -167,14 +170,14 @@ class IndexHealth:
                 report["healthy"] = False
                 report["issues"].append({
                     "type": "missing_md5_record", "severity": "warn",
-                    "title": "向量已存在但入库记录丢失", "detail": "界面会误标「未入库」，重建将产生重复向量",
+                    "title": "向量已存在但索引记录丢失", "detail": "界面会误标「未入库」，重建将产生重复向量",
                     "count": len(missing_record), "items": missing_record,
                 })
             if missing_vectors:
                 report["healthy"] = False
                 report["issues"].append({
                     "type": "missing_vectors", "severity": "error",
-                    "title": "入库记录存在但向量丢失", "detail": "该内容在向量库中没有向量，检索查不到对应文件",
+                    "title": "索引记录存在但向量丢失", "detail": "该内容在向量库中没有向量，检索查不到对应文件",
                     "count": len(missing_vectors), "items": missing_vectors,
                 })
             return report
@@ -194,7 +197,7 @@ class IndexHealth:
             try:
                 source_counts = _milvus_source_counts(self.vector_store)
             except Exception as e:
-                raise RuntimeError(f"无法连接 Milvus，修复终止: {e}")
+                raise RuntimeError(f"无法连接 Milvus，修复终止：{e}")
 
             summary = {"ghost_deleted": [], "ghost_errors": [], "md5_rebuilt": False, "re_indexed": [], "re_index_failures": []}
 
@@ -205,13 +208,13 @@ class IndexHealth:
                     self.vector_store.delete_by_source(src)
                     summary["ghost_deleted"].append(src)
                 except Exception as e:
-                    print(f"[索引健康] 清理残留向量失败 source={src}: {e}")
+                    logger.error(f"[索引健康检查] 清理残留向量失败 source={src}：{e}")
                     summary["ghost_errors"].append(f"{src}: 删除失败，详情见服务端日志")
 
             try:
                 source_counts = _milvus_source_counts(self.vector_store)
             except Exception as e:
-                raise RuntimeError(f"清理后复查 Milvus 失败，修复终止: {e}")
+                raise RuntimeError(f"清理后复查 Milvus 失败，修复终止：{e}")
             milvus_by_norm = {os.path.normcase(s) for s in source_counts}
             keep_hashes = {
                 md5 for norm, (_, md5) in disk_by_norm.items()
@@ -220,14 +223,10 @@ class IndexHealth:
             _write_md5_set(keep_hashes)
             summary["md5_rebuilt"] = True
 
-            backed_after = {
-                md5 for norm, (_, md5) in disk_by_norm.items()
-                if md5 and norm in milvus_by_norm
-            }
             to_reindex: list = []
             seen_hashes: set = set()
             for norm, (path, md5) in disk_by_norm.items():
-                if md5 and md5 in md5_set_before and md5 not in backed_after and md5 not in seen_hashes:
+                if md5 and md5 in md5_set_before and md5 not in keep_hashes and md5 not in seen_hashes:
                     to_reindex.append(path)
                     seen_hashes.add(md5)
             if to_reindex:

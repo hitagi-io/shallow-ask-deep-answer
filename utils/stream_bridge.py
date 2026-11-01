@@ -23,6 +23,10 @@ from __future__ import annotations
 import asyncio
 import threading
 
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
 
 class StreamBridge:
     """同步生成器 → asyncio 队列；`stop()` 后以 cancelled 事件结束。"""
@@ -75,7 +79,7 @@ class StreamBridge:
             try:
                 self._stream.close()
             except Exception as e:
-                print(f"[对话流] 关闭上游生成器失败（已忽略）: {e}")
+                logger.error(f"[对话流] 关闭上游生成器失败，继续结束流式任务: {e}")
 
     def stop(self) -> None:
         """请求取消；生产线程会在下一次 next() 返回或抛错时退出。"""

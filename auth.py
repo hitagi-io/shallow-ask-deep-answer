@@ -5,6 +5,7 @@ import random
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -17,6 +18,9 @@ from argon2.exceptions import VerificationError
 from dotenv import load_dotenv
 
 from utils.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 load_dotenv()
 
@@ -44,7 +48,7 @@ USER_CACHE_TTL_SECONDS = int(os.getenv("USER_CACHE_TTL_SECONDS", "30"))
 REGISTER_RATE_LIMIT = int(os.getenv("REGISTER_RATE_LIMIT", "5"))
 REGISTER_RATE_WINDOW_SECONDS = int(os.getenv("REGISTER_RATE_WINDOW_SECONDS", "3600"))
 
-# 对话并发槽位的跨进程咨询锁命名空间（二参数形式：classid, user_id）。
+# 对话并发槽位的跨进程咨询锁（advisory lock）命名空间（二参数形式：classid, user_id）。
 _CHAT_SLOT_LOCK_CLASS = 0x64656573
 
 
@@ -66,21 +70,23 @@ def _get_pool() -> ConnectionPool:
     return _pool
 
 
-def _get_conn():
-    return _get_pool().getconn()
-
-
-def _put_conn(conn):
-    if conn.info.transaction_status == TransactionStatus.INTRANS:
-        conn.rollback()
-    _get_pool().putconn(conn)
+@contextmanager
+def _connection():
+    """借用业务连接；提交由调用方决定，退出时沿用未提交事务的回滚策略。"""
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+    finally:
+        if conn.info.transaction_status == TransactionStatus.INTRANS:
+            conn.rollback()
+        pool.putconn(conn)
 
 
 def init_db():
     """创建所需表（users、conversations、messages、rate_limits）。"""
     with exclusive_section(PG_CONN, PG_LOCK_KEY_SETUP):
-        conn = _get_conn()
-        try:
+        with _connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
@@ -172,8 +178,6 @@ def init_db():
                     "ON chat_slots (user_id)"
                 )
             conn.commit()
-        finally:
-            _put_conn(conn)
 
 
 
@@ -230,16 +234,13 @@ def verify_token(token: str) -> dict | None:
 
 def get_user_by_id(user_id: int) -> dict | None:
     """按 id 查询用户（不缓存），返回 {'id', 'username', 'role'}；不存在返回 None。"""
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "SELECT id, username, role FROM users WHERE id = %s",
                 (user_id,),
             )
             return cur.fetchone()
-    finally:
-        _put_conn(conn)
 
 
 _user_cache: dict[int, tuple[float, dict | None]] = {}
@@ -273,7 +274,7 @@ _RATE_RETENTION = timedelta(hours=2)
 
 
 def _rate_lock_key(scope: str, key: str) -> int:
-    """限流键对应的咨询锁 key；哈希碰撞只会让无关的键短暂串行，不影响正确性。"""
+    """生成限流键对应的咨询锁 key；哈希碰撞只会让无关键短暂串行，不影响正确性。"""
     digest = hashlib.blake2b(
         f"rate-limit:{scope}:{key}".encode("utf-8"), digest_size=8
     ).digest()
@@ -281,7 +282,7 @@ def _rate_lock_key(scope: str, key: str) -> int:
 
 
 def _rate_lock_keys(cur, pairs: list[tuple[str, str]]) -> None:
-    """按固定顺序获取多个限流键的事务级咨询锁，避免并发请求之间形成死锁。"""
+    """按固定顺序获取多个限流键的事务级咨询锁（advisory lock），避免并发请求之间形成死锁。"""
     for lock_key in sorted({_rate_lock_key(scope, key) for scope, key in pairs}):
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
 
@@ -307,7 +308,7 @@ def _rate_record(cur, scope: str, key: str, now: datetime) -> None:
 
 
 def _rate_consume(cur, scope: str, key: str, limit: int, window_seconds: int, now: datetime) -> bool:
-    """原子地「检查并记录」一次尝试：先获取该限流键的事务级咨询锁。"""
+    """原子地「检查并记录」一次尝试：先获取该限流键的事务级咨询锁（advisory lock）。"""
     _rate_lock_keys(cur, [(scope, key)])
     if _rate_exceeded(cur, scope, key, limit, window_seconds, now):
         return False
@@ -318,19 +319,16 @@ def _rate_consume(cur, scope: str, key: str, limit: int, window_seconds: int, no
 def check_rate(scope: str, key: str, limit: int, window_seconds: int) -> bool:
     """记录并检查 key 在窗口期内的尝试次数，超限返回 False。
 
-    以数据库为计数载体，并在同一事务内按 (scope, key) 持有事务级咨询锁：
+    以数据库为计数载体，并在同一事务内按 (scope, key) 持有事务级咨询锁（advisory lock）：
     检查与插入因此成为原子操作，多进程部署下同一限流键也只会放行到上限，
     且不依赖长期驻留内存的字典。锁在事务提交/回滚时自动释放。
     """
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         now = datetime.now()
         with conn.cursor(row_factory=dict_row) as cur:
             allowed = _rate_consume(cur, scope, key, limit, window_seconds, now)
         conn.commit()
         return allowed
-    finally:
-        _put_conn(conn)
 
 
 
@@ -348,8 +346,7 @@ def register(username: str, password: str, ip: str | None = None) -> dict:
     if ip and not check_rate("register", ip, REGISTER_RATE_LIMIT, REGISTER_RATE_WINDOW_SECONDS):
         return {"ok": False, "error": "注册过于频繁，请稍后再试", "rate_limited": True}
 
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO users (username, password, role) VALUES (%s, %s, %s) "
@@ -361,8 +358,6 @@ def register(username: str, password: str, ip: str | None = None) -> dict:
         if not created:
             return {"ok": False, "error": "用户名已存在"}
         return {"ok": True}
-    finally:
-        _put_conn(conn)
 
 
 def login(username: str, password: str, ip: str | None = None) -> dict:
@@ -370,7 +365,7 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
 
     限流策略（目标：既不误伤共享出口的正常用户，也不让攻击者定向踢人）：
     - 账号级限流：按用户名计数，挡住针对单一账号的多 IP 爆破，与来源 IP 无关；
-    - IP 级限流：阈值放宽，仅作粗粒度兜底，避免 NAT / 机房共享出口被整体拒绝；
+    - IP 级限流：阈值放宽，仅作粗粒度防护，避免 NAT / 机房共享出口被整体拒绝；
     - 单 IP × 单账号失败冷却：只挡该来源对该账号的尝试，该账号在其他 IP 的正常登录不受影响。
 
     爆破防护完全由上述三层限流承担，不做账号级锁定：否则攻击者只要知道用户名、
@@ -382,8 +377,7 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
     now = datetime.now()
     acct_ip_key = f"{username}|{ip}" if ip else None
 
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         checks = [
             ("login_acct", username, LOGIN_ACCOUNT_RATE_LIMIT, LOGIN_ACCOUNT_RATE_WINDOW_SECONDS),
         ]
@@ -413,7 +407,7 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
                 (username,),
             )
             row = cur.fetchone()
-        # 密码校验耗时较长，先提交并释放咨询锁，避免同一账号/IP 的正常请求排队等待。
+        # 密码校验耗时较长，先提交并释放咨询锁，避免同一账号或 IP 的正常请求排队等待。
         conn.commit()
 
         if not row:
@@ -442,15 +436,12 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
                 "role": row["role"],
             },
         }
-    finally:
-        _put_conn(conn)
 
 
 
 def list_conversations(user_id: int) -> list[dict]:
     """返回用户所有会话（含消息），按最近更新倒序。"""
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
@@ -464,12 +455,10 @@ def list_conversations(user_id: int) -> list[dict]:
             )
             rows = cur.fetchall()
         convs: dict[str, dict] = {}
-        order: list[str] = []
         for r in rows:
             cid = r["id"]
             if cid not in convs:
                 convs[cid] = {"id": cid, "title": r["title"], "messages": []}
-                order.append(cid)
             if r["role"] is not None:
                 convs[cid]["messages"].append(
                     {
@@ -479,15 +468,12 @@ def list_conversations(user_id: int) -> list[dict]:
                         "status": r["status"],
                     }
                 )
-        return [convs[cid] for cid in order]
-    finally:
-        _put_conn(conn)
+        return list(convs.values())
 
 
 def create_conversation(user_id: int, conv_id: str, title: str) -> bool:
     """创建会话；id 已存在（含属于他人的会话）时返回 False，不抛异常。"""
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO conversations (id, user_id, title) VALUES (%s, %s, %s) "
@@ -497,13 +483,10 @@ def create_conversation(user_id: int, conv_id: str, title: str) -> bool:
             created = cur.rowcount > 0
         conn.commit()
         return created
-    finally:
-        _put_conn(conn)
 
 
 def update_conversation_title(user_id: int, conv_id: str, title: str) -> bool:
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE conversations SET title = %s, updated_at = CURRENT_TIMESTAMP "
@@ -513,12 +496,10 @@ def update_conversation_title(user_id: int, conv_id: str, title: str) -> bool:
             changed = cur.rowcount > 0
         conn.commit()
         return changed
-    finally:
-        _put_conn(conn)
 
 
 def _conversation_lock_key(conv_id: str) -> int:
-    """会话级咨询锁 key：让登记生成任务与删除会话共享同一把跨进程锁。"""
+    """会话级咨询锁（advisory lock） key：让登记生成任务与删除会话共享同一把跨进程锁。"""
     digest = hashlib.blake2b(
         f"chat-generation:{conv_id}".encode("utf-8"), digest_size=8
     ).digest()
@@ -564,7 +545,7 @@ def _reap_stale_generations(cur, conv_id: str, stale_seconds: float) -> int:
             ("生成中断：服务异常或进程重启", message_id, row["id"]),
         )
     if rows:
-        print(f"[会话] 已将 {len(rows)} 个超时未更新的生成任务标记为失败 conv={conv_id}")
+        logger.warning("[会话] 已将 %s 个长期未更新的生成任务标记为失败 conversation_id=%s", len(rows), conv_id)
     return len(rows)
 
 
@@ -586,10 +567,9 @@ def begin_generation(
     - {"status": "busy"}
     - {"status": "not_found"}：会话不存在或不属于当前用户
     """
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            # 与删除会话共用同一把事务级咨询锁，避免「登记—删除」互相穿插
+            # 与删除会话共用同一把事务级咨询锁（advisory lock），避免「登记—删除」互相穿插
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
             cur.execute(
                 "SELECT id FROM conversations WHERE id = %s AND user_id = %s FOR SHARE",
@@ -650,14 +630,11 @@ def begin_generation(
             "generation_id": generation_id,
             "user_message_id": user_message_id,
         }
-    finally:
-        _put_conn(conn)
 
 
 def touch_generation(generation_id: int) -> dict | None:
     """更新生成任务的心跳时间戳；任务已结束或被取消时返回停止信号。"""
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "UPDATE generations SET heartbeat_at = CURRENT_TIMESTAMP "
@@ -670,8 +647,6 @@ def touch_generation(generation_id: int) -> dict | None:
         if row is None:
             return None
         return {"running": True, "cancel_requested": bool(row["cancel_requested"])}
-    finally:
-        _put_conn(conn)
 
 
 def finish_generation(
@@ -686,8 +661,7 @@ def finish_generation(
     只有仍处于 running 的任务会被处理；已被补偿流程处理过的任务直接跳过，
     因此重复调用不会产生重复消息。
     """
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "SELECT conversation_id, status FROM generations WHERE id = %s FOR UPDATE",
@@ -713,8 +687,6 @@ def finish_generation(
         # 形成锁顺序反转。
         conn.commit()
         return message_id
-    finally:
-        _put_conn(conn)
 
 
 def delete_conversation_guarded(
@@ -728,48 +700,46 @@ def delete_conversation_guarded(
     cleanup 在持锁事务内执行（用于清理 LangGraph 检查点），失败时整体回滚，
     业务数据保持原样。返回 'deleted' | 'busy' | 'not_found'。
     """
-    conn = _get_conn()
-    try:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
-            cur.execute(
-                "SELECT id FROM conversations WHERE id = %s AND user_id = %s FOR UPDATE",
-                (conv_id, user_id),
-            )
-            if cur.fetchone() is None:
-                conn.rollback()
-                return "not_found"
-
-            _reap_stale_generations(cur, conv_id, stale_seconds)
-            cur.execute(
-                "SELECT id FROM generations "
-                "WHERE conversation_id = %s AND status = 'running' LIMIT 1",
-                (conv_id,),
-            )
-            if cur.fetchone() is not None:
+    with _connection() as conn:
+        try:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
                 cur.execute(
-                    "UPDATE generations SET cancel_requested = TRUE "
-                    "WHERE conversation_id = %s AND status = 'running'",
+                    "SELECT id FROM conversations WHERE id = %s AND user_id = %s FOR UPDATE",
+                    (conv_id, user_id),
+                )
+                if cur.fetchone() is None:
+                    conn.rollback()
+                    return "not_found"
+
+                _reap_stale_generations(cur, conv_id, stale_seconds)
+                cur.execute(
+                    "SELECT id FROM generations "
+                    "WHERE conversation_id = %s AND status = 'running' LIMIT 1",
                     (conv_id,),
                 )
-                conn.commit()
-                return "busy"
+                if cur.fetchone() is not None:
+                    cur.execute(
+                        "UPDATE generations SET cancel_requested = TRUE "
+                        "WHERE conversation_id = %s AND status = 'running'",
+                        (conv_id,),
+                    )
+                    conn.commit()
+                    return "busy"
 
-        # 检查点清理可能包含重试等待，放在同一持锁事务内完成：
-        # 期间其他进程无法登记新的生成任务；失败则回滚，业务数据不受影响。
-        cleanup()
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM conversations WHERE id = %s AND user_id = %s",
-                (conv_id, user_id),
-            )
-        conn.commit()
-        return "deleted"
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        _put_conn(conn)
+            # 检查点清理可能包含重试等待，放在同一持锁事务内完成：
+            # 期间其他进程无法登记新的生成任务；失败则回滚，业务数据不受影响。
+            cleanup()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM conversations WHERE id = %s AND user_id = %s",
+                    (conv_id, user_id),
+                )
+            conn.commit()
+            return "deleted"
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def acquire_chat_slot(
@@ -780,7 +750,7 @@ def acquire_chat_slot(
 ) -> dict:
     """跨进程占用一个对话并发槽位（数据库租约），超额时 token 为 None。
 
-    计数以 chat_slots 表为唯一来源：按 user_id 持有事务级咨询锁后，先清理失效
+    计数以 chat_slots 表为唯一来源：按 user_id 持有事务级咨询锁（advisory lock）后，先清理失效
     租约再判定剩余数量并插入，多个 worker/实例因此共享同一上限。失效租约分两类：
     超过 max_age_seconds 的租约，以及绑定的生成任务已结束或心跳超时
     stale_seconds 的租约；后者对应的运行中任务会被写入 cancel_requested，
@@ -789,8 +759,7 @@ def acquire_chat_slot(
     返回 {"token": str | None, "reaped": [失效租约 token]}，reaped 供调用方
     取消本进程内仍然存活的任务。
     """
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "SELECT pg_advisory_xact_lock(%s, %s)",
@@ -846,14 +815,11 @@ def acquire_chat_slot(
                 )
         conn.commit()
         return {"token": token, "reaped": reaped}
-    finally:
-        _put_conn(conn)
 
 
 def bind_chat_slot_generation(user_id: int, token: str, generation_id: int) -> bool:
     """把租约与生成任务关联，使租约过期时能跨进程请求该任务停止生成。"""
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE chat_slots SET generation_id = %s WHERE token = %s AND user_id = %s",
@@ -862,19 +828,14 @@ def bind_chat_slot_generation(user_id: int, token: str, generation_id: int) -> b
             bound = cur.rowcount > 0
         conn.commit()
         return bound
-    finally:
-        _put_conn(conn)
 
 
 def release_chat_slot(user_id: int, token: str) -> None:
     """释放租约；进程异常退出时未释放的租约由后续 acquire 按过期规则清理。"""
-    conn = _get_conn()
-    try:
+    with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM chat_slots WHERE token = %s AND user_id = %s",
                 (token, user_id),
             )
         conn.commit()
-    finally:
-        _put_conn(conn)

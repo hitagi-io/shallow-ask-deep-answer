@@ -31,7 +31,7 @@ def load_prompts(prompt_name):
     except FileNotFoundError as e:
         raise RuntimeError(f"提示词文件不存在: {abs_path}") from e
     except Exception as e:
-        raise RuntimeError(f"加载提示词失败 ({abs_path}): {e}") from e
+        raise RuntimeError(f"加载提示词失败 ({abs_path})：{e}") from e
 
 def _render(prompt_name, **values):
     """渲染提示词模板（$name / ${name} 占位符），缺失变量直接报错，避免带占位符上线。"""
@@ -39,7 +39,7 @@ def _render(prompt_name, **values):
     return Template(raw).substitute(**values)
 
 def render_main_prompt():
-    """渲染「仅知识库」模式（默认）主提示词。
+    """渲染默认的“仅知识库”模式主提示词。
 
     固定文案、结构化协议字段与直答类别统一取自代码常量，避免提示词与判定逻辑漂移。
     """
@@ -58,7 +58,7 @@ def render_main_prompt():
     )
 
 def render_summary_prompt():
-    """渲染检索子代理提示词：标记与固定短句同样取自代码常量。"""
+    """渲染检索子代理提示词，并注入协议标记和固定文案。"""
     return _render(
         'summary_prompt.txt',
         sentinel_kb_down=SENTINEL_KB_DOWN,
@@ -68,7 +68,7 @@ def render_summary_prompt():
     )
 
 def render_general_prompt():
-    """渲染通用模式（关闭「仅知识库」）主提示词：仅注入联网搜索的两个异常标记。"""
+    """渲染通用模式主提示词，并注入联网搜索的两个状态标记。"""
     return _render(
         'general_prompt.txt',
         search_error_marker=SEARCH_ERROR_MARKER,
