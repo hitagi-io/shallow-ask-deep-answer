@@ -157,6 +157,7 @@ def init_db():
                     "CREATE UNIQUE INDEX IF NOT EXISTS uq_generations_running "
                     "ON generations (conversation_id) WHERE status = 'running'"
                 )
+                cur.execute("ALTER TABLE generations ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT 'thinking'")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS rate_limits (
                         id           BIGSERIAL PRIMARY KEY,
@@ -498,6 +499,7 @@ def list_messages(
     conv_id: str,
     limit: int = 50,
     before: int | None = None,
+    stale_seconds: float = 120,
 ) -> dict | None:
     """验证归属后读取会话消息及固定模式，按 ID 向前翻页，页内正序返回。"""
     limit = max(1, min(limit, 100))
@@ -508,6 +510,11 @@ def list_messages(
             conversation = cur.fetchone()
             if conversation is None:
                 return None
+            _reap_stale_generations(cur, conv_id, stale_seconds)
+            # 先读取任务、再读取消息：结束发生在两次读取之间时，订阅会再取一次终态。
+            cur.execute("SELECT request_id FROM generations WHERE conversation_id = %s AND status = 'running'",
+                        (conv_id,))
+            active_generation = cur.fetchone()
             params: list = [conv_id]
             boundary = ""
             if before is not None:
@@ -518,9 +525,11 @@ def list_messages(
                         "WHERE conversation_id = %s" +
                         boundary + " ORDER BY id DESC LIMIT %s", params)
             rows = cur.fetchall()
+        conn.commit()
     page = rows[:limit]
     return {"messages": list(reversed(page)),
             "kbOnly": conversation["kb_only"],
+            "active_generation": active_generation,
             "next_before": page[-1]["id"] if len(rows) > limit else None}
 
 
@@ -591,7 +600,9 @@ def _conversation_lock_key(conv_id: str) -> int:
 
 
 _GENERATION_REPLAY_QUERY = """
-    SELECT g.id, g.status, g.error, g.user_message_id, g.assistant_message_id, g.kb_only,
+    SELECT g.id, g.request_id, g.status, g.error, g.phase,
+           g.user_message_id, g.assistant_message_id, g.kb_only,
+           EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - g.created_at)) AS elapsed_seconds,
            m.content AS assistant_content
     FROM generations g
     LEFT JOIN messages m ON m.id = g.assistant_message_id
@@ -623,6 +634,9 @@ def _reap_stale_generations(cur, conv_id: str, stale_seconds: float) -> int:
                 (conv_id, "（回答中断）", row["id"], row["kb_only"]),
             )
             message_id = cur.fetchone()["id"]
+        else:
+            cur.execute("UPDATE messages SET status = 'error', content = CASE WHEN content = '' "
+                        "THEN '（回答中断）' ELSE content END WHERE id = %s", (message_id,))
         cur.execute(
             "UPDATE generations SET status = 'failed', error = %s, "
             "assistant_message_id = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
@@ -713,8 +727,14 @@ def begin_generation(
             )
             user_message_id = cur.fetchone()["id"]
             cur.execute(
-                "UPDATE generations SET user_message_id = %s WHERE id = %s",
-                (user_message_id, generation_id),
+                "INSERT INTO messages (conversation_id, role, content, status, generation_id, kb_only) "
+                "VALUES (%s, 'assistant', '', 'streaming', %s, %s) RETURNING id",
+                (conv_id, generation_id, kb_only),
+            )
+            assistant_message_id = cur.fetchone()["id"]
+            cur.execute(
+                "UPDATE generations SET user_message_id = %s, assistant_message_id = %s WHERE id = %s",
+                (user_message_id, assistant_message_id, generation_id),
             )
             cur.execute(
                 "UPDATE conversations SET kb_only = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
@@ -725,24 +745,52 @@ def begin_generation(
             "status": "started",
             "generation_id": generation_id,
             "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
         }
 
 
-def touch_generation(generation_id: int) -> dict | None:
-    """更新生成任务的心跳时间戳；任务已结束或被取消时返回停止信号。"""
+def get_generation(user_id: int, conv_id: str, request_id: str, stale_seconds: float) -> dict | None:
+    """可跨 worker 订阅的完整快照；每次读取校验归属并补偿失联任务。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "UPDATE generations SET heartbeat_at = CURRENT_TIMESTAMP "
-                "WHERE id = %s AND status = 'running' "
-                "RETURNING cancel_requested",
-                (generation_id,),
-            )
+            query = _GENERATION_REPLAY_QUERY + " AND g.user_id = %s"
+            cur.execute(query, (conv_id, request_id, user_id))
             row = cur.fetchone()
+            if row is not None and row["status"] == "running":
+                _reap_stale_generations(cur, conv_id, stale_seconds)
+                cur.execute(query, (conv_id, request_id, user_id))
+                row = cur.fetchone()
         conn.commit()
-        if row is None:
-            return None
-        return {"running": True, "cancel_requested": bool(row["cancel_requested"])}
+    if row is not None:
+        row["elapsed_seconds"] = float(row["elapsed_seconds"])
+    return row
+
+
+def cancel_generation(user_id: int, conv_id: str, request_id: str) -> bool:
+    """显式停止与断开订阅分离；重复停止已结束的任务也成功。"""
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE generations SET cancel_requested = TRUE "
+                        "WHERE conversation_id = %s AND request_id = %s AND user_id = %s",
+                        (conv_id, request_id, user_id))
+            found = cur.rowcount > 0
+        conn.commit()
+    return found
+
+
+def save_generation_progress(generation_id: int, content: str | None, phase: str) -> bool:
+    """保存增量快照和心跳；返回 False 表示已取消或已由补偿流程结束。"""
+    with _connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("UPDATE generations SET heartbeat_at = CURRENT_TIMESTAMP, phase = %s "
+                        "WHERE id = %s AND status = 'running' "
+                        "RETURNING assistant_message_id, cancel_requested", (phase, generation_id))
+            row = cur.fetchone()
+            if row is not None and content is not None:
+                cur.execute("UPDATE messages SET content = %s WHERE id = %s",
+                            (content, row["assistant_message_id"]))
+        conn.commit()
+    return row is not None and not row["cancel_requested"]
 
 
 def finish_generation(
@@ -760,19 +808,29 @@ def finish_generation(
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT conversation_id, status, kb_only FROM generations WHERE id = %s FOR UPDATE",
+                "SELECT conversation_id, status, kb_only, assistant_message_id, cancel_requested "
+                "FROM generations WHERE id = %s FOR UPDATE",
                 (generation_id,),
             )
             row = cur.fetchone()
             if row is None or row["status"] != "running":
                 conn.rollback()
                 return None
-            cur.execute(
-                "INSERT INTO messages (conversation_id, role, content, status, generation_id, kb_only) "
-                "VALUES (%s, 'assistant', %s, %s, %s, %s) RETURNING id",
-                (row["conversation_id"], content, message_status, generation_id, row["kb_only"]),
-            )
-            message_id = cur.fetchone()["id"]
+            if row["cancel_requested"] and status == "completed":
+                status, message_status, error = "cancelled", "cancelled", "回答已取消"
+            if not content and message_status == "error":
+                content = error or "（回答中断）"
+            message_id = row["assistant_message_id"]
+            if message_id is None:  # 兼容升级前已登记的任务
+                cur.execute(
+                    "INSERT INTO messages (conversation_id, role, content, status, generation_id, kb_only) "
+                    "VALUES (%s, 'assistant', %s, %s, %s, %s) RETURNING id",
+                    (row["conversation_id"], content, message_status, generation_id, row["kb_only"]),
+                )
+                message_id = cur.fetchone()["id"]
+            else:
+                cur.execute("UPDATE messages SET content = %s, status = %s WHERE id = %s",
+                            (content, message_status, message_id))
             cur.execute(
                 "UPDATE generations SET status = %s, error = %s, assistant_message_id = %s, "
                 "updated_at = CURRENT_TIMESTAMP WHERE id = %s",
@@ -846,6 +904,8 @@ def acquire_chat_slot(
 ) -> dict:
     """跨进程占用一个对话并发槽位（数据库租约），超额时 token 为 None。
 
+    limit <= 0 时不限制数量，仍记录租约并清理失效任务。
+
     计数以 chat_slots 表为唯一来源：按 user_id 持有事务级咨询锁（advisory lock）后，先清理失效
     租约再判定剩余数量并插入，多个 worker/实例因此共享同一上限。失效租约分两类：
     超过 max_age_seconds 的租约，以及绑定的生成任务已结束或心跳超时
@@ -903,7 +963,7 @@ def acquire_chat_slot(
                 )
 
             token = None
-            if len(rows) - len(reaped) < limit:
+            if limit <= 0 or len(rows) - len(reaped) < limit:
                 token = uuid.uuid4().hex
                 cur.execute(
                     "INSERT INTO chat_slots (token, user_id) VALUES (%s, %s)",

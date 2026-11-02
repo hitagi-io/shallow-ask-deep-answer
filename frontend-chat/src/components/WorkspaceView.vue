@@ -22,7 +22,7 @@ const sidebarToggle = ref<HTMLButtonElement | null>(null)
 const confirmation = useConfirmation()
 const { message: confirmationMessage } = confirmation
 const chat = useChat(confirmation.ask)
-const { currentId, convList, isProcessing } = chat
+const { currentId, convList, processingIds } = chat
 const knowledge = useKnowledge(isAdmin, computed(() => mode.value === 'knowledge'), confirmation.ask)
 const { healthIssueCount } = knowledge
 const desktop = window.matchMedia('(min-width: 761px)')
@@ -64,7 +64,7 @@ async function logout() {
     <WorkspaceSidebar v-if="mode === 'chat'" :user="user" :sidebar-open="sidebarOpen" :collapsed="sidebarCollapsed"
       :conversation-busy="chat.conversationBusy.value || chat.loading.value" :rename-conversation="chat.renameConversation"
       :has-more="!!chat.nextCursor.value" :loading-more="chat.loadingMore.value" @load-more="chat.loadMoreConversations"
-      :is-processing="isProcessing" :conv-list="convList"
+      :processing-ids="processingIds" :conv-list="convList"
       :current-id="currentId" :health-issue-count="healthIssueCount"
       @close="closeSidebar" @navigate="navigate" @new-conversation="newConversation"
       @select-conversation="selectConversation" @delete-conversation="chat.deleteConversation" @logout="logout" />

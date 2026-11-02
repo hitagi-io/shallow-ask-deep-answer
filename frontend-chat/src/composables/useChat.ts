@@ -1,17 +1,10 @@
-import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
-import { fetchConversations, fetchMessages, createConversationApi, updateConversationTitle, deleteConversationApi, streamChat, newRequestId, withEmptyHistory, type Conversation, type Message } from '../api'
+import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import { fetchConversations, fetchMessages, createConversationApi, updateConversationTitle, deleteConversationApi, streamChat, cancelGeneration, getStoredUser, newRequestId, withEmptyHistory, type Conversation, type Message } from '../api'
 import { useNotice } from './useNotice'
 import type { ConfirmAction } from './useConfirmation'
 
 export function useChat(confirmAction: ConfirmAction = async () => false) {
   let disposed = false
-  let streamAbort: AbortController | null = null
-
-  // 用户主动停止生成：中止在途请求，已生成的部分内容保留在气泡里
-  function stopStreaming() {
-    streamAbort?.abort()
-  }
-
   // 输入框随内容自适应高度；清空内容时需手动复位（程序化清空不会触发 input 事件）
   const inputEl = ref<HTMLTextAreaElement | null>(null)
   function resetInputHeight() {
@@ -29,21 +22,39 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   }
   const conversations = ref<Record<string, Conversation>>({})
   const currentId = ref('')
-  const input = ref('')
+  const selectionKey = `deepagent_conversation_${getStoredUser()?.id ?? ''}`
+  const drafts = ref<Record<string, string>>({})
+  const input = computed({ get: () => drafts.value[currentId.value] || '', set: value => { drafts.value[currentId.value] = value } })
   const loading = ref(false)
   const loadError = ref('')
   const nextCursor = ref<string | null>(null)
   const loadingMore = ref(false)
   const conversationBusy = ref(false)
-  const failedAttempt = ref<{ conversationId: string; text: string; mode: boolean; requestId: string } | null>(null)
-  const canRetrySend = computed(() => failedAttempt.value?.conversationId === currentId.value && failedAttempt.value?.mode === kbOnly.value)
+  const failedAttempts = ref<Record<string, { text: string; mode: boolean; requestId: string }>>({})
+  const canRetrySend = computed(() => failedAttempts.value[currentId.value]?.mode === kbOnly.value)
   const following = ref(true)
   const visibleCount = ref(50)
-  let pendingFrame: number | null = null
-  const isProcessing = ref(false)
-  const isThinking = ref(false)
-  const thinkingSeconds = ref(0)
-  const thinkingPhase = ref('')
+  interface GenerationRun {
+    requestId: string
+    startedAt: number
+    thinking: boolean
+    phase: string
+    reconnecting: boolean
+    stopping: boolean
+    confirmed: boolean
+    cancelSent: boolean
+  }
+  const runs = ref<Record<string, GenerationRun>>({})
+  const controllers = new Map<string, AbortController>()
+  const activeRun = computed(() => runs.value[currentId.value])
+  const isProcessing = computed(() => !!activeRun.value)
+  const processingIds = computed(() => Object.keys(runs.value))
+  const isThinking = computed(() => !!activeRun.value?.thinking)
+  const now = ref(Date.now())
+  const thinkingSeconds = computed(() => activeRun.value ? Math.max(0, (now.value - activeRun.value.startedAt) / 1000) : 0)
+  const thinkingPhase = computed(() => activeRun.value?.stopping ? '正在停止' : activeRun.value?.reconnecting ? '连接中断，正在恢复' : activeRun.value?.phase || '')
+  const reconnecting = computed(() => !!activeRun.value?.reconnecting)
+  const stopping = computed(() => !!activeRun.value?.stopping)
   const PHASE_LABELS: Record<string, string> = {
     thinking: '正在思考',
     retrieving: '正在检索知识库',
@@ -52,7 +63,6 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     generating: '正在生成回答',
   }
   let thinkingTimer: number | null = null
-  let thinkingStartTime = 0
   const chatArea = ref<HTMLElement | null>(null)
   const kbOnly = computed(() => conversations.value[currentId.value]?.kbOnly ?? true)
   const isEmptyConversation = (conv: Conversation) => !conv.hasMessages && conv.messages.length === 0
@@ -94,7 +104,8 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
       }
       if (disposed) return
       conversations.value = loaded
-      currentId.value = Object.keys(loaded)[0] || ''
+      const selected = localStorage.getItem(selectionKey) || ''
+      currentId.value = loaded[selected] ? selected : Object.keys(loaded)[0] || ''
     } catch (e) {
       loadError.value = e instanceof Error ? e.message : '会话加载失败'
     } finally { loading.value = false }
@@ -117,7 +128,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   async function loadMessages(id = currentId.value, earlier = false) {
     const conv = conversations.value[id]
     if (!conv) return
-    if (conv.messagesLoading || (earlier && (!conv.nextBefore || isProcessing.value))) return
+    if (conv.messagesLoading || (!earlier && runs.value[id]) || (earlier && !conv.nextBefore)) return
     conv.messagesLoading = true
     conv.messagesError = ''
     try {
@@ -131,23 +142,19 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
       conv.messagesLoaded = true
       if (page.messages.length) conv.hasMessages = true
       if (page.kbOnly != null) conv.kbOnly = page.kbOnly
+      if (page.active_generation && !runs.value[id]) {
+        void observeGeneration(id, page.active_generation.request_id)
+      }
       if (!earlier && currentId.value === id) jumpToLatest()
     } catch (e) {
       conv.messagesError = e instanceof Error ? e.message : '消息加载失败'
     } finally { conv.messagesLoading = false }
   }
 
-  watch(isThinking, (val) => {
-    if (val) {
-      thinkingSeconds.value = 0
-      const tick = () => {
-        thinkingSeconds.value = +((Date.now() - thinkingStartTime) / 1000).toFixed(1)
-        thinkingTimer = window.setTimeout(tick, 100)
-      }
-      thinkingTimer = window.setTimeout(tick, 100)
-    } else {
-      if (thinkingTimer != null) { clearTimeout(thinkingTimer); thinkingTimer = null }
-    }
+  watch(isProcessing, (processing) => {
+    if (thinkingTimer != null) { clearInterval(thinkingTimer); thinkingTimer = null }
+    now.value = Date.now()
+    if (processing) thinkingTimer = window.setInterval(() => { now.value = Date.now() }, 100)
   })
 
   const current = computed(() => conversations.value[currentId.value])
@@ -158,7 +165,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   const hasEarlier = computed(() => messageOffset.value > 0 || !!current.value?.nextBefore)
   async function showEarlier() {
     const conv = current.value
-    if (!conv || conv.messagesLoading || isProcessing.value) return
+    if (!conv || conv.messagesLoading) return
     const id = currentId.value
     const mode = kbOnly.value
     const el = chatArea.value
@@ -182,7 +189,9 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   function jumpToLatest() { following.value = true; scrollToBottom() }
   watch([currentId, kbOnly], ([id]) => {
     visibleCount.value = 50
-    if (conversations.value[id] && !conversations.value[id].messagesLoaded) void loadMessages(id)
+    if (id) localStorage.setItem(selectionKey, id)
+    if (conversations.value[id]) void loadMessages(id)
+    resetInputHeight()
     jumpToLatest()
   })
 
@@ -193,7 +202,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   }
 
   async function newConversation(mode = kbOnly.value) {
-    if (isProcessing.value || conversationBusy.value || loading.value) return
+    if (conversationBusy.value || loading.value) return
     const active = conversations.value[currentId.value]
     const empty = active && isEmptyConversation(active) ? active : convList.value.find(isEmptyConversation)
     if (empty) {
@@ -206,6 +215,12 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
       // 服务端也会复用空白会话，涵盖尚未加载到的分页和并发新建。
       const conv = await createConversationApi('新对话')
       if (disposed) return
+      // 首次发送尚在登记时，服务端可能仍把它识别为空白会话。
+      // 保留已有对象，避免覆盖运行中的订阅及乐观消息。
+      if (runs.value[conv.id] || conversations.value[conv.id]?.hasMessages) {
+        showNotice('问题正在提交，请稍后再开启新对话', 'error')
+        return
+      }
       conv.kbOnly = mode
       conversations.value[conv.id] = conv
       currentId.value = conv.id
@@ -220,12 +235,13 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   }
 
   function selectConversation(id: string) {
-    if (isProcessing.value || conversationBusy.value || loading.value || !conversations.value[id]) return
+    if (conversationBusy.value || loading.value || !conversations.value[id]) return
     currentId.value = id
   }
 
   async function deleteConversation(id: string) {
-    if (isProcessing.value || conversationBusy.value || !await confirmAction('删除此对话及全部消息？此操作无法撤销。')) return
+    if (runs.value[id] || conversationBusy.value || !await confirmAction('删除此对话及全部消息？此操作无法撤销。')) return
+    if (runs.value[id] || conversationBusy.value) return
     conversationBusy.value = true
     // 先由服务端确认删除：运行中的会话会返回 409，本地不能抢先移除
     try {
@@ -235,6 +251,8 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
       return
     } finally { conversationBusy.value = false }
     delete conversations.value[id]
+    delete drafts.value[id]
+    delete failedAttempts.value[id]
     if (Object.keys(conversations.value).length === 0 && nextCursor.value) await loadMoreConversations()
     const ids = Object.keys(conversations.value)
     if (ids.length === 0) {
@@ -261,8 +279,83 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     if (question && !isProcessing.value) void sendMessage(question.content, current.value?.messages[index].kbOnly ?? kbOnly.value)
   }
   function retryFailedSend() {
-    const attempt = failedAttempt.value
+    const attempt = failedAttempts.value[currentId.value]
     if (attempt && canRetrySend.value) return sendMessage(attempt.text, attempt.mode, attempt.requestId)
+  }
+
+  async function requestStop(id: string, run: GenerationRun) {
+    if (!run.confirmed || run.cancelSent) return
+    run.cancelSent = true
+    try {
+      await cancelGeneration(id, run.requestId)
+    } catch (e) {
+      run.stopping = false
+      run.cancelSent = false
+      handlePersistError('停止生成', e)
+    }
+  }
+
+  function stopStreaming() {
+    const id = currentId.value
+    const run = runs.value[id]
+    if (!run || run.stopping) return
+    run.stopping = true
+    void requestStop(id, run)
+  }
+
+  async function observeGeneration(id: string, requestId: string, submission?: {
+    text: string; mode: boolean; user: Message; assistant: Message; hadMessages: boolean
+  }) {
+    const conv = conversations.value[id]
+    if (!conv || runs.value[id] || disposed) return
+    runs.value[id] = { requestId, startedAt: Date.now(), thinking: true, phase: '', reconnecting: false, stopping: false, confirmed: false, cancelSent: false }
+    const run = runs.value[id]
+    const ac = new AbortController()
+    controllers.set(id, ac)
+    try {
+      const outcome = await streamChat(id, requestId, snapshot => {
+        if (disposed) return
+        run.confirmed = true
+        run.startedAt = Date.now() - snapshot.elapsed_seconds * 1000
+        now.value = Date.now()
+        run.phase = PHASE_LABELS[snapshot.phase] || ''
+        let assistant = conv.messages.find(m => m.id === snapshot.assistant_message_id)
+        if (assistant && submission && assistant !== submission.assistant) {
+          conv.messages = conv.messages.filter(m => m !== submission.assistant)
+        }
+        if (!assistant) {
+          assistant = submission?.assistant || reactive<Message>({ role: 'assistant', content: '' })
+          if (!conv.messages.includes(assistant)) conv.messages.push(assistant)
+        }
+        assistant.id = snapshot.assistant_message_id
+        assistant.content = snapshot.assistant_content || ''
+        assistant.kbOnly = snapshot.kb_only
+        assistant.status = snapshot.status === 'running' ? 'streaming' : snapshot.status === 'failed' ? 'error' : snapshot.status
+        if (submission) {
+          const savedUser = conv.messages.find(m => m.id === snapshot.user_message_id)
+          if (savedUser && savedUser !== submission.user) conv.messages = conv.messages.filter(m => m !== submission.user)
+          else submission.user.id = snapshot.user_message_id
+        }
+        if (assistant.content && run.thinking && submission) assistant.thinkingTime = +(snapshot.elapsed_seconds).toFixed(1)
+        run.thinking = snapshot.status === 'running' && !assistant.content
+        if (run.stopping && snapshot.status === 'running') void requestStop(id, run)
+        if (currentId.value === id) scrollToBottom()
+      }, value => { run.reconnecting = value }, ac.signal, submission ? { message: submission.text, kbOnly: submission.mode } : undefined)
+      if (disposed) return
+      if (!outcome.started && submission) {
+        conv.messages = conv.messages.filter(m => m !== submission.user && m !== submission.assistant)
+        conv.hasMessages = submission.hadMessages
+        failedAttempts.value[id] = { text: submission.text, mode: submission.mode, requestId }
+        handlePersistError('发送消息', new Error(outcome.error || '请求未被服务端接受'))
+      } else {
+        delete failedAttempts.value[id]
+        if (outcome.status === 'error' && outcome.error) handlePersistError('生成回答', new Error(outcome.error))
+      }
+    } finally {
+      if (runs.value[id] === run) delete runs.value[id]
+      controllers.delete(id)
+      if (currentId.value === id) scrollToBottom()
+    }
   }
 
   async function sendMessage(retryText?: string, answerMode = kbOnly.value, previousRequestId?: string) {
@@ -270,113 +363,21 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     if (!text || isProcessing.value || conversationBusy.value || loading.value) return
     const convId = currentId.value
     const conv = conversations.value[convId]
-    if (!conv || answerMode !== kbOnly.value) return
-    if (!conv.messagesLoaded || conv.messagesLoading) return
-
-    // 本地先乐观展示；服务端在/stream 接口中原子写入用户消息，客户端不再单独提交
+    if (!conv || answerMode !== kbOnly.value || !conv.messagesLoaded || conv.messagesLoading) return
     const hadMessages = conv.hasMessages
     conv.hasMessages = true
     conv.kbOnly = answerMode
-    conv.messages.push({ role: 'user', content: text, kbOnly: answerMode })
-    const userIdx = conv.messages.length - 1
+    const user = reactive<Message>({ role: 'user', content: text, kbOnly: answerMode })
+    const assistant = reactive<Message>({ role: 'assistant', content: '', status: 'streaming', kbOnly: answerMode })
+    conv.messages.push(user, assistant)
     conv.updatedAt = new Date().toISOString()
-    if (conv.messages.length === 1 && conv.title === '新对话') {
+    if (!hadMessages && conv.title === '新对话') {
       conv.title = text.length > 20 ? text.slice(0, 20) + '...' : text
       updateConversationTitle(convId, conv.title).catch(e => handlePersistError('更新标题', e))
     }
     if (retryText == null) { input.value = ''; resetInputHeight() }
-    thinkingStartTime = Date.now()
-    thinkingPhase.value = ''
-    isProcessing.value = true
-    isThinking.value = true
     jumpToLatest()
-
-    const assistantMsg: Message = { role: 'assistant', content: '', status: 'streaming', kbOnly: answerMode }
-    conv.messages.push(assistantMsg)
-    const idx = conv.messages.length - 1
-
-    const captureThinkingTime = () => {
-      if (conv.messages[idx].thinkingTime == null) {
-        conv.messages[idx].thinkingTime = +((Date.now() - thinkingStartTime) / 1000).toFixed(1)
-      }
-    }
-
-    let buffered = ''
-    let replacing = false
-    const flushAnswer = () => {
-      if (pendingFrame !== null) { cancelAnimationFrame(pendingFrame); pendingFrame = null }
-      if (!conv.messages[idx]) { buffered = ''; replacing = false; return }
-      if (replacing) conv.messages[idx].content = buffered
-      else conv.messages[idx].content += buffered
-      buffered = ''
-      replacing = false
-      scrollToBottom()
-    }
-    const updateAnswer = (text: string, replace = false) => {
-      if (isThinking.value) { captureThinkingTime(); isThinking.value = false }
-      buffered = replace ? text : buffered + text
-      replacing ||= replace
-      if (pendingFrame === null) pendingFrame = requestAnimationFrame(flushAnswer)
-    }
-
-    // 上一次可能仍在途（正常情况下已被 isProcessing 挡住），先取消再开启新的
-    streamAbort?.abort()
-    const ac = new AbortController()
-    streamAbort = ac
-    // 幂等键：网络重试复用同一个值，服务端不会重复写入消息或重复生成
-    const requestId = previousRequestId || newRequestId()
-
-    try {
-      const outcome = await streamChat(
-        convId, requestId, text, answerMode,
-        chunk => updateAnswer(chunk),
-        text => updateAnswer(text, true),
-        phase => { if (isThinking.value) thinkingPhase.value = PHASE_LABELS[phase] || '' },
-        ac.signal,
-      )
-      flushAnswer()
-      captureThinkingTime()
-
-      if (!outcome.started) {
-        // 服务端没有接受本次请求（会话已删除、会话被占用或校验失败）：
-        // 回滚本地乐观消息，避免展示数据库中不存在的问答
-        conv.messages.splice(userIdx, 2)
-        conv.hasMessages = hadMessages
-        if (!ac.signal.aborted) failedAttempt.value = { conversationId: convId, text, mode: answerMode, requestId }
-        if (!ac.signal.aborted) handlePersistError('发送消息', new Error(outcome.error || '请求未被服务端接受'))
-        return
-      }
-      if (failedAttempt.value?.conversationId === convId && failedAttempt.value?.mode === answerMode) failedAttempt.value = null
-
-      if (outcome.messageId != null) conv.messages[idx].id = outcome.messageId
-      if (outcome.status === 'completed') {
-        conv.messages[idx].status = 'completed'
-        if (!conv.messages[idx].content) conv.messages[idx].content = '（未收到回复）'
-      } else if (outcome.status === 'cancelled') {
-        conv.messages[idx].status = 'cancelled'
-      } else {
-        conv.messages[idx].status = 'error'
-        if (!conv.messages[idx].content) {
-          conv.messages[idx].content = `错误: ${outcome.error || '生成失败'}`
-        }
-      }
-    } catch (e) {
-      captureThinkingTime()
-      if (ac.signal.aborted) {
-        conv.messages[idx].status = 'cancelled'
-      } else {
-        conv.messages[idx].status = 'error'
-        if (!conv.messages[idx].content) conv.messages[idx].content = '网络错误，请检查连接后重试'
-      }
-      handlePersistError('发送消息', e)
-    } finally {
-      flushAnswer()
-      isProcessing.value = false
-      isThinking.value = false
-      thinkingPhase.value = ''
-      scrollToBottom()
-      if (streamAbort === ac) streamAbort = null
-    }
+    await observeGeneration(convId, previousRequestId || newRequestId(), { text, mode: answerMode, user, assistant, hadMessages })
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -384,13 +385,20 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
   }
 
-  onMounted(initConversations)
+  function refreshCurrent() {
+    if (!document.hidden && currentId.value && !runs.value[currentId.value]) void loadMessages()
+  }
+  onMounted(() => {
+    void initConversations()
+    window.addEventListener('focus', refreshCurrent)
+  })
   onUnmounted(() => {
     disposed = true
-    stopStreaming()
-    if (thinkingTimer !== null) clearTimeout(thinkingTimer)
-    if (pendingFrame !== null) cancelAnimationFrame(pendingFrame)
+    // 页面卸载只断开订阅，显式停止才调用取消接口。
+    for (const controller of controllers.values()) controller.abort()
+    window.removeEventListener('focus', refreshCurrent)
+    if (thinkingTimer !== null) clearInterval(thinkingTimer)
   })
-  return { input, inputEl, chatArea, current, currentId, convList, hasEmptyConv, isProcessing, isThinking, thinkingSeconds, thinkingPhase, kbOnly, switchMode, suggestions, useSuggestion, newConversation, selectConversation, deleteConversation, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
+  return { input, inputEl, chatArea, current, currentId, convList, hasEmptyConv, isProcessing, processingIds, reconnecting, stopping, isThinking, thinkingSeconds, thinkingPhase, kbOnly, switchMode, suggestions, useSuggestion, newConversation, selectConversation, deleteConversation, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
     nextCursor, loadingMore, loadMoreConversations, loadMessages, hasEarlier, loading, loadError, initConversations, conversationBusy, renameConversation, following, onScroll, jumpToLatest, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend }
 }

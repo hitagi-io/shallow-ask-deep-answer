@@ -5,7 +5,7 @@ import ChatMessage from './ChatMessage.vue'
 import type { useChat } from '../composables/useChat'
 
 const props = defineProps<{ chat: ReturnType<typeof useChat> }>()
-const { input, inputEl, chatArea, current, isProcessing, isThinking, thinkingSeconds, thinkingPhase,
+const { input, inputEl, chatArea, current, isProcessing, isThinking, thinkingSeconds, thinkingPhase, reconnecting, stopping,
   kbOnly, switchMode, suggestions, useSuggestion, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
   loading, loadError, initConversations, conversationBusy, following, onScroll, jumpToLatest,
   loadMessages, hasEarlier, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend } = props.chat
@@ -42,7 +42,7 @@ async function clearInput() {
         <div class="suggestions"><button v-for="(suggestion, i) in suggestions" :key="suggestion.label" @click="useSuggestion(suggestion.prompt)"><span class="suggestion-index">0{{ i + 1 }}</span><span>{{ suggestion.label }}</span><span aria-hidden="true">↗</span></button></div>
       </div>
 
-      <button v-if="hasEarlier" class="history-button text-action" :disabled="current.messagesLoading || isProcessing" @click="showEarlier">{{ current.messagesLoading ? '正在加载…' : '查看更早的消息' }}</button>
+      <button v-if="hasEarlier" class="history-button text-action" :disabled="current.messagesLoading" @click="showEarlier">{{ current.messagesLoading ? '正在加载…' : '查看更早的消息' }}</button>
       <ChatMessage v-for="(msg, i) in visibleMessages" :key="`${current.id}:${kbOnly ? 'kb' : 'general'}:${msg.id ?? `local-${messageOffset + i}`}`"
         :message="msg" :thinking="isThinking && i === visibleMessages.length - 1"
         :streaming="isProcessing && !isThinking && i === visibleMessages.length - 1" :busy="isProcessing"
@@ -56,6 +56,7 @@ async function clearInput() {
   </button>
   </div>
   </div>
+  <p v-if="reconnecting" class="composer-hint" role="status">连接中断，正在恢复回答…</p>
   <button v-if="canRetrySend" class="latest-button" :disabled="isProcessing" @click="retryFailedSend">重试未确认的发送</button>
 
   <transition name="banner">
@@ -68,8 +69,8 @@ async function clearInput() {
     <div class="input-inner">
       <div class="input-options">
         <div class="mode-switch" role="group" aria-label="问答模式">
-          <button :class="{ active: kbOnly }" :aria-pressed="kbOnly" :disabled="isProcessing || conversationBusy || loading || !current || !!loadError" @click="switchMode(true)">知识库问答</button>
-          <button :class="{ active: !kbOnly }" :aria-pressed="!kbOnly" :disabled="isProcessing || conversationBusy || loading || !current || !!loadError" @click="switchMode(false)">通用问答</button>
+          <button :class="{ active: kbOnly }" :aria-pressed="kbOnly" :disabled="conversationBusy || loading || !current || !!loadError" @click="switchMode(true)">知识库问答</button>
+          <button :class="{ active: !kbOnly }" :aria-pressed="!kbOnly" :disabled="conversationBusy || loading || !current || !!loadError" @click="switchMode(false)">通用问答</button>
         </div>
         <span class="mode-description">{{ kbOnly ? '仅根据知识库检索结果回答' : '据模型知识与联网搜索果回答' }}</span>
       </div>
@@ -81,7 +82,7 @@ async function clearInput() {
           @input="resizeInput"
           />
         <button v-if="input.length" type="button" class="btn-clear" @click="clearInput" aria-label="清空输入框" title="清空输入框">清空</button>
-        <button v-if="isProcessing" class="btn-send" @click="stopStreaming" aria-label="停止生成" title="停止生成">
+        <button v-if="isProcessing" :disabled="stopping" class="btn-send" @click="stopStreaming" aria-label="停止生成" title="停止生成">
           <svg width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="3" fill="currentColor"/></svg>
         </button>
         <button v-else class="btn-send" :disabled="!input.trim() || !current?.messagesLoaded || current?.messagesLoading || loading || conversationBusy" @click="sendMessage()" aria-label="发送消息" title="发送消息">↑</button>

@@ -8,7 +8,7 @@ const props = defineProps<{
   user: UserInfo
   sidebarOpen: boolean
   collapsed: boolean
-  isProcessing: boolean
+  processingIds: string[]
   convList: Conversation[]
   currentId: string
   healthIssueCount: number
@@ -115,7 +115,7 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
       <button class="mobile-close" aria-label="收起侧边栏" title="收起侧边栏" @click="emit('close')">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m7-11-3 3 3 3"/></svg>
       </button>
-      <button class="btn-new" :disabled="isProcessing || conversationBusy" @click="emit('newConversation')" title="开启新对话">
+      <button class="btn-new" :disabled="conversationBusy" @click="emit('newConversation')" title="开启新对话">
         <span class="plus">＋</span> 开启新对话
       </button>
     </div>
@@ -127,18 +127,18 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
       <template v-for="group in groups" :key="group.label">
       <li class="date-group">{{ group.label }}</li>
       <li v-for="c in group.items" :key="c.id" class="conversation-item" :class="{ active: c.id === currentId, 'menu-open': conversationMenuId === c.id }" @keydown.esc.stop="closeConversationMenu(true)">
-        <button class="conv-btn" :disabled="isProcessing || conversationBusy" :aria-current="c.id === currentId ? 'page' : undefined" @click="emit('selectConversation', c.id)">
+        <button class="conv-btn" :disabled="conversationBusy" :aria-current="c.id === currentId ? 'page' : undefined" @click="emit('selectConversation', c.id)">
 
           <span class="conv-title">{{ c.title }}</span>
         </button>
-        <button class="conv-more" :disabled="isProcessing || conversationBusy" :aria-expanded="conversationMenuId === c.id" :aria-controls="`conversation-actions-${c.id}`" :aria-label="`${c.title}的更多操作`" title="更多操作" @click="conversationMenuId = conversationMenuId === c.id ? '' : c.id">
+        <button class="conv-more" :disabled="conversationBusy" :aria-expanded="conversationMenuId === c.id" :aria-controls="`conversation-actions-${c.id}`" :aria-label="`${c.title}的更多操作`" title="更多操作" @click="conversationMenuId = conversationMenuId === c.id ? '' : c.id">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
         </button>
         <div v-if="conversationMenuId === c.id" :id="`conversation-actions-${c.id}`" class="conversation-menu" role="group" aria-label="对话操作">
-          <button :disabled="isProcessing || conversationBusy" @click="closeConversationMenu(true); renameId = c.id; title = c.title">
+          <button :disabled="conversationBusy" @click="closeConversationMenu(true); renameId = c.id; title = c.title">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 3 5 5-12 12-6 1 1-6L16 3Zm-2 2 5 5"/></svg>重命名
           </button>
-          <button class="delete-action" :disabled="isProcessing || conversationBusy" @click="closeConversationMenu(true); emit('deleteConversation', c.id)">
+          <button class="delete-action" :disabled="conversationBusy || processingIds.includes(c.id)" @click="closeConversationMenu(true); emit('deleteConversation', c.id)">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7"/></svg>删除
           </button>
         </div>
@@ -169,7 +169,7 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
             <span v-if="healthIssueCount > 0" class="badge">{{ healthIssueCount }}</span>
           </button>
           <div v-if="showGearMenu" class="gear-menu">
-            <button v-if="user.role === 'admin'" :disabled="isProcessing" @click="navigateToKnowledge">
+            <button v-if="user.role === 'admin'" @click="navigateToKnowledge">
               管理知识库
               <span v-if="healthIssueCount > 0" class="badge menu-badge">{{ healthIssueCount }}</span>
             </button>

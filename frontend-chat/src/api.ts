@@ -163,7 +163,7 @@ export async function fetchConversations(cursor?: string | null): Promise<{
 }
 
 export async function fetchMessages(id: string, before?: number | null): Promise<{
-  messages: Message[]; next_before: number | null; kbOnly: boolean | null
+  messages: Message[]; next_before: number | null; kbOnly: boolean | null; active_generation: { request_id: string } | null
 }> {
   const query = new URLSearchParams({ limit: '50' })
   if (before != null) query.set('before', String(before))
@@ -210,147 +210,111 @@ export function newRequestId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
 }
 
+export interface GenerationSnapshot {
+  request_id: string
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  assistant_content: string | null
+  assistant_message_id: number
+  user_message_id: number
+  kb_only: boolean
+  elapsed_seconds: number
+  phase: string
+  error: string | null
+}
+
 export interface StreamOutcome {
-  /**
-   * 只有收到服务端显式 done 事件才是 completed；
-   * 连接提前结束、缺少 done 时一律按 error 处理，避免把截断当成正常完成。
-   */
   status: 'completed' | 'error' | 'cancelled'
-  /** 服务端是否已接受本次生成（收到 start 事件） */
   started: boolean
-  /** 服务端写入的助手消息 ID */
-  messageId?: number
   error?: string
 }
 
-interface StreamEvent {
-  type?: string
-  content?: string
-  /** type === 'phase' 时的阶段名（thinking / retrieving / generating） */
-  phase?: string
-  status?: string
-  error?: string
-  message_id?: number | null
-  user_message_id?: number | null
+function generationPath(conversationId: string, requestId: string) {
+  return `/api/conversations/${encodeURIComponent(conversationId)}/generations/${encodeURIComponent(requestId)}`
 }
 
-/**
- * 发起一次流式生成。
- *
- * - 消息由服务端统一持久化：客户端不再调用消息写入接口；
- * - requestId 是幂等键，网络重试复用同一个值不会重复生成或重复写消息；
- * - 用户停止时通过 signal 断开连接，服务端会将本次生成置为 cancelled 状态。
- */
+export async function cancelGeneration(conversationId: string, requestId: string): Promise<void> {
+  const res = await apiFetch(`${generationPath(conversationId, requestId)}/cancel`, {
+    method: 'POST', headers: authHeaders(),
+  })
+  if (!res.ok) throw new Error(await errorMessage(res, '停止生成失败'))
+}
+
+function reconnectDelay(signal: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    const finish = () => { clearTimeout(timer); signal.removeEventListener('abort', finish); resolve() }
+    const timer = setTimeout(finish, 1000)
+    signal.addEventListener('abort', finish, { once: true })
+    if (signal.aborted) finish()
+  })
+}
+
+/** POST 只创建一次任务；断线后使用 GET 重新订阅数据库快照，不重复提交问题。 */
 export async function streamChat(
   conversationId: string,
   requestId: string,
-  message: string,
-  kbOnly: boolean,
-  onChunk: (text: string) => void,
-  onReplace: (text: string) => void,
-  onPhase: (phase: string) => void,
+  onSnapshot: (snapshot: GenerationSnapshot) => void,
+  onConnection: (reconnecting: boolean) => void,
   signal: AbortSignal,
+  submission?: { message: string; kbOnly: boolean },
 ): Promise<StreamOutcome> {
-  let res: Response
-  try {
-    res = await apiFetch('/api/chat/stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({ message, thread_id: conversationId, request_id: requestId, kb_only: kbOnly }),
-      signal,
-    })
-  } catch {
-    if (signal.aborted) return { status: 'cancelled', started: false }
-    return { status: 'error', started: false, error: '网络错误，请检查连接后重试' }
-  }
-
-  if (!res.ok) {
-    if (res.status === 401) {
-      return { status: 'error', started: false, error: '登录已过期，请重新登录' }
-    }
-    if (res.status === 422) {
-      return { status: 'error', started: false, error: '输入内容不合法（可能超出长度上限）' }
-    }
-    return { status: 'error', started: false, error: await errorMessage(res, `请求失败: ${res.status}`) }
-  }
-
-  const reader = res.body?.getReader()
-  if (!reader) return { status: 'error', started: false, error: '无法读取响应流' }
-
-  const decoder = new TextDecoder()
-  let buffer = ''
-  let started = false
-  let outcome: StreamOutcome | null = null
-
-  const handleLine = (line: string): StreamOutcome | null => {
-    if (!line.startsWith('data: ')) return null
-    let data: StreamEvent
+  let started = !submission
+  let submit = submission
+  let missingAttempts = 0
+  while (!signal.aborted) {
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
     try {
-      data = JSON.parse(line.slice(6)) as StreamEvent
+      const initial = submit
+      submit = undefined
+      const res = await apiFetch(initial ? '/api/chat/stream' : `${generationPath(conversationId, requestId)}/stream`, {
+        method: initial ? 'POST' : 'GET',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: initial ? JSON.stringify({ message: initial.message, thread_id: conversationId, request_id: requestId, kb_only: initial.kbOnly }) : undefined,
+        signal,
+      })
+      if (!res.ok) {
+        // 首次 POST 回执丢失时，给登记事务留出完成时间，再确认任务是否存在。
+        if (!initial && res.status === 404 && !started && ++missingAttempts < 3) throw new Error('等待任务登记')
+        if (res.status >= 500) throw new Error('服务暂时不可用')
+        return { status: 'error', started, error: await errorMessage(res, `请求失败: ${res.status}`) }
+      }
+      started = true
+      reader = res.body?.getReader()
+      if (!reader) throw new Error('无法读取响应流')
+      const decoder = new TextDecoder()
+      let buffer = ''
+      const handleLine = (line: string): StreamOutcome | null => {
+        if (!line.startsWith('data: ')) return null
+        const data = JSON.parse(line.slice(6))
+        if (data.type === 'error') return { status: 'error', started, error: data.error }
+        if (data.type !== 'snapshot') return null
+        onConnection(false)
+        onSnapshot(data as GenerationSnapshot)
+        if (data.status === 'running') return null
+        return { status: data.status === 'completed' ? 'completed' : data.status === 'cancelled' ? 'cancelled' : 'error', started, error: data.error }
+      }
+      while (!signal.aborted) {
+        const { done, value } = await reader.read()
+        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        if (done && buffer) lines.push(buffer)
+        for (const line of lines) {
+          const outcome = handleLine(line)
+          if (outcome) return outcome
+        }
+        if (done) break
+      }
     } catch {
-      return null
+      // 网络断线与停止生成是不同操作；保持会话运行态并重新订阅。
+    } finally {
+      await reader?.cancel().catch(() => {})
     }
-    if (data.type === 'start') {
-      started = true
-      return null
+    if (!signal.aborted) {
+      onConnection(true)
+      await reconnectDelay(signal)
     }
-    if (data.type === 'phase') {
-      started = true
-      if (data.phase) onPhase(data.phase)
-      return null
-    }
-    if (data.type === 'replace') {
-      started = true
-      onReplace(data.content || '')
-      return null
-    }
-    if (data.type === 'chunk') {
-      started = true
-      if (data.content) onChunk(data.content)
-      return null
-    }
-    if (data.type === 'done') {
-      started = true
-      return { status: 'completed', started: true, messageId: data.message_id ?? undefined }
-    }
-    if (data.type === 'error') {
-      started = true
-      return {
-        status: data.status === 'cancelled' ? 'cancelled' : 'error',
-        started: true,
-        messageId: data.message_id ?? undefined,
-        error: data.error || '服务处理异常，请稍后重试',
-      }
-    }
-    return null
   }
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
-      for (const line of lines) {
-        const parsed = handleLine(line)
-        if (parsed) outcome = parsed
-      }
-    }
-    buffer += decoder.decode()
-    // 末尾没有换行的最后一行也要解析，避免漏掉紧邻 EOF 的 done 事件
-    if (buffer) {
-      const parsed = handleLine(buffer)
-      if (parsed) outcome = parsed
-    }
-  } catch {
-    if (signal.aborted) return { status: 'cancelled', started }
-    return { status: 'error', started, error: '网络错误，回答未完成' }
-  }
-
-  if (outcome) return outcome
-  if (signal.aborted) return { status: 'cancelled', started }
-  return { status: 'error', started, error: '连接中断，回答未完成' }
+  return { status: 'cancelled', started }
 }
 
 // ---------- knowledge API ----------
