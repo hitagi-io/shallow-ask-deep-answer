@@ -236,7 +236,7 @@ export async function cancelGeneration(conversationId: string, requestId: string
   const res = await apiFetch(`${generationPath(conversationId, requestId)}/cancel`, {
     method: 'POST', headers: authHeaders(),
   })
-  if (!res.ok) throw new Error(await errorMessage(res, '停止生成失败'))
+  if (!res.ok) throw new Error(await errorMessage(res, '暂时无法停止回答，请重试'))
 }
 
 function reconnectDelay(signal: AbortSignal): Promise<void> {

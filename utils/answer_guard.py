@@ -29,9 +29,11 @@ logger = get_logger(__name__)
 SEARCH_ERROR_MARKER = "__SEARCH_UNAVAILABLE__"
 SEARCH_EMPTY_MARKER = "__SEARCH_EMPTY__"
 
-COPY_KB_DOWN = "抱歉，知识库检索服务暂时不可用，请稍后重试。"
-COPY_KB_MISS = "抱歉，内部知识库中未找到相关资料。您可以切换到「通用问答」后重试。"
-COPY_KB_UNVERIFIED = "抱歉，本次回答未能通过知识库依据校验，请稍后重试。"
+COPY_KB_DOWN = "抱歉，知识库暂时无法查询，请稍后再试。"
+COPY_KB_NO_ANSWER = "抱歉，本次未能根据知识库资料给出可靠回答。您可以补充问题描述后重试。"
+# 用户侧统一提示；内部状态和日志仍区分无资料与校验未通过。
+COPY_KB_MISS = COPY_KB_NO_ANSWER
+COPY_KB_UNVERIFIED = COPY_KB_NO_ANSWER
 
 _COPY_BY_WINNER = {
     "kb_down": COPY_KB_DOWN,

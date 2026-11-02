@@ -35,9 +35,9 @@ function copyCode(event: MouseEvent) {
 // 空内容时按终态给出占位文案：服务端只保存模型实际输出，不拼接展示标记
 function bubbleText(msg: Message) {
   if (msg.content) return msg.content
-  if (msg.status === 'error') return '（生成失败）'
-  if (msg.status === 'cancelled') return '（已取消）'
-  if (msg.status === 'completed') return '（未收到回复）'
+  if (msg.status === 'error') return '这次没能完成回答，请重试。'
+  if (msg.status === 'cancelled') return '已停止回答。'
+  if (msg.status === 'completed') return '这次没有收到回答，请重新提问。'
   return ''
 }
 
@@ -59,7 +59,7 @@ const html = computed(() => {
         <span class="thinking-dot"></span>
         <span class="thinking-dot" style="animation-delay:0.15s"></span>
         <span class="thinking-dot" style="animation-delay:0.3s"></span>
-        <span class="thinking-text">{{ thinkingPhase || '处理中' }}...... {{ formatDuration(thinkingSeconds) }}</span>
+        <span class="thinking-text">{{ thinkingPhase || '正在处理问题' }}… {{ formatDuration(thinkingSeconds) }}</span>
       </div>
       <div v-if="message.role === 'assistant' && !(thinking && !message.content)" ref="body" class="bubble markdown-body" @click="copyCode" v-html="html"></div>
       <div v-if="message.role === 'assistant' && !thinking && !streaming" class="message-actions">
@@ -77,9 +77,9 @@ const html = computed(() => {
         </button>
         <span role="status" aria-live="polite">{{ copyNotice }}</span>
       </div>
-      <div v-if="message.role === 'assistant' && message.thinkingTime != null && message.content" class="thinking-time">· 处理耗时 {{ formatDuration(message.thinkingTime) }}</div>
+      <div v-if="message.role === 'assistant' && message.thinkingTime != null && message.content" class="thinking-time">· 用时 {{ formatDuration(message.thinkingTime) }}</div>
       <div v-if="message.role === 'assistant' && (message.status === 'cancelled' || message.status === 'error') && message.content" class="message-note" :class="message.status">
-        {{ message.status === 'cancelled' ? '· 已取消' : '· 回答未完成' }}
+        {{ message.status === 'cancelled' ? '· 已停止回答' : '· 回答未完成，可重新提问' }}
       </div>
       <div v-if="message.role === 'user'" class="bubble">{{ message.content }}</div>
       <span v-if="streaming && message.role === 'assistant'" class="cursor">▌</span>

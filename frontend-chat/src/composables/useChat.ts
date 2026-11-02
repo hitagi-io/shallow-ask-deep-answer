@@ -52,15 +52,15 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   const isThinking = computed(() => !!activeRun.value?.thinking)
   const now = ref(Date.now())
   const thinkingSeconds = computed(() => activeRun.value ? Math.max(0, (now.value - activeRun.value.startedAt) / 1000) : 0)
-  const thinkingPhase = computed(() => activeRun.value?.stopping ? '正在停止' : activeRun.value?.reconnecting ? '连接中断，正在恢复' : activeRun.value?.phase || '')
+  const thinkingPhase = computed(() => activeRun.value?.stopping ? '正在停止回答' : activeRun.value?.reconnecting ? '连接中断，正在重新连接' : activeRun.value?.phase || '')
   const reconnecting = computed(() => !!activeRun.value?.reconnecting)
   const stopping = computed(() => !!activeRun.value?.stopping)
   const PHASE_LABELS: Record<string, string> = {
     thinking: '正在思考',
-    retrieving: '正在检索知识库',
+    retrieving: '正在查找知识库资料',
     searching: '正在联网搜索',
-    working: '正在使用工具',
-    generating: '正在生成回答',
+    working: '正在处理问题',
+    generating: '正在整理回答',
   }
   let thinkingTimer: number | null = null
   const chatArea = ref<HTMLElement | null>(null)
@@ -291,7 +291,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     } catch (e) {
       run.stopping = false
       run.cancelSent = false
-      handlePersistError('停止生成', e)
+      handlePersistError('停止回答', e)
     }
   }
 
@@ -346,10 +346,13 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
         conv.messages = conv.messages.filter(m => m !== submission.user && m !== submission.assistant)
         conv.hasMessages = submission.hadMessages
         failedAttempts.value[id] = { text: submission.text, mode: submission.mode, requestId }
-        handlePersistError('发送消息', new Error(outcome.error || '请求未被服务端接受'))
+        handlePersistError('发送消息', new Error(outcome.error || '未能确认是否发送成功，请重试'))
       } else {
         delete failedAttempts.value[id]
-        if (outcome.status === 'error' && outcome.error) handlePersistError('生成回答', new Error(outcome.error))
+        if (outcome.status === 'error' && outcome.error) {
+          console.error('[回答失败]', outcome.error)
+          showNotice(outcome.error, 'error')
+        }
       }
     } finally {
       if (runs.value[id] === run) delete runs.value[id]

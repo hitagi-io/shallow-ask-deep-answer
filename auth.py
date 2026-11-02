@@ -630,16 +630,16 @@ def _reap_stale_generations(cur, conv_id: str, stale_seconds: float) -> int:
             cur.execute(
                 "INSERT INTO messages (conversation_id, role, content, status, generation_id, kb_only) "
                 "VALUES (%s, 'assistant', %s, 'error', %s, %s) RETURNING id",
-                (conv_id, "（回答中断）", row["id"], row["kb_only"]),
+                (conv_id, "回答已中断，请重新提问。", row["id"], row["kb_only"]),
             )
             message_id = cur.fetchone()["id"]
         else:
             cur.execute("UPDATE messages SET status = 'error', content = CASE WHEN content = '' "
-                        "THEN '（回答中断）' ELSE content END WHERE id = %s", (message_id,))
+                        "THEN '回答已中断，请重新提问。' ELSE content END WHERE id = %s", (message_id,))
         cur.execute(
             "UPDATE generations SET status = 'failed', error = %s, "
             "assistant_message_id = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
-            ("生成中断：服务异常或进程重启", message_id, row["id"]),
+            ("服务暂时不可用，回答已中断，请稍后再试。", message_id, row["id"]),
         )
     if rows:
         logger.warning("[会话] 已将 %s 个长期未更新的生成任务标记为失败 conversation_id=%s", len(rows), conv_id)
@@ -816,9 +816,9 @@ def finish_generation(
                 conn.rollback()
                 return None
             if row["cancel_requested"] and status == "completed":
-                status, message_status, error = "cancelled", "cancelled", "回答已取消"
+                status, message_status, error = "cancelled", "cancelled", "已停止回答。"
             if not content and message_status == "error":
-                content = error or "（回答中断）"
+                content = error or "回答已中断，请重新提问。"
             message_id = row["assistant_message_id"]
             if message_id is None:  # 兼容升级前已登记的任务
                 cur.execute(

@@ -31,6 +31,7 @@ do_retrieval 返回 JSON；顶层 status 是工具状态，documents 中的 sour
 
 <output_contract>
 默认用中文写结论及必要要点；覆盖任务中的每个子问题，部分缺证或冲突就明确其范围。除任务要求详细外，保持简洁，不重复堆砌片段。
+正文使用可直接面向用户的自然表达，具体说明哪一项内容还不能确定，不使用「证据不足」「校验失败」「任务状态」等内部措辞；保留必要的事实限制和来源归属。
 正常回答末尾单独一行：来源：文件名1、文件名2
 文件名去重、按正文首次使用顺序，最多 ${citation_source_limit} 个。正文和来源行都使用纯文本或必要的 Markdown，不用 JSON 或 XML 包裹整个答案。
 你只生成上述正文与来源行，或固定短句；protocol、status、evidence 等结构化报告字段由代码根据实际工具结果生成，不由你编造。
@@ -48,7 +49,7 @@ do_retrieval 返回 JSON；顶层 status 是工具状态，documents 中的 sour
 <example>
 <question>审批期限是多少？</question>
 <retrieval_result>{"status":"ok","documents":[{"source":"规定甲.txt","content":"审批期限为 3 天。"},{"source":"规定乙.txt","content":"审批期限为 5 天。"}]}</retrieval_result>
-<output>规定甲记载审批期限为 3 天，规定乙记载为 5 天。现有片段未说明两者的版本或适用范围，无法确定应采用哪项规定。
+<output>规定甲记载审批期限为 3 天，规定乙记载为 5 天。目前查到的资料没有注明两者的版本或适用范围，还不能确定应采用哪项规定。
 来源：规定甲.txt、规定乙.txt</output>
 </example>
 <example>

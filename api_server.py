@@ -536,7 +536,7 @@ async def _generation_events(user_id: int, conv_id: str, request_id: str):
             get_generation, user_id, conv_id, request_id, CHAT_GENERATION_STALE_SECONDS,
         )
         if generation is None:
-            yield _sse({"type": "error", "status": "error", "error": "生成任务不存在"})
+            yield _sse({"type": "error", "status": "error", "error": "未找到这次回答，请刷新页面后重试。"})
             return
         # elapsed_seconds 每次读取都会变；仅内容、阶段或状态改变时推送完整快照。
         signature = {k: v for k, v in generation.items() if k != "elapsed_seconds"}
@@ -556,7 +556,7 @@ async def resume_generation(conv_id: str, request_id: str, user: dict = Depends(
         get_generation, user["user_id"], conv_id, request_id, CHAT_GENERATION_STALE_SECONDS,
     )
     if generation is None:
-        raise HTTPException(status_code=404, detail="生成任务不存在")
+        raise HTTPException(status_code=404, detail="未找到这次回答，请刷新页面后重试。")
     return StreamingResponse(_generation_events(user["user_id"], conv_id, request_id),
                              media_type="text/event-stream", headers=SSE_HEADERS)
 
@@ -564,7 +564,7 @@ async def resume_generation(conv_id: str, request_id: str, user: dict = Depends(
 @app.post("/api/conversations/{conv_id}/generations/{request_id}/cancel")
 async def stop_generation(conv_id: str, request_id: str, user: dict = Depends(get_current_user)):
     if not await asyncio.to_thread(cancel_generation, user["user_id"], conv_id, request_id):
-        raise HTTPException(status_code=404, detail="生成任务不存在")
+        raise HTTPException(status_code=404, detail="未找到这次回答，请刷新页面后重试。")
     return {"message": "ok"}
 
 

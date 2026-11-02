@@ -15,7 +15,7 @@ async def run_generation(stream_factory, save_progress, finish, *, deadline, on_
     parts: list[str] = []
     phase = "thinking"
     dirty = False
-    status, message_status, error = "failed", "error", "生成中断：服务正在关闭"
+    status, message_status, error = "failed", "error", "服务暂时不可用，回答已中断，请稍后再试。"
     bridge = None
     try:
         cancel_event = threading.Event()
@@ -29,7 +29,7 @@ async def run_generation(stream_factory, save_progress, finish, *, deadline, on_
                     dirty = False
                     next_save = time.monotonic() + save_interval
                     if not running:
-                        status, message_status, error = "cancelled", "cancelled", "回答已取消"
+                        status, message_status, error = "cancelled", "cancelled", "已停止回答。"
                         break
                 try:
                     kind, payload = await asyncio.wait_for(bridge.receive(), max(0.001, next_save - time.monotonic()))
@@ -47,16 +47,16 @@ async def run_generation(stream_factory, save_progress, finish, *, deadline, on_
                     status, message_status, error = "completed", "completed", None
                     break
                 elif kind == "cancelled":
-                    status, message_status, error = "cancelled", "cancelled", "回答已取消"
+                    status, message_status, error = "cancelled", "cancelled", "已停止回答。"
                     break
                 else:
                     raise payload
     except TimeoutError:
-        error = "回答超时，请稍后重试"
+        error = "这次回答用时过长，已停止，请稍后再试。"
     except asyncio.CancelledError:
         pass  # 服务退出时保留已生成内容；HTTP 断开不会取消此任务。
     except Exception:
-        error = "服务处理异常，请稍后重试"
+        error = "抱歉，这次没能完成回答，请稍后再试。"
         logger.exception("[对话生成] 后台任务失败")
     finally:
         if bridge is not None:

@@ -40,7 +40,7 @@ async function clearInput() {
       <div v-if="current.messagesLoaded && current.messages.length === 0" class="empty welcome-state">
         <BrandMark class="empty-seal" />
         <p class="empty-title">有什么想了解的？</p>
-        <p class="empty-hint">从一个问题开始，让知识为你所用。</p>
+        <p class="empty-hint">{{ kbOnly ? '可以询问资料中的规定、流程或具体内容。' : '可以提问，也可以让我帮您写作、翻译或梳理思路。' }}</p>
         <div class="suggestions"><button v-for="(suggestion, i) in suggestions" :key="suggestion.label" @click="useSuggestion(suggestion.prompt)"><span class="suggestion-index">0{{ i + 1 }}</span><span>{{ suggestion.label }}</span><AppIcon class="suggestion-arrow" name="arrow-up-right" :size="16" /></button></div>
       </div>
 
@@ -58,8 +58,8 @@ async function clearInput() {
   </button>
   </div>
   </div>
-  <p v-if="reconnecting" class="composer-hint" role="status">连接中断，正在恢复回答…</p>
-  <button v-if="canRetrySend" class="latest-button" :disabled="isProcessing" @click="retryFailedSend">重试未确认的发送</button>
+  <p v-if="reconnecting" class="composer-hint" role="status">连接中断，正在重新连接…</p>
+  <button v-if="canRetrySend" class="latest-button" :disabled="isProcessing" @click="retryFailedSend">未能确认是否发送成功，点击重试</button>
 
   <transition name="banner">
     <AppNotice v-if="persistNotice" class="persist-notice" tone="error" dismissible @dismiss="clearNotice">{{ persistNotice }}</AppNotice>
@@ -72,17 +72,17 @@ async function clearInput() {
           <button :class="{ active: kbOnly }" :aria-pressed="kbOnly" :disabled="conversationBusy || loading || !current || !!loadError" @click="switchMode(true)">知识库问答</button>
           <button :class="{ active: !kbOnly }" :aria-pressed="!kbOnly" :disabled="conversationBusy || loading || !current || !!loadError" @click="switchMode(false)">通用问答</button>
         </div>
-        <span class="mode-description">{{ kbOnly ? '仅根据知识库检索结果回答' : '据模型知识与联网搜索果回答' }}</span>
+        <span class="mode-description">{{ kbOnly ? '根据知识库资料回答' : '解答日常问题，必要时联网查找资料' }}</span>
       </div>
       <div class="input-row">
         <textarea
           ref="inputEl"
-          v-model="input" :placeholder="isProcessing ? '可以先写下一个问题…' : kbOnly ? '向知识库提问…' : '询问、探索，或开始一个想法…'" aria-label="输入问题" rows="1"
+          v-model="input" :placeholder="isProcessing ? '可以先写下一个问题…' : kbOnly ? '想了解知识库中的哪些内容？' : '输入问题，或描述您想完成的事…'" aria-label="输入问题" rows="1"
           @keydown="onKeydown"
           @input="resizeInput"
           />
         <button v-if="input.length" type="button" class="btn-clear" @click="clearInput" aria-label="清空输入框" title="清空输入框">清空</button>
-        <button v-if="isProcessing" :disabled="stopping" class="btn-send" @click="stopStreaming" aria-label="停止生成" title="停止生成">
+        <button v-if="isProcessing" :disabled="stopping" class="btn-send" @click="stopStreaming" aria-label="停止回答" title="停止回答">
           <svg width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="3" fill="currentColor"/></svg>
         </button>
         <button v-else class="btn-send" :disabled="!input.trim() || !current?.messagesLoaded || current?.messagesLoading || loading || conversationBusy" @click="sendMessage()" aria-label="发送消息" title="发送消息"><AppIcon name="arrow-up" :size="20" /></button>
