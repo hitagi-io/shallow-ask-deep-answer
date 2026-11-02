@@ -7,6 +7,7 @@ import { formatDuration } from '../utils/duration'
 import BrandMark from './BrandMark.vue'
 import { copyText } from '../utils/clipboard'
 import { useNotice } from '../composables/useNotice'
+import { useStreamingText } from '../composables/useStreamingText'
 
 const props = defineProps<{
   message: Message
@@ -40,9 +41,10 @@ function bubbleText(msg: Message) {
   return ''
 }
 
-// Only reparse when this message changes; timers and other messages reuse the cached HTML.
+const renderedText = useStreamingText(() => bubbleText(props.message), () => props.message.status === 'streaming')
+// 历史消息复用 HTML；流式全文最多每 100ms 解析一次，仍保留 HTML 清洗。
 const html = computed(() => {
-  const clean = DOMPurify.sanitize(marked.parse(bubbleText(props.message), { breaks: true, gfm: true }) as string, { FORBID_TAGS: ['button'], ALLOW_DATA_ATTR: false })
+  const clean = DOMPurify.sanitize(marked.parse(renderedText.value, { breaks: true, gfm: true }) as string, { FORBID_TAGS: ['button'], ALLOW_DATA_ATTR: false })
   return clean.replace(/<pre>/g, '<pre><button type="button" data-copy-code aria-label="复制代码" title="复制代码"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg></button>')
 })
 </script>

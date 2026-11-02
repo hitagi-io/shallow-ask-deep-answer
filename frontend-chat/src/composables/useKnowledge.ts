@@ -19,8 +19,11 @@ export function useKnowledge(isAdmin: Readonly<Ref<boolean>>, active: Readonly<R
   const search = ref('')
   const statusFilter = ref<'all' | 'indexed' | 'pending'>('all')
   const uploadResults = ref<UploadResult[]>([])
+  const uploadProgress = computed(() => uploadResults.value.filter(result =>
+    result.status === 'waiting' || result.status === 'uploading' || result.status === 'indexing'))
+  const uploadCompleted = computed(() => uploadResults.value.length - uploadProgress.value.length)
   const loadError = ref('')
-  const { message: knowledgeMsg, type: knowledgeMsgType, show, clear: clearNotice } = useNotice(0)
+  const { message: knowledgeMsg, type: knowledgeMsgType, show, clear: clearNotice } = useNotice(5000)
   const knowledgeBusy = computed(() => operation.value !== '')
   const knowledgeLoading = computed(() => operation.value === 'loading')
   const knowledgeUploading = computed(() => operation.value === 'uploading')
@@ -34,12 +37,12 @@ export function useKnowledge(isAdmin: Readonly<Ref<boolean>>, active: Readonly<R
   const errorText = (error: unknown) => error instanceof Error ? error.message : '操作失败，请稍后重试'
 
   // All entry points share one synchronous lock, including drag/drop and keyboard input.
-  async function run(kind: Operation, action: () => Promise<void>) {
+  async function run(kind: Operation, action: () => Promise<void>, notify = true) {
     if (disposed || !isAdmin.value || knowledgeBusy.value) return
     operation.value = kind
-    clearNotice()
+    if (notify) clearNotice()
     try { await action() }
-    catch (error) { show(errorText(error), 'error') }
+    catch (error) { if (notify) show(errorText(error), 'error') }
     finally { operation.value = ''; deletingName.value = '' }
   }
   async function refreshFiles() {
@@ -80,7 +83,19 @@ export function useKnowledge(isAdmin: Readonly<Ref<boolean>>, active: Readonly<R
           row.detail = error || (uploaded?.indexed ? (uploaded.overwritten ? '已覆盖并入库' : '已入库') : '入库失败')
         } catch (error) { row.status = 'error'; row.detail = errorText(error) }
       }
-      if (!disposed) await refreshAll(true)
+      if (!disposed) {
+        const failures = uploadResults.value.filter(result => result.status === 'error')
+        const succeeded = uploadResults.value.length - failures.length
+        const summary = failures.length
+          ? `上传完成：成功 ${succeeded} 个，失败 ${failures.length} 个`
+          : `已上传并入库 ${succeeded} 个文件`
+        const details = failures.map(result => `${result.name}：${result.detail}`)
+        uploadResults.value = []
+        // 刷新异常与上传结果合并，避免覆盖具体文件的失败原因。
+        try { await refreshAll(true) }
+        catch (error) { details.push(`刷新状态失败：${errorText(error)}`) }
+        show([summary, ...details].join('\n'), details.length ? 'error' : 'success')
+      }
     })
   }
   function onFileSelect(event: Event) {
@@ -113,7 +128,7 @@ export function useKnowledge(isAdmin: Readonly<Ref<boolean>>, active: Readonly<R
     return run('checking', async () => { await refreshHealth(true); await refreshFiles() })
   }
   async function handleHealthRepair() {
-    if (knowledgeBusy.value || !await confirmAction('立即修复索引？将清理残留向量、重建记录并重新索引缺失文件。')) return
+    if (knowledgeBusy.value || !await confirmAction('立即修复索引？将清理残留向量，并重建分块缺失、损坏或内容陈旧的索引。')) return
     await run('repairing', async () => {
       const report = await repairIndexHealth()
       if (disposed) return
@@ -134,7 +149,7 @@ export function useKnowledge(isAdmin: Readonly<Ref<boolean>>, active: Readonly<R
         if (!disposed && !knowledgeBusy.value && health.value === snapshot) {
           const changed = JSON.stringify(report.issues) !== JSON.stringify(snapshot?.issues) || JSON.stringify(report.stats) !== JSON.stringify(snapshot?.stats)
           health.value = report
-          if (active.value && changed) await run('loading', refreshFiles)
+          if (active.value && changed) await run('loading', refreshFiles, false)
         }
       } catch { /* Manual refresh exposes errors; polling keeps the last known report. */ }
     }
@@ -145,7 +160,7 @@ export function useKnowledge(isAdmin: Readonly<Ref<boolean>>, active: Readonly<R
   onUnmounted(() => { disposed = true; clearTimeout(pollTimer); uploadAbort.abort() })
   function formatHealthTime(iso: string | null) { return iso ? new Date(iso).toLocaleString() : '从未' }
 
-  return { files, filteredFiles, search, statusFilter, uploadResults, loadError, selectFiles, clearNotice,
+  return { files, filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, loadError, selectFiles, clearNotice,
     knowledgeLoading, knowledgeBuilding, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput,
     deletingName, health, healthChecking, healthRepairing, healthIssueCount, knowledgeBusy, loadKnowledgeState, onFileSelect,
     onDrop, handleDeleteFile, handleBuild, handleHealthCheck, handleHealthRepair, formatHealthTime }

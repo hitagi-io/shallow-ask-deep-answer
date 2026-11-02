@@ -1,247 +1,201 @@
-"""索引一致性健康检查与修复。
-
-协调三份数据的一致性：
-- md5.txt          索引记录（文件 MD5 一行一个）
-- knowledge 目录   源文件
-- Milvus           向量数据（chunk 的 source 元数据 = 文件绝对路径）
-
-覆盖三类故障：
-1. md5.txt 损坏（knowledge、Milvus 正常）→ 以 Milvus 为准重建索引记录
-2. knowledge 文件丢失（md5.txt、Milvus 正常）→ 清理残留向量 + 剔除孤立记录
-3. Milvus 向量丢失（md5.txt、knowledge 正常）→ 剔除记录并重新入库
-
-判定基准是**内容**（md5）而非路径：同内容文件按内容去重、只入库一次，
-因此只要该内容的任意一个文件带向量即视为已入库，与前端 /api/files 的判定标准一致。
-"""
+"""校验磁盘 SHA-256、PostgreSQL 清单与 Milvus 中每一块实际内容。"""
 from __future__ import annotations
 
 import os
 import threading
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timezone
 
+from rag.index_manifest import chunks_match
 from rag.vector_store import get_vector_store
-from utils.knowledge_files import list_supported_files, compute_file_md5, md5_lock, read_indexed_md5s
+from utils.knowledge_files import list_supported_files, compute_file_sha256
 from utils.config_loader import vector_db_config
 from utils.logging_config import get_logger
-
-logger = get_logger(__name__)
 from utils.project_paths import resolve_project_path
 
-_ITER_BATCH_SIZE = 1000
-
-
-def _md5_txt_path() -> str:
-    return resolve_project_path("md5.txt")
-
-
-def _write_md5_set(hashes: set) -> None:
-    with md5_lock:
-        path = _md5_txt_path()
-        tmp_path = path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for h in sorted(hashes):
-                f.write(f"{h}\n")
-        os.replace(tmp_path, path)
-
-
-def _milvus_source_counts(vector_store) -> dict:
-    """返回 Milvus 中 {source绝对路径: chunk数}，连接失败或查询失败时抛出异常。
-
-    用 MilvusClient.query_iterator 游标翻页；不用 query() + 递增 offset，
-    因为 query() 有 offset + limit ≤ 16384 的硬上限，数据量涨上去会直接报错
-    （invalid max query result window），导致整个健康检查和自动修复抛异常。
-    """
-    vs = vector_store.vector_store
-    client = vs.client
-    counts: dict = {}
-    iterator = client.query_iterator(
-        collection_name=vs.collection_name,
-        batch_size=_ITER_BATCH_SIZE,
-        filter='source != ""',
-        output_fields=["source"],
-    )
-    try:
-        while True:
-            rows = iterator.next()
-            if not rows:
-                break
-            for row in rows:
-                counts[row["source"]] = counts.get(row["source"], 0) + 1
-    finally:
-        iterator.close()
-    return counts
+logger = get_logger(__name__)
 
 
 class IndexHealth:
-    """索引健康检查与修复（线程安全，check/repair 串行执行）。"""
-
     def __init__(self):
         self.vector_store = get_vector_store()
         self.knowledge_dir = resolve_project_path(vector_db_config["knowledge_dir"])
         self.allowed_types = tuple(vector_db_config["allowed_types"])
         self._lock = threading.RLock()
 
-    def _disk_files(self) -> list:
-        os.makedirs(self.knowledge_dir, exist_ok=True)
-        return list(list_supported_files(self.knowledge_dir, self.allowed_types))
-
-    def _base_report(self) -> dict:
-        return {
-            "checked_at": None,
-            "healthy": True,
-            "milvus_error": None,
-            "stats": {"files": 0, "indexed_files": 0, "chunks": 0},
-            "issues": [],
+    def _scan(self):
+        report = {
+            "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "healthy": True, "milvus_error": None, "manifest_error": None,
+            "stats": {"files": 0, "indexed_files": 0, "chunks": 0}, "issues": [],
         }
+        issues = {}
+
+        def issue(kind, title, detail, item):
+            report["healthy"] = False
+            entry = issues.setdefault(kind, {
+                "type": kind, "severity": "error", "title": title, "detail": detail,
+                "count": 0, "items": [],
+            })
+            if item not in entry["items"]:
+                entry["items"].append(item)
+                entry["count"] += 1
+
+        disk = {path: compute_file_sha256(path) for path in
+                list_supported_files(self.knowledge_dir, self.allowed_types)}
+        by_norm = {os.path.normcase(path): path for path in disk}
+        by_hash = defaultdict(list)
+        for path, digest in disk.items():
+            if digest:
+                by_hash[digest].append(path)
+            else:
+                issue("file_unreadable", "源文件读取失败", "无法确认文件内容，修复不会删除其索引", path)
+        report["stats"]["files"] = len(disk)
+        state = {"disk": disk, "by_norm": by_norm, "by_hash": by_hash,
+                 "records": {}, "rows": [], "healthy_hashes": set()}
+        try:
+            records = state["records"] = self.vector_store.manifests.all()
+        except Exception:
+            logger.exception("[索引健康检查] PostgreSQL 清单读取失败")
+            report["manifest_error"] = "无法读取 PostgreSQL 索引清单，详情见服务端日志"
+            issue("manifest_unreachable", "索引清单不可用", report["manifest_error"], "PostgreSQL")
+            report["issues"] = list(issues.values())
+            return report, state
+        try:
+            rows = state["rows"] = self.vector_store.chunk_rows()
+        except Exception:
+            logger.exception("[索引健康检查] Milvus 查询失败")
+            report["milvus_error"] = "无法读取 Milvus，详情见服务端日志"
+            issue("milvus_unreachable", "向量库不可用", report["milvus_error"], "Milvus")
+            report["issues"] = list(issues.values())
+            return report, state
+        report["stats"]["chunks"] = len(rows)
+        rows_by_hash = defaultdict(list)
+        for row in rows:
+            rows_by_hash[row.get("content_sha256")].append(row)
+            source = row.get("source")
+            if not isinstance(source, str) or os.path.normcase(source) not in by_norm:
+                issue("ghost_vectors", "向量库存在残留分块", "对应源文件不存在或来源元数据缺失", source or str(row.get("pk")))
+            if row.get("content_sha256") not in records:
+                issue("missing_manifest", "分块缺少索引清单", "现有分块不能证明完整性，需从源文件重新索引", source or str(row.get("pk")))
+
+        for digest, record in records.items():
+            path = by_norm.get(os.path.normcase(record.source))
+            source_current = path is not None and disk[path] == digest
+            if not by_hash.get(digest) and (path is None or disk[path] is not None):
+                issue("orphan_manifest", "索引清单对应内容已不在磁盘", "源文件已删除或被修改，需重建或清理旧索引", record.source)
+            if path is None:
+                issue("missing_source", "索引来源文件已丢失", "存在同内容副本时会转移索引来源", record.source)
+            elif disk[path] is not None and disk[path] != digest:
+                issue("stale_content", "索引内容已陈旧", "源文件 SHA-256 与入库时不一致", path)
+            if record.state != "ready":
+                issue("incomplete_index", "索引构建未完成", "上次写入未完成校验和提交，需要重建", record.source)
+            if record.index_version != self.vector_store.index_version:
+                issue("outdated_index_version", "索引版本已过期", "解析、分块或嵌入配置已改变，需要重建", record.source)
+            actual = rows_by_hash.get(digest, [])
+            matched = chunks_match(record, actual)
+            if not actual:
+                issue("missing_vectors", "索引分块全部缺失", "清单存在，但 Milvus 中没有对应分块", record.source)
+            elif len(actual) != record.expected_chunks:
+                issue("chunk_count_mismatch", "索引分块数量不符", "存在部分缺失、重复或残留分块", f"{record.source}（预期 {record.expected_chunks}，实际 {len(actual)}）")
+            elif not matched:
+                issue("chunk_integrity_mismatch", "索引分块内容或身份不符", "分块序号、逐块 SHA-256、来源、版本或写入代次与清单不一致", record.source)
+            if source_current and record.state == "ready" and record.index_version == self.vector_store.index_version and matched:
+                state["healthy_hashes"].add(digest)
+        report["stats"]["indexed_files"] = sum(digest in state["healthy_hashes"] for digest in disk.values())
+        report["issues"] = list(issues.values())
+        return report, state
 
     def check(self) -> dict:
-        """执行只读健康检查并返回报告，不修改任何数据。"""
-        with self._lock:
-            report = self._base_report()
-            report["checked_at"] = datetime.now().isoformat(timespec="seconds")
+        """只读检查；从未入库、也没有残留分块的文件仍视为待构建。"""
+        with self._lock, self.vector_store._store_lock:
+            return self._scan()[0]
 
-            disk_files = [resolve_project_path(f) for f in self._disk_files()]
-            md5_set = read_indexed_md5s()
-            report["stats"]["files"] = len(disk_files)
-
-            try:
-                source_counts = _milvus_source_counts(self.vector_store)
-            except Exception as e:
-                report["healthy"] = False
-                logger.error(f"[索引健康检查] 检查失败，无法连接 Milvus：{e}")
-                report["milvus_error"] = "无法连接 Milvus，详情见服务端日志"
-                report["issues"].append({
-                    "type": "milvus_unreachable", "severity": "error",
-                    "title": "无法连接 Milvus", "detail": "无法连接 Milvus，详情见服务端日志",
-                    "count": 0, "items": [],
-                })
-                return report
-
-            milvus_by_norm = {os.path.normcase(s): s for s in source_counts}
-            report["stats"]["chunks"] = sum(source_counts.values())
-
-            # 路径用于定位向量，MD5 用于判断同内容文件是否已入库。
-            disk_by_norm: dict = {}
-            for f in disk_files:
-                disk_by_norm[os.path.normcase(f)] = (f, compute_file_md5(f))
-
-            files_by_md5: dict = {}
-            for _, (path, md5) in disk_by_norm.items():
-                if md5:
-                    files_by_md5.setdefault(md5, []).append(path)
-            disk_hashes = set(files_by_md5)
-            backed_hashes = {
-                md5 for norm, (_, md5) in disk_by_norm.items()
-                if md5 and norm in milvus_by_norm
-            }
-
-            ghost = [s for s in source_counts if os.path.normcase(s) not in disk_by_norm]
-            if ghost:
-                report["healthy"] = False
-                report["issues"].append({
-                    "type": "ghost_vectors", "severity": "warn",
-                    "title": "向量库存在残留向量",
-                    "detail": "对应磁盘文件已丢失；若该内容在磁盘上仍有同内容副本，修复会改用副本重新入库",
-                    "count": len(ghost), "items": ghost,
-                })
-
-            orphan_hashes = [h for h in md5_set if h not in disk_hashes]
-            if orphan_hashes:
-                report["healthy"] = False
-                report["issues"].append({
-                    "type": "orphan_md5", "severity": "warn",
-                    "title": "索引记录存在孤立条目", "detail": "对应文件已丢失",
-                    "count": len(orphan_hashes), "items": [h[:12] + "..." for h in orphan_hashes],
-                })
-
-            missing_record = [
-                p for h in (backed_hashes - md5_set) for p in files_by_md5[h]
-            ]
-
-            missing_vectors = [
-                p for h in (md5_set - backed_hashes) if h in files_by_md5 for p in files_by_md5[h]
-            ]
-
-            report["stats"]["indexed_files"] = sum(
-                1 for _, (_, md5) in disk_by_norm.items() if md5 and md5 in md5_set
-            )
-
-            if missing_record:
-                report["healthy"] = False
-                report["issues"].append({
-                    "type": "missing_md5_record", "severity": "warn",
-                    "title": "向量已存在但索引记录丢失", "detail": "界面会误标「未入库」，重建将产生重复向量",
-                    "count": len(missing_record), "items": missing_record,
-                })
-            if missing_vectors:
-                report["healthy"] = False
-                report["issues"].append({
-                    "type": "missing_vectors", "severity": "error",
-                    "title": "索引记录存在但向量丢失", "detail": "该内容在向量库中没有向量，检索查不到对应文件",
-                    "count": len(missing_vectors), "items": missing_vectors,
-                })
-            return report
+    def file_statuses(self) -> list[dict]:
+        """文件列表与健康检查共用完整性判定，不把清单存在当成已正确入库。"""
+        with self._lock, self.vector_store._store_lock:
+            report, state = self._scan()
+            if report["milvus_error"] or report["manifest_error"]:
+                raise RuntimeError("无法确认索引状态")
+            return [{"name": os.path.basename(path), "path": path,
+                     "indexed": digest in state["healthy_hashes"]}
+                    for path, digest in state["disk"].items()]
 
     def repair(self) -> dict:
-        """按安全顺序修复三类不一致，返回修复摘要 + 修复后的健康报告。
-
-        修复动作：清理残留向量 → 以 Milvus∩磁盘 重建 md5.txt（记录按内容去重）
-        → 为“记录存在但向量丢失”的内容重新入库一个代表文件。
-        新上传但从未构建的文件不属于异常，不做处理。
-        """
-        with self._lock:
-            disk_files = [resolve_project_path(f) for f in self._disk_files()]
-            disk_by_norm = {os.path.normcase(f): (f, compute_file_md5(f)) for f in disk_files}
-            md5_set_before = read_indexed_md5s()
-
-            try:
-                source_counts = _milvus_source_counts(self.vector_store)
-            except Exception as e:
-                raise RuntimeError(f"无法连接 Milvus，修复终止：{e}")
-
-            summary = {"ghost_deleted": [], "ghost_errors": [], "md5_rebuilt": False, "re_indexed": [], "re_index_failures": []}
-
-            for src in source_counts:
-                if os.path.normcase(src) in disk_by_norm:
+        """按源文件重建异常内容；失败保留清单供重试，绝不据剩余向量补齐清单。"""
+        with self._lock, self.vector_store._store_lock:
+            report, state = self._scan()
+            if report["milvus_error"] or report["manifest_error"]:
+                raise RuntimeError("存储不可用，修复终止")
+            summary = {"ghost_deleted": [], "ghost_errors": [], "manifest_rebuilt": False,
+                       "re_indexed": [], "re_index_failures": []}
+            targets = {}
+            for digest, record in state["records"].items():
+                if digest in state["healthy_hashes"]:
                     continue
-                try:
-                    self.vector_store.delete_vectors_by_source(src)
-                    summary["ghost_deleted"].append(src)
-                except Exception as e:
-                    logger.error(f"[索引健康检查] 清理残留向量失败 source={src}：{e}")
-                    summary["ghost_errors"].append(f"{src}: 删除失败，详情见服务端日志")
-
-            try:
-                source_counts = _milvus_source_counts(self.vector_store)
-            except Exception as e:
-                raise RuntimeError(f"清理后复查 Milvus 失败，修复终止：{e}")
-            milvus_by_norm = {os.path.normcase(s) for s in source_counts}
-            keep_hashes = {
-                md5 for norm, (_, md5) in disk_by_norm.items()
-                if md5 and norm in milvus_by_norm
-            }
-            _write_md5_set(keep_hashes)
-            summary["md5_rebuilt"] = True
-
-            to_reindex: list = []
-            seen_hashes: set = set()
-            for norm, (path, md5) in disk_by_norm.items():
-                if md5 and md5 in md5_set_before and md5 not in keep_hashes and md5 not in seen_hashes:
-                    to_reindex.append(path)
-                    seen_hashes.add(md5)
-            if to_reindex:
-                failures = self.vector_store.index_pending_files(to_reindex)
-                failed_files = {item["file"] for item in failures}
-                summary["re_indexed"] = [p for p in to_reindex if p not in failed_files]
+                copies = state["by_hash"].get(digest)
+                if copies:
+                    targets[digest] = copies[0]
+                source = state["by_norm"].get(os.path.normcase(record.source))
+                if source and state["disk"][source]:
+                    targets[state["disk"][source]] = source
+            # 清单遗失时重新解析源文件，不信任现存块数和元数据。
+            for row in state["rows"]:
+                source = row.get("source")
+                path = state["by_norm"].get(os.path.normcase(source)) if isinstance(source, str) else None
+                if row.get("content_sha256") not in state["records"]:
+                    if path and state["disk"][path]:
+                        targets[state["disk"][path]] = path
+                    copies = state["by_hash"].get(row.get("content_sha256"))
+                    if copies:
+                        targets[row["content_sha256"]] = copies[0]
+            if targets:
+                failures = self.vector_store.index_pending_files(list(targets.values()))
+                failed = {item["file"] for item in failures}
+                summary["re_indexed"] = [path for path in targets.values() if path not in failed]
                 summary["re_index_failures"] = failures
-                failed_hashes = {
-                    disk_by_norm[os.path.normcase(p)][1] for p in failed_files
-                    if os.path.normcase(p) in disk_by_norm
-                }
-                failed_hashes.discard(None)
-                if failed_hashes:
-                    _write_md5_set(read_indexed_md5s() | failed_hashes)
+                summary["manifest_rebuilt"] = bool(summary["re_indexed"])
 
+            # 重建完成后重新取快照；仅清理确认已无磁盘内容的清单。
+            after_report, after = self._scan()
+            if after_report["milvus_error"] or after_report["manifest_error"]:
+                after_report["repair"] = summary
+                return after_report
+            unreadable = any(digest is None for digest in after["disk"].values())
+            for digest, record in after["records"].items():
+                if after["by_hash"].get(digest) or unreadable:
+                    continue
+                path = after["by_norm"].get(os.path.normcase(record.source))
+                if path and after["disk"][path] not in after["healthy_hashes"]:
+                    continue  # 文件不可读或新版本仍未成功，保留旧清单以便再次修复。
+                try:
+                    deleted = self.vector_store._delete_pks([row["pk"] for row in after["rows"]
+                                                            if row.get("content_sha256") == digest])
+                    self.vector_store.manifests.delete(digest)
+                    summary["manifest_rebuilt"] = True
+                    if deleted and record.source not in summary["ghost_deleted"]:
+                        summary["ghost_deleted"].append(record.source)
+                except Exception:
+                    logger.exception("[索引健康检查] 清理过期清单失败 source=%s", record.source)
+                    summary["ghost_errors"].append(f"{record.source}: 清理失败，详情见服务端日志")
+            records = self.vector_store.manifests.all()
+            # 无清单的残留块仅在源文件已丢失或替代索引已验证后删除。
+            leftovers = defaultdict(list)
+            for row in self.vector_store.chunk_rows():
+                if row.get("content_sha256") in records:
+                    continue
+                source = row.get("source")
+                path = after["by_norm"].get(os.path.normcase(source)) if isinstance(source, str) else None
+                if unreadable or (path and after["disk"][path] not in after["healthy_hashes"]):
+                    continue
+                leftovers[source or "(来源缺失)"].append(row["pk"])
+            for source, pks in leftovers.items():
+                try:
+                    self.vector_store._delete_pks(pks)
+                    summary["ghost_deleted"].append(source)
+                except Exception:
+                    logger.exception("[索引健康检查] 清理残留块失败 source=%s", source)
+                    summary["ghost_errors"].append(f"{source}: 清理失败，详情见服务端日志")
             report = self.check()
             report["repair"] = summary
             return report

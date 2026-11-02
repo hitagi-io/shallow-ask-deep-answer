@@ -18,11 +18,11 @@ from pydantic import BaseModel, Field
 from chat_agent import ChatAgent, PG_CHECKPOINT_POOL_MAX
 from rag.vector_store import get_vector_store
 from rag.index_health import IndexHealth
-from utils.knowledge_files import list_supported_files, compute_file_md5, read_indexed_md5s
 from utils.config_loader import vector_db_config
 from utils.project_paths import resolve_project_path
 from utils.pg_lock import SingleInstanceGuard, exclusive_section, shared_section
 from utils.generation_runner import run_generation
+from utils.health_report_cache import HealthReportCache
 from utils.logging_config import configure_logging, get_logger
 from auth import (
     PASSWORD_MAX_LENGTH,
@@ -140,17 +140,13 @@ allowed_types = vector_db_config["allowed_types"]
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
 
-_health_report: dict | None = None
-_health_report_at: float = 0.0
-
 HEALTH_REPORT_TTL_SECONDS = int(os.getenv("HEALTH_REPORT_TTL_SECONDS", "120"))
+_health_reports = HealthReportCache(HEALTH_REPORT_TTL_SECONDS)
 
 
 def _set_health_report(report: dict) -> None:
     """更新进程内报告缓存并刷新时间戳。"""
-    global _health_report, _health_report_at
-    _health_report = report
-    _health_report_at = time.monotonic()
+    _health_reports.set(report)
 
 
 _PG_LOCK_KEY_HEALTH = 0x64656570
@@ -182,7 +178,7 @@ def _replace_and_index(tmp_path: str, dest: str) -> dict:
 
 def _format_repair_summary(repair: dict) -> str:
     """格式化修复摘要，供定时自动修复和手动修复共用同一套表述。"""
-    record_state = "已重建" if repair.get("md5_rebuilt") else "未变更"
+    record_state = "已更新" if repair.get("manifest_rebuilt") else "未变更"
     return (
         f"清理残留向量 {len(repair.get('ghost_deleted', []))} 个"
         f"（失败 {len(repair.get('ghost_errors', []))} 个），"
@@ -203,8 +199,8 @@ def _auto_heal_report() -> dict:
         for _ in range(max_rounds):
             if report.get("healthy"):
                 break
-            if report.get("milvus_error"):
-                logger.warning("[索引自动修复] 无法连接 Milvus，本轮暂不执行修复")
+            if report.get("milvus_error") or report.get("manifest_error"):
+                logger.warning("[索引自动修复] 存储不可用，本轮暂不执行修复")
                 break
             try:
                 report = index_health.repair()
@@ -650,15 +646,14 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
 
 @app.get("/api/files")
 def list_files(user: dict = Depends(require_admin)):
-    os.makedirs(knowledge_dir, exist_ok=True)
-    files = list_supported_files(knowledge_dir, tuple(allowed_types))
-    indexed_set = read_indexed_md5s()
-    items = []
-    for f in files:
-        md5_hex = compute_file_md5(f)
-        indexed = bool(md5_hex) and md5_hex in indexed_set
-        items.append({"name": os.path.basename(f), "path": f, "indexed": indexed})
-    return {"files": items}
+    try:
+        with shared_section(PG_CONN, _PG_LOCK_KEY_INDEX_WRITE, INDEX_READ_LOCK_TIMEOUT_SECONDS):
+            return {"files": index_health.file_statuses()}
+    except TimeoutError:
+        raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
+    except Exception:
+        logger.exception("[知识库] 无法读取文件索引状态")
+        raise HTTPException(status_code=503, detail="无法确认索引状态，请稍后重试")
 
 
 async def _write_upload_to(f: UploadFile, tmp_path: str) -> int:
@@ -722,9 +717,8 @@ def delete_file(filename: str, user: dict = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="文件不存在")
     try:
         with _index_write_section():
-            md5_hex = compute_file_md5(file_path)
             os.remove(file_path)
-            vector_store.delete_file_index(file_path, md5_hex)
+            vector_store.delete_file_index(file_path)
         return {"message": f"已删除: {safe_name}"}
     except TimeoutError as e:
         logger.error(f"[知识库] 删除失败 file={safe_name}：等待索引写锁超时（{e}）")
@@ -740,7 +734,7 @@ def delete_file(filename: str, user: dict = Depends(require_admin)):
 # 保留路由名，以维持原有反向路由名称和 OpenAPI operationId。
 @app.post("/api/vector/build", name="build_vector")
 def build_knowledge_index(user: dict = Depends(require_admin)):
-    """为缺少 MD5 索引记录的知识库内容补建索引。"""
+    """为尚未入库、分块损坏或版本过期的知识库内容构建索引。"""
     try:
         with _index_write_section():
             failures = vector_store.index_pending_files()
@@ -763,22 +757,23 @@ def build_knowledge_index(user: dict = Depends(require_admin)):
 @app.get("/api/index/health")
 def get_index_health(refresh: bool = False, user: dict = Depends(require_admin)):
     """返回最近一次健康检查报告；refresh=1 时立即执行一次检查。"""
-    if refresh or _health_report is None or time.monotonic() - _health_report_at > HEALTH_REPORT_TTL_SECONDS:
-        try:
-            with shared_section(PG_CONN, _PG_LOCK_KEY_INDEX_WRITE, INDEX_READ_LOCK_TIMEOUT_SECONDS):
-                _set_health_report(index_health.check())
-        except TimeoutError as e:
-            logger.error(f"[索引健康检查] 检查失败：等待索引写锁超时（{e}）")
-            raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
-        except Exception as e:
-            logger.error(f"[索引健康检查] 检查失败：{e}")
-            raise HTTPException(status_code=500, detail="健康检查失败，请稍后重试")
-    return _health_report
+    def check():
+        with shared_section(PG_CONN, _PG_LOCK_KEY_INDEX_WRITE, INDEX_READ_LOCK_TIMEOUT_SECONDS):
+            return index_health.check()
+
+    try:
+        return _health_reports.get(check, refresh=refresh)
+    except TimeoutError as e:
+        logger.error(f"[索引健康检查] 检查失败：等待索引写锁超时（{e}）")
+        raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
+    except Exception as e:
+        logger.error(f"[索引健康检查] 检查失败：{e}")
+        raise HTTPException(status_code=500, detail="健康检查失败，请稍后重试")
 
 
 @app.post("/api/index/health/repair")
 def repair_index_health(user: dict = Depends(require_admin)):
-    """手动触发一致性修复：清理残留向量、重建索引记录、重索引向量丢失的文件。"""
+    """清理残留索引，并从源文件重建缺失、损坏或陈旧的分块与清单。"""
     try:
         with _index_write_section():
             report = index_health.repair()
@@ -790,7 +785,7 @@ def repair_index_health(user: dict = Depends(require_admin)):
         logger.error(f"[索引健康检查] 修复失败：{e}")
         raise HTTPException(status_code=500, detail="修复失败，请稍后重试")
     logger.info(f"[索引健康检查] 修复完成：{_format_repair_summary(report.get('repair') or {})}")
-    return _health_report
+    return report
 
 
 if __name__ == "__main__":

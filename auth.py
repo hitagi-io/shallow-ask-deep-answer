@@ -357,12 +357,13 @@ def register(username: str, password: str, ip: str | None = None) -> dict:
     if ip and not consume_rate_limit("register", ip, REGISTER_RATE_LIMIT, REGISTER_RATE_WINDOW_SECONDS):
         return {"ok": False, "error": "注册过于频繁，请稍后再试", "rate_limited": True}
 
+    password_hash = _hash_password(password)
     with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO users (username, password, role) VALUES (%s, %s, %s) "
                 "ON CONFLICT (username) DO NOTHING",
-                (username, _hash_password(password), "user"),
+                (username, password_hash, "user"),
             )
             created = cur.rowcount > 0
         conn.commit()
@@ -420,35 +421,33 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
                 (username,),
             )
             row = cur.fetchone()
-        # 密码校验耗时较长，先提交并释放咨询锁，避免同一账号或 IP 的正常请求排队等待。
+        # 提交释放咨询锁，并退出上下文归还连接，再执行耗时的密码校验。
         conn.commit()
 
-        if not row:
-            return {"ok": False, "error": "用户名或密码错误"}
+    if not row:
+        return {"ok": False, "error": "用户名或密码错误"}
 
-        if not _verify_password(password, row["password"]):
-            if acct_ip_key:
-                # 失败计数在独立事务内原子「检查并记录」，并发失败也不会超过上限。
-                with conn.cursor(row_factory=dict_row) as cur:
-                    allowed = _rate_consume(
-                        cur, "login_fail_ip", acct_ip_key,
-                        LOGIN_ACCOUNT_IP_MAX_ATTEMPTS, LOGIN_ACCOUNT_IP_WINDOW_SECONDS, now,
-                    )
-                conn.commit()
-                if not allowed:
-                    return {"ok": False, "error": "尝试过于频繁，请稍后再试", "rate_limited": True}
-            return {"ok": False, "error": "用户名或密码错误"}
+    if not _verify_password(password, row["password"]):
+        if acct_ip_key:
+            # 按需借用连接，在独立事务内原子检查并记录失败次数。
+            allowed = consume_rate_limit(
+                "login_fail_ip", acct_ip_key,
+                LOGIN_ACCOUNT_IP_MAX_ATTEMPTS, LOGIN_ACCOUNT_IP_WINDOW_SECONDS,
+            )
+            if not allowed:
+                return {"ok": False, "error": "尝试过于频繁，请稍后再试", "rate_limited": True}
+        return {"ok": False, "error": "用户名或密码错误"}
 
-        token = _create_token(row["id"], row["username"], row["role"])
-        return {
-            "ok": True,
-            "token": token,
-            "user": {
-                "id": row["id"],
-                "username": row["username"],
-                "role": row["role"],
-            },
-        }
+    token = _create_token(row["id"], row["username"], row["role"])
+    return {
+        "ok": True,
+        "token": token,
+        "user": {
+            "id": row["id"],
+            "username": row["username"],
+            "role": row["role"],
+        },
+    }
 
 
 

@@ -1,5 +1,9 @@
-collection_name: milvus
+# 当前清单格式使用独立集合（显式主键 + 动态分块元数据）。
+collection_name: knowledge_chunks_v1
 embedding_model: qwen3.7-text-embedding-flash
+# 索引管线修订号：解析规则或服务端模型行为变化时递增，触发完整重建。
+# 分块参数、嵌入模型与解析依赖版本也会自动计入索引版本指纹。
+index_version: 1
 
 # Milvus 配置（通过 Docker 部署 Milvus 服务）
 milvus_uri: "http://localhost:19530"
@@ -21,7 +25,7 @@ k: 3
 knowledge_dir: knowledge
 allowed_types: [".txt",".pdf",".docx"]
 
-# 索引健康自检间隔（小时）：后台定时检查 md5.txt / knowledge 目录 / Milvus 三者一致性
+# 索引健康自检间隔（小时）：检查 PostgreSQL 清单 / knowledge / Milvus 每一块内容
 health_check_interval_hours: 6
 # 索引自愈：自检发现问题时自动执行修复并复查，直至通过
 # 单轮自愈最多执行修复的次数（防止异常情况下自愈循环不终止）

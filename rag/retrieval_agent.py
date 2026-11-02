@@ -100,8 +100,9 @@ retrieval_subagent = CompiledSubAgent(
         "知识库检索入口。主助手澄清并拆解问题后，每个 task 传入一个自包含检索目标、"
         "必要的实体、时间范围及回答粒度；可按独立目标委派多个本类子代理。"
         "每个子代理最多检索 3 次，只处理分配的目标，依据片段总结并保留缺证和冲突。返回由代码封装的 "
-        "kb_retrieval_report，主助手按顶层 status 处理，只用 answer 作事实正文，"
-        "只引用 sources 内的文件；无需要求子代理手写报告 JSON。"
+        "kb_retrieval_report，主助手按顶层 status 处理，只用 answer 作事实正文。"
+        "sources 是召回文件集合，按 answer 与 cited_sources 选择其中实际支撑正文的文件；"
+        "无需要求子代理手写报告 JSON。"
     ),
     runnable=structured_retrieval_agent,
 )

@@ -379,12 +379,13 @@ export interface HealthReport {
   checked_at: string | null
   healthy: boolean
   milvus_error?: string | null
+  manifest_error?: string | null
   stats: { files: number; indexed_files: number; chunks: number }
   issues: HealthIssue[]
   repair?: {
     ghost_deleted: string[]
     ghost_errors: string[]
-    md5_rebuilt: boolean
+    manifest_rebuilt: boolean
     re_indexed: string[]
     re_index_failures: { file: string; error: string }[]
   }
