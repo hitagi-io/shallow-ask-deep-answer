@@ -2,6 +2,7 @@
 import { ref, watch } from 'vue'
 import { apiLogin, apiRegister, type UserInfo } from '../api'
 import BrandMark from './BrandMark.vue'
+import AppNotice from './AppNotice.vue'
 const props = defineProps<{ error: string }>()
 const emit = defineEmits<{ authenticated: [user: UserInfo] }>()
 const authMode = ref<'login' | 'register'>('login')
@@ -62,8 +63,8 @@ async function handleSubmit() {
         <button :disabled="authLoading" :class="{ active: authMode === 'register' }" @click="authMode = 'register'; authError = ''; authSuccess = ''">注册</button>
       </div>
 
-      <div v-if="authSuccess" class="auth-success" role="status">{{ authSuccess }}</div>
-      <div v-if="authError" class="auth-error" role="alert">{{ authError }}</div>
+      <AppNotice v-if="authSuccess" class="auth-notice" tone="success">{{ authSuccess }}</AppNotice>
+      <AppNotice v-if="authError" class="auth-notice" tone="error">{{ authError }}</AppNotice>
 
       <form @submit.prevent="handleSubmit" class="auth-form">
         <input
@@ -88,7 +89,7 @@ async function handleSubmit() {
           autocomplete="new-password"
           :disabled="authLoading"
           />
-        <button type="submit" class="btn-auth" :disabled="authLoading">
+        <button type="submit" class="btn btn-primary btn-auth" :disabled="authLoading">
           {{ authLoading ? '处理中...' : (authMode === 'login' ? '登录' : '注册') }}
         </button>
       </form>
@@ -97,7 +98,6 @@ async function handleSubmit() {
 </template>
 
 <style scoped>
-.auth-page { display: grid; place-items: center; height: 100vh; height: 100dvh; overflow-y: auto; padding: 32px 24px; background: #fafafa; }
 .auth-card { width: 100%; max-width: 390px; padding: 36px; border: 1px solid var(--line); border-radius: 18px; background: white; box-shadow: 0 12px 50px #00000004; }
 .auth-mark { display: block; width: 36px; height: 36px; margin: 0 auto 20px; }
 .auth-title { font-size: 26px; font-weight: 600; text-align: center; margin: 0; letter-spacing: -.6px; }
@@ -105,12 +105,9 @@ async function handleSubmit() {
 .auth-tabs button { flex: 1; padding: 8px; font-size: 13px; color: var(--muted); border-radius: 5px; }
 .auth-tabs button.active { color: var(--text); background: white; box-shadow: 0 1px 3px #0000000c; }
 .auth-form { display: flex; flex-direction: column; gap: 12px; }
-.auth-form input { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; background: white; }
-.btn-auth { margin-top: 6px; background: var(--accent); color: white; border-radius: 8px; padding: 12px; font-size: 14px; }
-.btn-auth:hover:not(:disabled) { background: #444; }
-.auth-error, .auth-success { padding: 10px 12px; font-size: 12px; border-radius: 7px; margin-bottom: 16px; line-height: 1.6; }
-.auth-error { color: var(--danger); background: #fff1ef; }
-.auth-success { color: var(--success); background: #edf8f1; }
+.auth-form input { width: 100%; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-control); font-size: 14px; background: var(--bg); }
+.btn-auth { margin-top: 6px; padding: 12px; }
+.auth-notice { margin-bottom: 16px; }
 @media (max-width: 760px) {
   .auth-card { padding: 28px 24px; }
 }

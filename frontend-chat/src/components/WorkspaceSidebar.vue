@@ -4,6 +4,7 @@ import type { Conversation, UserInfo } from '../api'
 import type { AppMode } from '../types'
 import BrandMark from './BrandMark.vue'
 import AppDialog from './AppDialog.vue'
+import AppIcon from './AppIcon.vue'
 const props = defineProps<{
   user: UserInfo
   sidebarOpen: boolean
@@ -116,7 +117,7 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m7-11-3 3 3 3"/></svg>
       </button>
       <button class="btn-new" :disabled="conversationBusy" @click="emit('newConversation')" title="开启新对话">
-        <span class="plus">＋</span> 开启新对话
+        <AppIcon name="plus" /> 开启新对话
       </button>
     </div>
 
@@ -182,7 +183,7 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
   <AppDialog v-if="renameId" title="重命名对话" compact @close="renameId = ''">
     <form class="rename-form" @submit.prevent="rename">
       <input v-model="title" class="filter-input" aria-label="对话名称" maxlength="255" autofocus />
-      <button :disabled="!title.trim() || conversationBusy" type="submit">{{ conversationBusy ? '保存中…' : '保存' }}</button>
+      <button class="btn btn-primary" :disabled="!title.trim() || conversationBusy" type="submit">{{ conversationBusy ? '保存中…' : '保存' }}</button>
     </form>
   </AppDialog>
 </template>
@@ -192,7 +193,7 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
 .conv-list .date-group, .conv-list .no-results { padding: 10px 12px; font-size: 11px; color: var(--muted); background: transparent; }
 .rename-form { display: flex; flex-direction: column; gap: 16px; }
 .rename-form input { width: 100%; min-width: 0; }
-.rename-form button { align-self: flex-end; padding: 8px 20px; border-radius: 7px; background: var(--accent); color: white; }
+.rename-form button { align-self: flex-end; }
 .sidebar { width: 256px; flex-shrink: 0; padding: 24px 12px 12px; background: var(--sidebar); display: flex; flex-direction: column; border-right: 1px solid var(--line); }
 .sidebar-header { display: flex; align-items: center; gap: 8px; padding: 0 8px 24px; flex-wrap: wrap; }
 .brand { display: flex; gap: 9px; align-items: center; flex: 1; white-space: nowrap; }
@@ -200,7 +201,6 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
 .btn-search { width: 30px; height: 30px; flex-shrink: 0; display: grid; place-items: center; border-radius: 6px; color: var(--muted); }
 .btn-search:hover, .btn-search.active { background: var(--hover); color: var(--text); }
 .btn-new { display: flex; align-items: center; gap: 9px; width: 100%; margin-top: 20px; padding: 10px 12px; background: var(--bg); border: 1px solid #dedede; border-radius: 9px; text-align: left; font-size: 13px; box-shadow: 0 1px 2px #00000004; }
-.plus { font-size: 19px; line-height: 1; font-weight: 400; }
 .btn-new:hover:not(:disabled) { background: var(--hover); }
 .conv-list { list-style: none; margin: 0; padding: 0; flex: 1; overflow-y: auto; min-height: 0; }
 .conv-list li { display: flex; align-items: center; border-radius: 7px; margin-bottom: 3px; }

@@ -45,7 +45,7 @@ const renderedText = useStreamingText(() => bubbleText(props.message), () => pro
 // 历史消息复用 HTML；流式全文最多每 100ms 解析一次，仍保留 HTML 清洗。
 const html = computed(() => {
   const clean = DOMPurify.sanitize(marked.parse(renderedText.value, { breaks: true, gfm: true }) as string, { FORBID_TAGS: ['button'], ALLOW_DATA_ATTR: false })
-  return clean.replace(/<pre>/g, '<pre><button type="button" data-copy-code aria-label="复制代码" title="复制代码"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg></button>')
+  return clean.replace(/<pre>/g, '<pre><button type="button" class="icon-button" data-copy-code aria-label="复制代码" title="复制代码"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg></button>')
 })
 </script>
 
@@ -63,16 +63,16 @@ const html = computed(() => {
       </div>
       <div v-if="message.role === 'assistant' && !(thinking && !message.content)" ref="body" class="bubble markdown-body" @click="copyCode" v-html="html"></div>
       <div v-if="message.role === 'assistant' && !thinking && !streaming" class="message-actions">
-        <button v-if="message.content" aria-label="复制回答" title="复制回答" @click="copy(message.content)">
+        <button v-if="message.content" class="icon-button" aria-label="复制回答" title="复制回答" @click="copy(message.content)">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
         </button>
-        <button v-if="message.content" type="button" class="feedback-button" :class="{ selected: feedback === 'like' }" :aria-pressed="feedback === 'like'" aria-label="点赞" :title="feedback === 'like' ? '取消点赞' : '点赞'" @click="toggleFeedback('like')">
+        <button v-if="message.content" type="button" class="icon-button feedback-button" :class="{ selected: feedback === 'like' }" :aria-pressed="feedback === 'like'" aria-label="点赞" :title="feedback === 'like' ? '取消点赞' : '点赞'" @click="toggleFeedback('like')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 10v11H3V10h4Zm0 0 5-8a3 3 0 0 1 3 3l-1 5h5a2 2 0 0 1 2 2.4l-1.4 7A2 2 0 0 1 17.6 21H7"/></svg>
         </button>
-        <button v-if="message.content" type="button" class="feedback-button" :class="{ selected: feedback === 'dislike' }" :aria-pressed="feedback === 'dislike'" aria-label="点踩" :title="feedback === 'dislike' ? '取消点踩' : '点踩'" @click="toggleFeedback('dislike')">
+        <button v-if="message.content" type="button" class="icon-button feedback-button" :class="{ selected: feedback === 'dislike' }" :aria-pressed="feedback === 'dislike'" aria-label="点踩" :title="feedback === 'dislike' ? '取消点踩' : '点踩'" @click="toggleFeedback('dislike')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path transform="rotate(180 12 12)" d="M7 10v11H3V10h4Zm0 0 5-8a3 3 0 0 1 3 3l-1 5h5a2 2 0 0 1 2 2.4l-1.4 7A2 2 0 0 1 17.6 21H7"/></svg>
         </button>
-        <button v-if="message.status === 'error' || message.status === 'cancelled'" :disabled="busy" aria-label="重新提问" title="重新提问" @click="emit('retry')">
+        <button v-if="message.status === 'error' || message.status === 'cancelled'" class="icon-button" :disabled="busy" aria-label="重新提问" title="重新提问" @click="emit('retry')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 19.6 9M4.4 15a8 8 0 0 0 13.5 2.9"/></svg>
         </button>
         <span role="status" aria-live="polite">{{ copyNotice }}</span>
@@ -89,18 +89,16 @@ const html = computed(() => {
 
 <style scoped>
 .message-actions { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); margin-top: 12px; }
-.message-actions button { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 6px; }
 .message-actions [role="status"] { margin-left: 8px; }
-.message-actions button:hover:not(:disabled), .markdown-body :deep(pre button:hover) { background: var(--hover); color: var(--text); }
 .feedback-button { transition: background-color .15s, color .15s, transform .15s; }
-.message-actions .feedback-button:hover:not(:disabled), .message-actions .feedback-button.selected { background: transparent; color: var(--text); }
+.feedback-button.selected { color: var(--text); }
 .feedback-button.selected svg { fill: currentColor; }
 .feedback-button:active { transform: scale(.9); }
 @media (prefers-reduced-motion: reduce) {
   .feedback-button { transition: none; }
   .feedback-button:active { transform: none; }
 }
-.markdown-body :deep(pre button) { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 6px; margin: 0 0 10px auto; color: var(--muted); }
+.markdown-body :deep(pre button) { margin: 0 0 10px auto; }
 .message { display: flex; gap: 12px; max-width: 768px; margin: 0 auto 36px; }
 .avatar { width: 28px; height: 28px; display: grid; place-items: center; flex-shrink: 0; margin-top: 4px; }
 .avatar .brand-mark { width: 22px; height: 22px; }

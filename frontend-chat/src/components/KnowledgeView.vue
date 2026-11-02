@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import type { useKnowledge } from '../composables/useKnowledge'
+import AppIcon from './AppIcon.vue'
+import AppNotice from './AppNotice.vue'
 const props = defineProps<{ knowledge: ReturnType<typeof useKnowledge> }>()
 const emit = defineEmits<{ back: [] }>()
 const { files, knowledgeLoading, knowledgeBuilding, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput, deletingName, health, healthChecking, healthRepairing, knowledgeBusy, loadKnowledgeState, onFileSelect, onDrop, handleDeleteFile, handleBuild, handleHealthCheck, handleHealthRepair, formatHealthTime } = props.knowledge
@@ -9,8 +11,8 @@ const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, lo
 <template>
   <div class="knowledge-page">
     <header class="knowledge-header">
-      <button class="btn-back" @click="emit('back')" title="返回对话">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+      <button class="icon-button btn-back" @click="emit('back')" aria-label="返回对话" title="返回对话">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
       </button>
       <div>
         <h1>知识库管理</h1>
@@ -18,11 +20,7 @@ const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, lo
       </div>
     </header>
 
-    <div v-if="knowledgeMsg" class="notice" :class="knowledgeMsgType" :role="knowledgeMsgType === 'error' ? 'alert' : 'status'">
-      <span class="notice-icon" aria-hidden="true">{{ knowledgeMsgType === 'error' ? '!' : '✓' }}</span>
-      <p class="notice-message">{{ knowledgeMsg }}</p>
-      <button class="notice-close" aria-label="关闭通知" title="关闭通知" @click="clearNotice">×</button>
-    </div>
+    <AppNotice v-if="knowledgeMsg" class="knowledge-notice" :tone="knowledgeMsgType === 'error' ? 'error' : 'success'" dismissible @dismiss="clearNotice">{{ knowledgeMsg }}</AppNotice>
 
     <div class="knowledge-cols">
       <div class="knowledge-left">
@@ -37,6 +35,7 @@ const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, lo
             @click="selectFiles"
             >
             <input ref="fileInput" type="file" accept=".txt,.pdf,.docx" :disabled="knowledgeBusy" multiple hidden @change="onFileSelect" />
+            <AppIcon name="upload" :size="28" />
             <p v-if="knowledgeUploading">{{ uploadProgress.length ? '上传并入库中...' : '正在刷新状态...' }}</p>
             <p v-else-if="knowledgeBusy">其他操作进行中，请稍候...</p>
             <p v-else>点击或拖拽文件到此处</p>
@@ -51,12 +50,12 @@ const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, lo
           <div class="card-header">
             <h2>索引健康</h2>
             <div class="health-actions">
-              <button class="btn-ghost" :disabled="knowledgeBusy" @click="handleHealthCheck">
+              <button class="btn btn-secondary btn-small" :disabled="knowledgeBusy" @click="handleHealthCheck">
                 <span v-if="healthChecking" class="btn-spinner" aria-hidden="true"></span>
                 {{ healthChecking ? '检查中...' : '立即检查' }}
               </button>
               <button
-                class="btn-ghost" :disabled="knowledgeBusy" @click="handleHealthRepair"
+                class="btn btn-secondary btn-small" :disabled="knowledgeBusy" @click="handleHealthRepair"
                 title="系统定时自检发现问题会自动修复；此处可立即手动执行一次"
                 >
                 <span v-if="healthRepairing" class="btn-spinner" aria-hidden="true"></span>
@@ -90,12 +89,12 @@ const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, lo
           <div class="card-header">
             <h2>文档列表</h2>
             <div class="file-header-actions">
-              <button class="btn-ghost" :disabled="knowledgeBusy" @click="loadKnowledgeState">
+              <button class="btn btn-secondary btn-small" :disabled="knowledgeBusy" @click="loadKnowledgeState">
                 <span v-if="knowledgeLoading" class="btn-spinner" aria-hidden="true"></span>
                 {{ knowledgeLoading ? '刷新中...' : '刷新' }}
               </button>
               <button
-                class="btn-ghost" :disabled="knowledgeBusy" @click="handleBuild"
+                class="btn btn-secondary btn-small" :disabled="knowledgeBusy" @click="handleBuild"
                 title="重新扫描知识库目录，补建未入库文件"
                 >
                 <span v-if="knowledgeBuilding" class="btn-spinner" aria-hidden="true"></span>
@@ -105,7 +104,7 @@ const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, lo
           </div>
           <div class="file-filters"><input v-model="search" class="filter-input" placeholder="搜索文档名称" aria-label="搜索文档名称" type="search" /><select v-model="statusFilter" class="filter-input" aria-label="入库状态"><option value="all">全部状态</option><option value="indexed">已入库</option><option value="pending">未入库</option></select></div>
           <p class="hint">{{ filteredFiles.length }} / {{ files.length }} 个文档</p>
-          <div v-if="loadError" class="empty">文档列表暂不可用 <button class="btn-ghost" :disabled="knowledgeBusy" @click="loadKnowledgeState">重新加载</button></div>
+          <div v-if="loadError" class="empty">文档列表暂不可用 <button class="btn btn-secondary btn-small" :disabled="knowledgeBusy" @click="loadKnowledgeState">重新加载</button></div>
           <div v-else-if="knowledgeLoading && files.length === 0" class="empty" role="status">加载中...</div>
           <div v-else-if="filteredFiles.length === 0" class="empty">{{ files.length ? '没有匹配的文档' : '暂无文档' }}</div>
           <ul v-else class="file-list">
@@ -113,7 +112,7 @@ const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, lo
               <span class="file-name">{{ f.name }}</span>
               <span class="file-actions">
                 <span class="file-status" :class="f.indexed ? 'indexed' : 'pending'">{{ f.indexed ? '已入库' : '未入库' }}</span>
-                <button class="btn-danger" :disabled="knowledgeBusy" @click="handleDeleteFile(f.name)">
+                <button class="btn btn-danger btn-small" :disabled="knowledgeBusy" @click="handleDeleteFile(f.name)">
                   {{ deletingName === f.name ? '删除中...' : '删除' }}
                 </button>
               </span>
@@ -138,8 +137,7 @@ const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, lo
 .knowledge-header { display: flex; gap: 16px; align-items: center; margin-bottom: 32px; }
 .knowledge-header h1 { font-size: 26px; font-weight: 600; letter-spacing: -.7px; margin: 0; }
 .subtitle { font-size: 13px; color: var(--muted); margin: 9px 0 0; }
-.btn-back { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 8px; }
-.btn-back:hover { background: var(--surface); }
+.btn-back { width: 34px; height: 34px; border: 1px solid var(--line); border-radius: var(--radius-control); }
 .knowledge-cols { display: grid; grid-template-columns: minmax(260px, .8fr) minmax(320px, 1.2fr); gap: 24px; }
 .knowledge-left, .knowledge-right { min-width: 0; }
 .card { border: 1px solid var(--line); border-radius: 12px; padding: 22px; margin-bottom: 20px; background: white; }
@@ -147,15 +145,10 @@ const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, lo
 .card-header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 18px; }
 .hint { font-size: 12px; line-height: 1.7; color: var(--muted); margin: 12px 0 16px; }
 .dropzone { border: 1px dashed #cdcdcd; border-radius: 9px; background: #fafafa; min-height: 150px; padding: 28px 16px; display: grid; place-items: center; text-align: center; font-size: 13px; color: #666; cursor: pointer; }
-.dropzone::before { content: '↑'; font-size: 28px; color: #555; }
 .dropzone p { margin: 10px 0 0; }
 .dropzone.over, .dropzone:hover { border-color: #777; background: #f1f1f1; }
 .dropzone.busy { opacity: .5; cursor: wait; }
 .health-actions, .file-header-actions, .file-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.btn-ghost, .btn-danger { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; font-size: 11px; white-space: nowrap; }
-.btn-ghost:hover:not(:disabled) { background: var(--surface); border-color: #ccc; }
-.btn-danger { color: var(--danger); border-color: transparent; }
-.btn-danger:hover:not(:disabled) { background: #fff1ef; }
 .btn-spinner { width: 11px; height: 11px; border: 1px solid #ccc; border-top-color: #555; border-radius: 50%; animation: spin .8s linear infinite; }
 .file-list { list-style: none; padding: 0; margin: 0; }
 .file-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--line); }
@@ -163,7 +156,7 @@ const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, lo
 .file-name { font-size: 13px; overflow-wrap: anywhere; }
 .file-actions { flex-shrink: 0; }
 .file-status { font-size: 10px; padding: 4px 7px; border-radius: 5px; }
-.file-status.indexed { color: var(--success); background: #edf8f1; }
+.file-status.indexed { color: var(--success); background: var(--success-bg); }
 .file-status.pending { color: #986918; background: #fff7e5; }
 .card > .empty { min-height: 180px; font-size: 13px; color: var(--muted); }
 .health-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
@@ -174,15 +167,9 @@ const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, lo
 .health-issues { list-style: none; margin: 0; padding: 0; }
 .health-issues li { display: flex; align-items: baseline; gap: 8px; border-top: 1px solid var(--line); padding: 12px 0; font-size: 12px; }
 .issue-sev { font-size: 10px; padding: 2px 5px; background: #fff7e5; color: #986918; flex-shrink: 0; border-radius: 4px; }
-.issue-sev.error { background: #fff1ef; color: var(--danger); }
+.issue-sev.error { background: var(--danger-bg); color: var(--danger); }
 .issue-detail { display: block; font-style: normal; color: var(--muted); line-height: 1.7; margin-top: 5px; overflow-wrap: anywhere; }
-.notice { display: flex; align-items: flex-start; gap: 12px; padding: 14px 16px; margin-bottom: 20px; border: 1px solid currentColor; border-radius: 8px; background: #edf8f1; color: var(--success); font-size: 13px; line-height: 1.6; }
-.notice.error { background: #fff1ef; color: var(--danger); }
-.notice-icon { display: grid; place-items: center; flex-shrink: 0; width: 20px; height: 20px; border: 1px solid currentColor; border-radius: 50%; font-size: 12px; font-weight: 600; }
-.notice-message { flex: 1; min-width: 0; max-height: 18rem; overflow-y: auto; margin: 0; white-space: pre-line; overflow-wrap: anywhere; }
-.notice-close { display: grid; place-items: center; flex-shrink: 0; width: 24px; height: 24px; border-radius: 4px; color: inherit; font-size: 20px; }
-.notice-close:hover { background: rgb(0 0 0 / 5%); }
-.notice-close:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.knowledge-notice { margin-bottom: 20px; }
 @media (max-width: 1100px) {
   .knowledge-cols { grid-template-columns: 1fr; }
   .knowledge-left { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }

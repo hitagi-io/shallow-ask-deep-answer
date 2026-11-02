@@ -25,7 +25,7 @@ onUnmounted(() => setUnauthorizedHandler(null))
 </script>
 
 <template>
-<div v-if="checkingAuth" class="auth-page" role="status">正在验证登录状态...</div>
+<div v-if="checkingAuth" class="auth-page auth-loading" role="status">正在验证登录状态…</div>
 <WorkspaceView v-else-if="user" :key="user.id" :user="user" @logout="endSession()" />
 <AuthView v-else :error="authError" @authenticated="user = $event; authError = ''" />
 </template>

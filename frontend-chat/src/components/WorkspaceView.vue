@@ -78,15 +78,13 @@ async function logout() {
   </div>
   <AppDialog v-if="confirmationMessage" title="确认操作" compact @close="confirmation.settle(false)">
     <p class="confirmation-copy">{{ confirmationMessage }}</p>
-    <div class="confirmation-actions"><button autofocus @click="confirmation.settle(false)">取消</button><button class="confirm-button" @click="confirmation.settle(true)">确认</button></div>
+    <div class="confirmation-actions"><button class="btn btn-secondary" autofocus @click="confirmation.settle(false)">取消</button><button class="btn btn-primary" @click="confirmation.settle(true)">确认</button></div>
   </AppDialog>
 </template>
 
 <style scoped>
 .confirmation-copy { font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; }
 .confirmation-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
-.confirmation-actions button { padding: 8px 20px; border: 1px solid var(--line); border-radius: 7px; }
-.confirmation-actions .confirm-button { background: var(--accent); color: white; }
 .layout { display: flex; height: 100vh; height: 100dvh; }
 .main { position: relative; flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .mobile-menu, .sidebar-backdrop { display: none; }

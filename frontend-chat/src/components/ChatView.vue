@@ -2,6 +2,8 @@
 import { nextTick } from 'vue'
 import BrandMark from './BrandMark.vue'
 import ChatMessage from './ChatMessage.vue'
+import AppIcon from './AppIcon.vue'
+import AppNotice from './AppNotice.vue'
 import type { useChat } from '../composables/useChat'
 
 const props = defineProps<{ chat: ReturnType<typeof useChat> }>()
@@ -39,7 +41,7 @@ async function clearInput() {
         <BrandMark class="empty-seal" />
         <p class="empty-title">有什么想了解的？</p>
         <p class="empty-hint">从一个问题开始，让知识为你所用。</p>
-        <div class="suggestions"><button v-for="(suggestion, i) in suggestions" :key="suggestion.label" @click="useSuggestion(suggestion.prompt)"><span class="suggestion-index">0{{ i + 1 }}</span><span>{{ suggestion.label }}</span><span aria-hidden="true">↗</span></button></div>
+        <div class="suggestions"><button v-for="(suggestion, i) in suggestions" :key="suggestion.label" @click="useSuggestion(suggestion.prompt)"><span class="suggestion-index">0{{ i + 1 }}</span><span>{{ suggestion.label }}</span><AppIcon class="suggestion-arrow" name="arrow-up-right" :size="16" /></button></div>
       </div>
 
       <button v-if="hasEarlier" class="history-button text-action" :disabled="current.messagesLoading" @click="showEarlier">{{ current.messagesLoading ? '正在加载…' : '查看更早的消息' }}</button>
@@ -60,9 +62,7 @@ async function clearInput() {
   <button v-if="canRetrySend" class="latest-button" :disabled="isProcessing" @click="retryFailedSend">重试未确认的发送</button>
 
   <transition name="banner">
-    <div v-if="persistNotice" class="persist-notice" role="alert">
-      {{ persistNotice }} <button aria-label="关闭提示" @click="clearNotice">×</button>
-    </div>
+    <AppNotice v-if="persistNotice" class="persist-notice" tone="error" dismissible @dismiss="clearNotice">{{ persistNotice }}</AppNotice>
   </transition>
 
   <div class="input-bar">
@@ -85,7 +85,7 @@ async function clearInput() {
         <button v-if="isProcessing" :disabled="stopping" class="btn-send" @click="stopStreaming" aria-label="停止生成" title="停止生成">
           <svg width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="3" fill="currentColor"/></svg>
         </button>
-        <button v-else class="btn-send" :disabled="!input.trim() || !current?.messagesLoaded || current?.messagesLoading || loading || conversationBusy" @click="sendMessage()" aria-label="发送消息" title="发送消息">↑</button>
+        <button v-else class="btn-send" :disabled="!input.trim() || !current?.messagesLoaded || current?.messagesLoading || loading || conversationBusy" @click="sendMessage()" aria-label="发送消息" title="发送消息"><AppIcon name="arrow-up" :size="20" /></button>
       </div>
     </div>
     <p class="composer-hint">重要信息请核对来源</p>
@@ -109,7 +109,7 @@ async function clearInput() {
 .suggestions button:hover { background: var(--surface); border-color: #ccc; }
 .suggestion-index { width: 100%; color: #969696; font-family: var(--font-mono); font-size: 11px; }
 .suggestions button > span:nth-child(2) { flex: 1; }
-.suggestions button > span:last-child { color: #949494; }
+.suggestion-arrow { color: var(--muted); }
 .input-bar { padding: 12px 32px 16px; }
 .input-inner { display: flex; flex-direction: column; max-width: 768px; margin: 0 auto; border: 1px solid #dedede; border-radius: 17px; padding: 10px 14px; box-shadow: 0 4px 20px #00000005; background: white; }
 .input-inner:focus-within { border-color: #aaa; box-shadow: 0 4px 20px #00000008; }
@@ -118,8 +118,8 @@ async function clearInput() {
 .input-row textarea:focus-visible { outline: none; }
 .btn-clear { flex-shrink: 0; height: 34px; padding: 0 8px; border-radius: 7px; color: var(--muted); font-size: 12px; }
 .btn-clear:hover { background: var(--surface); color: var(--text); }
-.btn-send { width: 34px; height: 34px; border-radius: 50%; background: var(--accent); color: white; flex-shrink: 0; display: grid; place-items: center; font-size: 22px; }
-.btn-send:hover:not(:disabled) { background: #444; }
+.btn-send { width: 34px; height: 34px; border-radius: 50%; background: var(--accent); color: white; flex-shrink: 0; display: grid; place-items: center; transition: background-color .15s; }
+.btn-send:hover:not(:disabled) { background: var(--accent-hover); }
 .input-options { order: 1; display: flex; align-items: center; gap: 12px; margin-top: 8px; }
 .mode-switch { display: flex; gap: 3px; background: #f4f4f4; padding: 3px; border-radius: 7px; }
 .mode-switch button { font-size: 11px; color: var(--muted); padding: 5px 9px; border-radius: 5px; }
@@ -127,7 +127,7 @@ async function clearInput() {
 .mode-description { font-size: 11px; color: var(--muted); }
 .composer-hint { font-size: 10px; color: #858585; text-align: center; margin: 11px 0 0; }
 .composer-hint span { margin: 0 6px; color: #b5b5b5; }
-.persist-notice { margin: 0 auto; padding: 8px 16px; color: var(--danger); background: #fff4f2; font-size: 12px; border-radius: 8px; max-width: 90%; cursor: pointer; }
+.persist-notice { flex-shrink: 0; margin: 0 auto; width: min(768px, calc(100% - 64px)); }
 @media (max-width: 760px) {
   .chat-area { padding: 40px 18px 24px; }
   .empty-title { font-size: 26px; }
@@ -135,6 +135,7 @@ async function clearInput() {
   .suggestions button { padding: 11px 14px; }
   .suggestion-index { width: auto; }
   .input-bar { padding: 8px 12px max(12px, env(safe-area-inset-bottom)); }
+  .persist-notice { width: calc(100% - 24px); }
   .input-inner { padding: 10px 12px; }
   .mode-description { display: none; }
 }
