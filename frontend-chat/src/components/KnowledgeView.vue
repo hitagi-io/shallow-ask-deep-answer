@@ -2,7 +2,7 @@
 import type { useKnowledge } from '../composables/useKnowledge'
 const props = defineProps<{ knowledge: ReturnType<typeof useKnowledge> }>()
 const emit = defineEmits<{ back: [] }>()
-const { files, knowledgeLoading, knowledgeBuilding, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput, deletingName, health, healthChecking, healthRepairing, knowledgeBusy, loadFiles, onFileSelect, onDrop, handleDeleteFile, handleBuild, handleHealthCheck, handleHealthRepair, formatHealthTime } = props.knowledge
+const { files, knowledgeLoading, knowledgeBuilding, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput, deletingName, health, healthChecking, healthRepairing, knowledgeBusy, loadKnowledgeState, onFileSelect, onDrop, handleDeleteFile, handleBuild, handleHealthCheck, handleHealthRepair, formatHealthTime } = props.knowledge
 const { filteredFiles, search, statusFilter, uploadResults, loadError, selectFiles, clearNotice } = props.knowledge
 </script>
 
@@ -86,7 +86,7 @@ const { filteredFiles, search, statusFilter, uploadResults, loadError, selectFil
           <div class="card-header">
             <h2>文档列表</h2>
             <div class="file-header-actions">
-              <button class="btn-ghost" :disabled="knowledgeBusy" @click="loadFiles">
+              <button class="btn-ghost" :disabled="knowledgeBusy" @click="loadKnowledgeState">
                 <span v-if="knowledgeLoading" class="btn-spinner" aria-hidden="true"></span>
                 {{ knowledgeLoading ? '刷新中...' : '刷新' }}
               </button>
@@ -101,7 +101,7 @@ const { filteredFiles, search, statusFilter, uploadResults, loadError, selectFil
           </div>
           <div class="file-filters"><input v-model="search" class="filter-input" placeholder="搜索文档名称" aria-label="搜索文档名称" type="search" /><select v-model="statusFilter" class="filter-input" aria-label="入库状态"><option value="all">全部状态</option><option value="indexed">已入库</option><option value="pending">未入库</option></select></div>
           <p class="hint">{{ filteredFiles.length }} / {{ files.length }} 个文档</p>
-          <div v-if="loadError" role="alert">{{ loadError }} <button class="text-action" :disabled="knowledgeBusy" @click="loadFiles">重新加载</button></div>
+          <div v-if="loadError" role="alert">{{ loadError }} <button class="text-action" :disabled="knowledgeBusy" @click="loadKnowledgeState">重新加载</button></div>
           <div v-else-if="knowledgeLoading && files.length === 0" class="empty" role="status">加载中...</div>
           <div v-else-if="filteredFiles.length === 0" class="empty">{{ files.length ? '没有匹配的文档' : '暂无文档' }}</div>
           <ul v-else class="file-list">

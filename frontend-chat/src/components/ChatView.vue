@@ -6,7 +6,7 @@ import type { useChat } from '../composables/useChat'
 
 const props = defineProps<{ chat: ReturnType<typeof useChat> }>()
 const { input, inputEl, chatArea, current, isProcessing, isThinking, thinkingSeconds, thinkingPhase,
-  kbOnly, suggestions, useSuggestion, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
+  kbOnly, switchMode, suggestions, useSuggestion, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
   loading, loadError, initConversations, conversationBusy, following, onScroll, jumpToLatest,
   loadMessages, hasEarlier, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend } = props.chat
 function resizeInput(event: Event) {
@@ -43,7 +43,7 @@ async function clearInput() {
       </div>
 
       <button v-if="hasEarlier" class="history-button text-action" :disabled="current.messagesLoading || isProcessing" @click="showEarlier">{{ current.messagesLoading ? '正在加载…' : '查看更早的消息' }}</button>
-      <ChatMessage v-for="(msg, i) in visibleMessages" :key="`${current.id}:${msg.id ?? `local-${messageOffset + i}`}`"
+      <ChatMessage v-for="(msg, i) in visibleMessages" :key="`${current.id}:${kbOnly ? 'kb' : 'general'}:${msg.id ?? `local-${messageOffset + i}`}`"
         :message="msg" :thinking="isThinking && i === visibleMessages.length - 1"
         :streaming="isProcessing && !isThinking && i === visibleMessages.length - 1" :busy="isProcessing"
         :thinking-seconds="i === visibleMessages.length - 1 ? thinkingSeconds : 0" :thinking-phase="i === visibleMessages.length - 1 ? thinkingPhase : ''"
@@ -68,10 +68,10 @@ async function clearInput() {
     <div class="input-inner">
       <div class="input-options">
         <div class="mode-switch" role="group" aria-label="问答模式">
-          <button :class="{ active: kbOnly }" :aria-pressed="kbOnly" :disabled="isProcessing" @click="kbOnly = true">知识库问答</button>
-          <button :class="{ active: !kbOnly }" :aria-pressed="!kbOnly" :disabled="isProcessing" @click="kbOnly = false">通用问答</button>
+          <button :class="{ active: kbOnly }" :aria-pressed="kbOnly" :disabled="isProcessing || conversationBusy || loading || !current || !!loadError" @click="switchMode(true)">知识库问答</button>
+          <button :class="{ active: !kbOnly }" :aria-pressed="!kbOnly" :disabled="isProcessing || conversationBusy || loading || !current || !!loadError" @click="switchMode(false)">通用问答</button>
         </div>
-        <span class="mode-description">{{ kbOnly ? '问候、身份询问、翻译改写直接回答；其他问题检索内部资料' : '模型知识 · 按需联网' }}</span>
+        <span class="mode-description">{{ kbOnly ? '仅根据知识库检索结果回答' : '据模型知识与联网搜索果回答' }}</span>
       </div>
       <div class="input-row">
         <textarea
@@ -87,7 +87,7 @@ async function clearInput() {
         <button v-else class="btn-send" :disabled="!input.trim() || !current?.messagesLoaded || current?.messagesLoading || loading || conversationBusy" @click="sendMessage()" aria-label="发送消息" title="发送消息">↑</button>
       </div>
     </div>
-    <p class="composer-hint">Enter 发送 <span>·</span> Shift + Enter 换行 <span>·</span> 重要信息请核对来源</p>
+    <p class="composer-hint">重要信息请核对来源</p>
   </div>
 </template>
 

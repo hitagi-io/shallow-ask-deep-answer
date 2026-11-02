@@ -10,15 +10,28 @@ export interface Message {
   kbOnly?: boolean
 }
 
-export interface Conversation {
-  id: string
-  title: string
+export interface MessageHistory {
   messages: Message[]
   messagesLoaded?: boolean
   nextBefore?: number | null
   messagesLoading?: boolean
   messagesError?: string
+}
+
+export interface ConversationSummary {
+  id: string
+  title: string
   updatedAt?: string
+  /** 是否已有消息，用于识别唯一的空白会话。 */
+  hasMessages: boolean
+  /** 首次发送后固定的会话模式；空白会话可在本地切换。 */
+  kbOnly: boolean | null
+}
+
+export interface Conversation extends ConversationSummary, MessageHistory {}
+
+export function withEmptyHistory(summary: ConversationSummary): Conversation {
+  return { ...summary, messages: [], messagesLoaded: !summary.hasMessages, nextBefore: null }
 }
 
 export interface UserInfo {
@@ -43,7 +56,8 @@ function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)
 }
 
-export function getUser(): UserInfo | null {
+/** 读取本地登录快照；当前身份和权限仍需通过 apiMe 向服务端验证。 */
+export function getStoredUser(): UserInfo | null {
   const raw = localStorage.getItem(USER_KEY)
   if (!raw) return null
   try {
@@ -139,7 +153,7 @@ export async function apiMe(): Promise<UserInfo> {
 // ---------- conversation API ----------
 
 export async function fetchConversations(cursor?: string | null): Promise<{
-  conversations: Omit<Conversation, 'messages'>[]; next_cursor: string | null
+  conversations: ConversationSummary[]; next_cursor: string | null
 }> {
   const query = new URLSearchParams({ limit: '20' })
   if (cursor) query.set('cursor', cursor)
@@ -149,7 +163,7 @@ export async function fetchConversations(cursor?: string | null): Promise<{
 }
 
 export async function fetchMessages(id: string, before?: number | null): Promise<{
-  messages: Message[]; next_before: number | null
+  messages: Message[]; next_before: number | null; kbOnly: boolean | null
 }> {
   const query = new URLSearchParams({ limit: '50' })
   if (before != null) query.set('before', String(before))
@@ -165,7 +179,8 @@ export async function createConversationApi(title: string): Promise<Conversation
     body: JSON.stringify({ title }),
   })
   if (!res.ok) throw new Error(await errorMessage(res, '创建会话失败'))
-  return { ...(await res.json()), updatedAt: new Date().toISOString(), messagesLoaded: true, nextBefore: null }
+  const summary: ConversationSummary = await res.json()
+  return withEmptyHistory(summary)
 }
 
 export async function updateConversationTitle(id: string, title: string): Promise<void> {
@@ -380,7 +395,8 @@ export async function deleteFile(name: string): Promise<void> {
   if (!res.ok) throw new Error(await errorMessage(res, '删除失败'))
 }
 
-export async function buildVector(): Promise<{ message: string; failures: { file: string; error: string }[] }> {
+/** 为尚未记录的知识库内容补建索引。 */
+export async function buildKnowledgeIndex(): Promise<{ message: string; failures: { file: string; error: string }[] }> {
   const res = await apiFetch('/api/vector/build', { method: 'POST', headers: authHeaders() })
   if (!res.ok) throw new Error(await errorMessage(res, '构建失败'))
   return res.json()

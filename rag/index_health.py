@@ -20,18 +20,18 @@ import threading
 from datetime import datetime
 
 from rag.vector_store import get_vector_store
-from utils.file_tool import list_files_with_allowed_type, get_file_md5_hex, md5_lock, read_md5_set
+from utils.knowledge_files import list_supported_files, compute_file_md5, md5_lock, read_indexed_md5s
 from utils.config_loader import vector_db_config
 from utils.logging_config import get_logger
 
 logger = get_logger(__name__)
-from utils.path_tool import get_abs_path
+from utils.project_paths import resolve_project_path
 
 _ITER_BATCH_SIZE = 1000
 
 
 def _md5_txt_path() -> str:
-    return get_abs_path("md5.txt")
+    return resolve_project_path("md5.txt")
 
 
 def _write_md5_set(hashes: set) -> None:
@@ -77,13 +77,13 @@ class IndexHealth:
 
     def __init__(self):
         self.vector_store = get_vector_store()
-        self.knowledge_dir = get_abs_path(vector_db_config["knowledge_dir"])
+        self.knowledge_dir = resolve_project_path(vector_db_config["knowledge_dir"])
         self.allowed_types = tuple(vector_db_config["allowed_types"])
         self._lock = threading.RLock()
 
     def _disk_files(self) -> list:
         os.makedirs(self.knowledge_dir, exist_ok=True)
-        return list(list_files_with_allowed_type(self.knowledge_dir, self.allowed_types))
+        return list(list_supported_files(self.knowledge_dir, self.allowed_types))
 
     def _base_report(self) -> dict:
         return {
@@ -100,8 +100,8 @@ class IndexHealth:
             report = self._base_report()
             report["checked_at"] = datetime.now().isoformat(timespec="seconds")
 
-            disk_files = [get_abs_path(f) for f in self._disk_files()]
-            md5_set = read_md5_set()
+            disk_files = [resolve_project_path(f) for f in self._disk_files()]
+            md5_set = read_indexed_md5s()
             report["stats"]["files"] = len(disk_files)
 
             try:
@@ -123,7 +123,7 @@ class IndexHealth:
             # 路径用于定位向量，MD5 用于判断同内容文件是否已入库。
             disk_by_norm: dict = {}
             for f in disk_files:
-                disk_by_norm[os.path.normcase(f)] = (f, get_file_md5_hex(f))
+                disk_by_norm[os.path.normcase(f)] = (f, compute_file_md5(f))
 
             files_by_md5: dict = {}
             for _, (path, md5) in disk_by_norm.items():
@@ -190,9 +190,9 @@ class IndexHealth:
         新上传但从未构建的文件不属于异常，不做处理。
         """
         with self._lock:
-            disk_files = [get_abs_path(f) for f in self._disk_files()]
-            disk_by_norm = {os.path.normcase(f): (f, get_file_md5_hex(f)) for f in disk_files}
-            md5_set_before = read_md5_set()
+            disk_files = [resolve_project_path(f) for f in self._disk_files()]
+            disk_by_norm = {os.path.normcase(f): (f, compute_file_md5(f)) for f in disk_files}
+            md5_set_before = read_indexed_md5s()
 
             try:
                 source_counts = _milvus_source_counts(self.vector_store)
@@ -205,7 +205,7 @@ class IndexHealth:
                 if os.path.normcase(src) in disk_by_norm:
                     continue
                 try:
-                    self.vector_store.delete_by_source(src)
+                    self.vector_store.delete_vectors_by_source(src)
                     summary["ghost_deleted"].append(src)
                 except Exception as e:
                     logger.error(f"[索引健康检查] 清理残留向量失败 source={src}：{e}")
@@ -230,7 +230,7 @@ class IndexHealth:
                     to_reindex.append(path)
                     seen_hashes.add(md5)
             if to_reindex:
-                failures = self.vector_store.do_store(to_reindex)
+                failures = self.vector_store.index_pending_files(to_reindex)
                 failed_files = {item["file"] for item in failures}
                 summary["re_indexed"] = [p for p in to_reindex if p not in failed_files]
                 summary["re_index_failures"] = failures
@@ -240,7 +240,7 @@ class IndexHealth:
                 }
                 failed_hashes.discard(None)
                 if failed_hashes:
-                    _write_md5_set(read_md5_set() | failed_hashes)
+                    _write_md5_set(read_indexed_md5s() | failed_hashes)
 
             report = self.check()
             report["repair"] = summary

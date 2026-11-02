@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import type { Message } from '../api'
-import { formatTime } from '../utils/format'
+import { formatDuration } from '../utils/duration'
 import BrandMark from './BrandMark.vue'
 import { copyText } from '../utils/clipboard'
 import { useNotice } from '../composables/useNotice'
@@ -57,7 +57,7 @@ const html = computed(() => {
         <span class="thinking-dot"></span>
         <span class="thinking-dot" style="animation-delay:0.15s"></span>
         <span class="thinking-dot" style="animation-delay:0.3s"></span>
-        <span class="thinking-text">{{ thinkingPhase || '处理中' }}...... {{ formatTime(thinkingSeconds) }}</span>
+        <span class="thinking-text">{{ thinkingPhase || '处理中' }}...... {{ formatDuration(thinkingSeconds) }}</span>
       </div>
       <div v-if="message.role === 'assistant' && !(thinking && !message.content)" ref="body" class="bubble markdown-body" @click="copyCode" v-html="html"></div>
       <div v-if="message.role === 'assistant' && !thinking && !streaming" class="message-actions">
@@ -75,7 +75,7 @@ const html = computed(() => {
         </button>
         <span role="status" aria-live="polite">{{ copyNotice }}</span>
       </div>
-      <div v-if="message.role === 'assistant' && message.thinkingTime != null && message.content" class="thinking-time">· 处理耗时 {{ formatTime(message.thinkingTime) }}</div>
+      <div v-if="message.role === 'assistant' && message.thinkingTime != null && message.content" class="thinking-time">· 处理耗时 {{ formatDuration(message.thinkingTime) }}</div>
       <div v-if="message.role === 'assistant' && (message.status === 'cancelled' || message.status === 'error') && message.content" class="message-note" :class="message.status">
         {{ message.status === 'cancelled' ? '· 已取消' : '· 回答未完成' }}
       </div>

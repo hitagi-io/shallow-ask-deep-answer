@@ -1,9 +1,9 @@
 import os
 import yaml
-from utils.path_tool import get_abs_path
+from utils.project_paths import resolve_project_path
 
 def load_config(file_path):
-    abs_path = get_abs_path(os.path.join('config', file_path))
+    abs_path = resolve_project_path(os.path.join('config', file_path))
     try:
         with open(abs_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)

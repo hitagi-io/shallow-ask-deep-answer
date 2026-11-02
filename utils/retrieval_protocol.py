@@ -3,7 +3,7 @@
 为什么不再用文本短句判定：
 - 文本无法区分“检索服务故障 / 知识库无资料 / 正常资料里恰好引用了这些字眼”；
 - 子代理最终回答由模型生成，本身不能作为“检索是否成功”的证据；
-- 因此检索工具、子代理报告、直答声明都使用带 protocol/version 的结构化数据：
+- 因此检索工具、子代理报告、澄清请求都使用带 protocol/version 的结构化数据：
   检索证据由工具写入 artifact，子代理报告由代码在其出口根据 artifact 汇总，
   主 Agent 侧只做结构校验，不再做任何失败短句子串匹配。
 
@@ -23,7 +23,7 @@ PROTOCOL_VERSION = 1
 # 协议名由工具、提示词和输出校验共同使用，修改时需同步三者。
 RETRIEVAL_PROTOCOL = "kb_retrieval"
 REPORT_PROTOCOL = "kb_retrieval_report"
-DIRECT_ANSWER_PROTOCOL = "kb_direct_answer"
+CLARIFICATION_PROTOCOL = "kb_clarification"
 
 STATUS_OK = "ok"
 STATUS_EMPTY = "empty"
@@ -46,8 +46,6 @@ RETRIEVAL_EMPTY_MARKER = "__RETRIEVAL_EMPTY__"
 SENTINEL_KB_DOWN = "检索服务暂时不可用"
 SENTINEL_KB_MISS = "未找到足够资料"
 _SENTINELS = (SENTINEL_KB_DOWN, SENTINEL_KB_MISS)
-
-DIRECT_CATEGORIES = ("greeting", "identity", "rewrite", "provided_text")
 
 CITATION_SOURCE_LIMIT = 5
 QUERY_LOG_LIMIT = 500
@@ -123,15 +121,15 @@ def build_retrieval_artifact(
     }
 
 
-def build_direct_answer_content(category: str) -> str:
-    """构造直答声明的工具结果文本（模型可见，也供主 Agent 侧结构校验）。"""
-    if category not in DIRECT_CATEGORIES:
-        raise ValueError(f"非法直答类别: {category}")
+def build_clarification_content(question: str) -> str:
+    """封装待用户回答的澄清问句，不授权任何无依据的正文。"""
+    if not isinstance(question, str) or not question.strip() or len(question) > 500:
+        raise ValueError("澄清问题须为 1～500 字")
     return json.dumps(
         {
-            "protocol": DIRECT_ANSWER_PROTOCOL,
+            "protocol": CLARIFICATION_PROTOCOL,
             "version": PROTOCOL_VERSION,
-            "category": category,
+            "question": question.strip(),
         },
         ensure_ascii=False,
     )
@@ -312,15 +310,15 @@ def parse_retrieval_report(text: Any) -> dict | None:
     return data
 
 
-def parse_direct_answer_content(text: Any) -> str | None:
-    """解析直答声明工具结果；返回类别，非法时返回 None。"""
+def parse_clarification_content(text: Any) -> str | None:
+    """解析澄清工具结果；返回问句，非法时返回 None。"""
     data = _json_object(text)
     if data is None:
         return None
-    if data.get("protocol") != DIRECT_ANSWER_PROTOCOL or data.get("version") != PROTOCOL_VERSION:
+    if data.get("protocol") != CLARIFICATION_PROTOCOL or data.get("version") != PROTOCOL_VERSION:
         return None
-    category = data.get("category")
-    return category if category in DIRECT_CATEGORIES else None
+    question = data.get("question")
+    return question.strip() if isinstance(question, str) and 0 < len(question.strip()) <= 500 else None
 
 
 def looks_like_report(text: Any) -> bool:

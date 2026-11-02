@@ -3,25 +3,27 @@
 import os
 import threading
 from datetime import date
-from typing import Literal
 
+from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware, dynamic_prompt
 from langchain.chat_models import init_chat_model
 from deepagents import create_deep_agent
+from deepagents.backends import StateBackend
+from deepagents.middleware.subagents import SubAgentMiddleware
+from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg_pool import ConnectionPool
 from utils.answer_guard import SEARCH_EMPTY_MARKER, SEARCH_ERROR_MARKER, guarded_stream
-from utils.retrieval_protocol import build_direct_answer_content
+from utils.retrieval_protocol import build_clarification_content
 from utils.config_loader import agent_config
 from utils.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
 from utils.prompt_loader import (
     load_conversation_summary_prompt,
     render_general_prompt,
-    render_main_prompt,
-    render_text_transform_prompt,
+    render_kb_agent_prompt,
 )
 from utils.logging_config import get_logger
-from rag.rag_summary import rag_summary_subagents
+from rag.retrieval_agent import retrieval_subagent
 from langchain_tavily import TavilySearch
 from langchain_core.tools import tool
 from dotenv import load_dotenv
@@ -38,18 +40,6 @@ PG_CHECKPOINT_POOL_MAX = int(os.getenv("PG_CHECKPOINT_POOL_MAX", "20"))
 
 _tavily: TavilySearch | None = None
 _tavily_lock: threading.Lock = threading.Lock()
-
-STRICT_GENERAL_PURPOSE_SUBAGENT = {
-    "name": "general-purpose",
-    "description": (
-        "受限文本整理子代理，仅对任务中明确提供的原文做改写、提取、归类或格式转换。"
-        "不检索、不查证、不提供知识证据。仅知识库模式的主助手应通过 mark_direct_answer "
-        "自行完成允许的文本直答；知识问题使用 rag_summary_subagents。"
-    ),
-    "system_prompt": render_text_transform_prompt(),
-    "tools": [],
-}
-
 
 def _inject_current_date(base_prompt: str) -> str:
     """在系统提示末尾追加当天日期；每次模型调用时读取，避免跨天后日期过期。"""
@@ -120,32 +110,21 @@ def tavily_search(query: str) -> str:
     )
 
 
-@tool
-def mark_direct_answer(
-    category: Literal["greeting", "identity", "rewrite", "provided_text"],
-) -> str:
-    """声明整个请求属于无需外部事实的直答类别，供服务端放行回答。
+@tool(return_direct=True)
+def ask_kb_clarification(question: str) -> str:
+    """在检索前向用户澄清知识库问题，等待下一轮补充后再检索。
 
-    必须在输出回答之前调用，且只允许以下类别：
-    - greeting：打招呼、寒暄、客套（如"你好"、"谢谢"）；
-    - identity：询问助手身份；
-    - rewrite：翻译、改写润色、格式转换，所需原文来自用户本轮消息；
-    - provided_text：对用户本轮消息中已提供文本的摘要、提取、归类。
-
-    缺少待处理原文时可声明对应文本类别后请求原文。若请求混有事实查证、
-    知识解释或补充背景，使用 rag_summary_subagents，不调用本工具。
-    同一回合不混用本工具与 task；收到声明后仅输出相应文本结果。
-
-    Args:
-        category: 豁免任务类别。
-
-    Returns:
-        str: 结构化直答声明（服务端据此放行本轮文本，用户不可见）。
+    question 只能是简短的澄清问句，询问缺失的对象、文档、范围或比较维度，
+    不得包含事实回答、翻译改写结果或推测。没有知识库查询目标时，请用户
+    提供具体知识库问题，并可提示通用任务使用通用问答。本轮不同时调用 task。
+    服务端只展示此问句，不放行工具调用前后额外生成的正文。
     """
-    return build_direct_answer_content(category)
+    return build_clarification_content(question)
 
 
-class MainDeepAgent:
+class ChatAgent:
+    """装配知识库与通用问答两种模式，并提供统一的流式回答接口。"""
+
     def __init__(self):
         self.model=init_chat_model(
             model=agent_config["main_agent_model"],
@@ -163,12 +142,12 @@ class MainDeepAgent:
         self.checkpointer = PostgresSaver(self._pg_pool)
         with exclusive_section(_PG_CONNECTION_STRING, PG_LOCK_KEY_SETUP):
             self.checkpointer.setup()
-        self.kb_only_prompt = render_main_prompt()
+        self.kb_only_prompt = render_kb_agent_prompt()
         self.general_prompt = render_general_prompt()
         self._kb_only_agent = self._build_kb_only_agent()
         self._general_agent = self._build_general_agent()
 
-    def _middleware(self, static_prompt: str):
+    def _build_middleware(self, static_prompt: str):
         return [
             SummarizationMiddleware(
                 model=self.model,
@@ -180,14 +159,26 @@ class MainDeepAgent:
         ]
 
     def _build_kb_only_agent(self):
-        # 严格模式只允许显式直答声明或知识库子代理，不开放通用联网工具。
-        return create_deep_agent(
+        # 显式装配工具，避免 create_deep_agent 自动加入文件、待办及通用子代理。
+        return create_agent(
             model=self.model,
-            tools=[mark_direct_answer],
+            tools=[ask_kb_clarification],
             system_prompt=self.kb_only_prompt,
             checkpointer=self.checkpointer,
-            subagents=[rag_summary_subagents, STRICT_GENERAL_PURPOSE_SUBAGENT],
-            middleware=self._middleware(self.kb_only_prompt),
+            middleware=[
+                SubAgentMiddleware(
+                    backend=StateBackend,
+                    subagents=[retrieval_subagent],
+                    system_prompt=None,
+                    task_description=(
+                        "委派一个明确的知识库检索子问题。主助手先澄清、拆解并改写问题，"
+                        "按独立检索目标决定任务数量；独立任务可同时调用，汇总全部报告后回答。"
+                        "可用子代理：{available_agents}"
+                    ),
+                ),
+                PatchToolCallsMiddleware(),
+                *self._build_middleware(self.kb_only_prompt),
+            ],
         )
 
     def _build_general_agent(self):
@@ -196,10 +187,11 @@ class MainDeepAgent:
             tools=[tavily_search],
             system_prompt=self.general_prompt,
             checkpointer=self.checkpointer,
-            middleware=self._middleware(self.general_prompt),
+            middleware=self._build_middleware(self.general_prompt),
         )
 
-    def ask_deep_agent(self, query, thread_id, kb_only=True, should_stop=None):
+    def stream_answer(self, query, thread_id, kb_only=True, should_stop=None):
+        """生成文本增量与阶段/替换事件，供 StreamBridge 消费。"""
         agent = self._kb_only_agent if kb_only else self._general_agent
         raw_stream = agent.stream(
             {"messages": [{"role": "human", "content": query}]},

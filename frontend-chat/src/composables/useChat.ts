@@ -1,5 +1,5 @@
 import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
-import { fetchConversations, fetchMessages, createConversationApi, updateConversationTitle, deleteConversationApi, streamChat, newRequestId, type Conversation, type Message } from '../api'
+import { fetchConversations, fetchMessages, createConversationApi, updateConversationTitle, deleteConversationApi, streamChat, newRequestId, withEmptyHistory, type Conversation, type Message } from '../api'
 import { useNotice } from './useNotice'
 import type { ConfirmAction } from './useConfirmation'
 
@@ -36,7 +36,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   const loadingMore = ref(false)
   const conversationBusy = ref(false)
   const failedAttempt = ref<{ conversationId: string; text: string; mode: boolean; requestId: string } | null>(null)
-  const canRetrySend = computed(() => failedAttempt.value?.conversationId === currentId.value)
+  const canRetrySend = computed(() => failedAttempt.value?.conversationId === currentId.value && failedAttempt.value?.mode === kbOnly.value)
   const following = ref(true)
   const visibleCount = ref(50)
   let pendingFrame: number | null = null
@@ -54,7 +54,8 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   let thinkingTimer: number | null = null
   let thinkingStartTime = 0
   const chatArea = ref<HTMLElement | null>(null)
-  const kbOnly = ref(true)
+  const kbOnly = computed(() => conversations.value[currentId.value]?.kbOnly ?? true)
+  const isEmptyConversation = (conv: Conversation) => !conv.hasMessages && conv.messages.length === 0
   const suggestions = computed(() => kbOnly.value ? [
     { label: '总结资料中的关键结论', prompt: '请总结【请填写文档名称或资料主题】中的关键结论，重点关注【请填写你关注的问题】。' },
     { label: '查找相关规定与操作流程', prompt: '请查找关于【请填写具体事项】的相关规定与操作流程。' },
@@ -86,7 +87,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
       if (disposed) return
       nextCursor.value = page.next_cursor
       const loaded: Record<string, Conversation> = {}
-      for (const c of page.conversations) loaded[c.id] = { ...c, messages: [] }
+      for (const c of page.conversations) loaded[c.id] = withEmptyHistory(c)
       if (Object.keys(loaded).length === 0) {
         const conv = await createConversationApi('新对话')
         loaded[conv.id] = conv
@@ -106,7 +107,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
       const page = await fetchConversations(nextCursor.value)
       if (disposed) return
       for (const c of page.conversations) {
-        if (!conversations.value[c.id]) conversations.value[c.id] = { ...c, messages: [] }
+        if (!conversations.value[c.id]) conversations.value[c.id] = withEmptyHistory(c)
       }
       nextCursor.value = page.next_cursor
     } catch (e) { handlePersistError('加载更多会话', e) }
@@ -115,7 +116,8 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
 
   async function loadMessages(id = currentId.value, earlier = false) {
     const conv = conversations.value[id]
-    if (!conv || conv.messagesLoading || (earlier && (!conv.nextBefore || isProcessing.value))) return
+    if (!conv) return
+    if (conv.messagesLoading || (earlier && (!conv.nextBefore || isProcessing.value))) return
     conv.messagesLoading = true
     conv.messagesError = ''
     try {
@@ -127,6 +129,8 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
         : page.messages
       conv.nextBefore = page.next_before
       conv.messagesLoaded = true
+      if (page.messages.length) conv.hasMessages = true
+      if (page.kbOnly != null) conv.kbOnly = page.kbOnly
       if (!earlier && currentId.value === id) jumpToLatest()
     } catch (e) {
       conv.messagesError = e instanceof Error ? e.message : '消息加载失败'
@@ -148,7 +152,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
 
   const current = computed(() => conversations.value[currentId.value])
   const convList = computed(() => Object.values(conversations.value).sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime()))
-  const hasEmptyConv = computed(() => convList.value.some(c => c.messagesLoaded && c.messages.length === 0))
+  const hasEmptyConv = computed(() => convList.value.some(isEmptyConversation))
   const messageOffset = computed(() => Math.max(0, (current.value?.messages.length || 0) - visibleCount.value))
   const visibleMessages = computed(() => current.value?.messages.slice(messageOffset.value) || [])
   const hasEarlier = computed(() => messageOffset.value > 0 || !!current.value?.nextBefore)
@@ -156,6 +160,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     const conv = current.value
     if (!conv || conv.messagesLoading || isProcessing.value) return
     const id = currentId.value
+    const mode = kbOnly.value
     const el = chatArea.value
     const height = el?.scrollHeight || 0
     const top = el?.scrollTop || 0
@@ -164,18 +169,18 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     else {
       const count = conv.messages.length
       await loadMessages(id, true)
-      if (currentId.value !== id) return
-      visibleCount.value += conv.messages.length - count
+      if (currentId.value !== id || kbOnly.value !== mode) return
+      visibleCount.value += (current.value?.messages.length || 0) - count
     }
     await nextTick()
-    if (el && currentId.value === id) el.scrollTop = top + el.scrollHeight - height
+    if (el && currentId.value === id && kbOnly.value === mode) el.scrollTop = top + el.scrollHeight - height
   }
   function onScroll() {
     const el = chatArea.value
     if (el) following.value = el.scrollHeight - el.scrollTop - el.clientHeight < 80
   }
   function jumpToLatest() { following.value = true; scrollToBottom() }
-  watch(currentId, id => {
+  watch([currentId, kbOnly], ([id]) => {
     visibleCount.value = 50
     if (conversations.value[id] && !conversations.value[id].messagesLoaded) void loadMessages(id)
     jumpToLatest()
@@ -187,14 +192,21 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     })
   }
 
-  async function newConversation() {
+  async function newConversation(mode = kbOnly.value) {
     if (isProcessing.value || conversationBusy.value || loading.value) return
-    const empty = convList.value.find(c => c.messagesLoaded && c.messages.length === 0)
-    if (empty) { currentId.value = empty.id; return }
+    const active = conversations.value[currentId.value]
+    const empty = active && isEmptyConversation(active) ? active : convList.value.find(isEmptyConversation)
+    if (empty) {
+      empty.kbOnly = mode
+      currentId.value = empty.id
+      return
+    }
     conversationBusy.value = true
     try {
+      // 服务端也会复用空白会话，涵盖尚未加载到的分页和并发新建。
       const conv = await createConversationApi('新对话')
-      conv.updatedAt = new Date().toISOString()
+      if (disposed) return
+      conv.kbOnly = mode
       conversations.value[conv.id] = conv
       currentId.value = conv.id
     } catch (e) {
@@ -202,8 +214,13 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     } finally { conversationBusy.value = false }
   }
 
+  async function switchMode(mode: boolean) {
+    if (mode === kbOnly.value) return
+    await newConversation(mode)
+  }
+
   function selectConversation(id: string) {
-    if (isProcessing.value) return
+    if (isProcessing.value || conversationBusy.value || loading.value || !conversations.value[id]) return
     currentId.value = id
   }
 
@@ -245,7 +262,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   }
   function retryFailedSend() {
     const attempt = failedAttempt.value
-    if (attempt && attempt.conversationId === currentId.value) return sendMessage(attempt.text, attempt.mode, attempt.requestId)
+    if (attempt && canRetrySend.value) return sendMessage(attempt.text, attempt.mode, attempt.requestId)
   }
 
   async function sendMessage(retryText?: string, answerMode = kbOnly.value, previousRequestId?: string) {
@@ -253,10 +270,14 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     if (!text || isProcessing.value || conversationBusy.value || loading.value) return
     const convId = currentId.value
     const conv = conversations.value[convId]
-    if (!conv || !conv.messagesLoaded || conv.messagesLoading) return
+    if (!conv || answerMode !== kbOnly.value) return
+    if (!conv.messagesLoaded || conv.messagesLoading) return
 
     // 本地先乐观展示；服务端在/stream 接口中原子写入用户消息，客户端不再单独提交
-    conv.messages.push({ role: 'user', content: text })
+    const hadMessages = conv.hasMessages
+    conv.hasMessages = true
+    conv.kbOnly = answerMode
+    conv.messages.push({ role: 'user', content: text, kbOnly: answerMode })
     const userIdx = conv.messages.length - 1
     conv.updatedAt = new Date().toISOString()
     if (conv.messages.length === 1 && conv.title === '新对话') {
@@ -320,11 +341,12 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
         // 服务端没有接受本次请求（会话已删除、会话被占用或校验失败）：
         // 回滚本地乐观消息，避免展示数据库中不存在的问答
         conv.messages.splice(userIdx, 2)
+        conv.hasMessages = hadMessages
         if (!ac.signal.aborted) failedAttempt.value = { conversationId: convId, text, mode: answerMode, requestId }
         if (!ac.signal.aborted) handlePersistError('发送消息', new Error(outcome.error || '请求未被服务端接受'))
         return
       }
-      if (failedAttempt.value?.conversationId === convId) failedAttempt.value = null
+      if (failedAttempt.value?.conversationId === convId && failedAttempt.value?.mode === answerMode) failedAttempt.value = null
 
       if (outcome.messageId != null) conv.messages[idx].id = outcome.messageId
       if (outcome.status === 'completed') {
@@ -369,6 +391,6 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     if (thinkingTimer !== null) clearTimeout(thinkingTimer)
     if (pendingFrame !== null) cancelAnimationFrame(pendingFrame)
   })
-  return { input, inputEl, chatArea, current, currentId, convList, hasEmptyConv, isProcessing, isThinking, thinkingSeconds, thinkingPhase, kbOnly, suggestions, useSuggestion, newConversation, selectConversation, deleteConversation, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
+  return { input, inputEl, chatArea, current, currentId, convList, hasEmptyConv, isProcessing, isThinking, thinkingSeconds, thinkingPhase, kbOnly, switchMode, suggestions, useSuggestion, newConversation, selectConversation, deleteConversation, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
     nextCursor, loadingMore, loadMoreConversations, loadMessages, hasEarlier, loading, loadError, initConversations, conversationBusy, renameConversation, following, onScroll, jumpToLatest, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend }
 }

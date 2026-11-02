@@ -15,7 +15,7 @@ from utils.retrieval_protocol import (
     build_retrieval_artifact,
     build_retrieval_content,
 )
-from utils.prompt_loader import render_summary_prompt
+from utils.prompt_loader import render_retrieval_agent_prompt
 from rag.vector_store import get_vector_store
 from utils.config_loader import agent_config
 from utils.logging_config import get_logger
@@ -67,7 +67,7 @@ def do_retrieval(query):
     return text, build_retrieval_artifact(STATUS_OK, query, chunks)
 
 
-rag_summary_agent = create_agent(
+retrieval_agent = create_agent(
     model=init_chat_model(
         model=agent_config["rag_summary_model"],
         model_provider=agent_config["rag_summary_model_provider"],
@@ -76,13 +76,13 @@ rag_summary_agent = create_agent(
         max_retries=int(agent_config.get("llm_max_retries", 1)),
     ),
     tools=[do_retrieval],
-    system_prompt=render_summary_prompt(),
+    system_prompt=render_retrieval_agent_prompt(),
 )
 
 
 def _invoke_with_report(state):
     """运行子代理，并用代码（而非模型文本）生成结构化检索报告。"""
-    result = rag_summary_agent.invoke(state)
+    result = retrieval_agent.invoke(state)
     if isinstance(result, dict) and isinstance(result.get("messages"), list):
         result = dict(result)
         result["structured_response"] = RetrievalReport(
@@ -91,16 +91,17 @@ def _invoke_with_report(state):
     return result
 
 
-structured_rag_summary_agent = RunnableLambda(_invoke_with_report)
+structured_retrieval_agent = RunnableLambda(_invoke_with_report)
 
-rag_summary_subagents = CompiledSubAgent(
+# 这是单个子代理定义；注册名会进入持久化的 task 调用参数，保留旧值兼容历史会话。
+retrieval_subagent = CompiledSubAgent(
     name="rag_summary_subagents",
     description=(
-        "仅知识库模式的事实与资料查询入口。通过 task 每回合委派一次，传入自包含问题、"
-        "全部子问题、必要的时间范围及回答粒度；问候、身份和纯文本转换由主助手直答。"
-        "子代理最多检索 3 次，依据片段总结并保留缺证和冲突。返回由代码封装的 "
+        "知识库检索入口。主助手澄清并拆解问题后，每个 task 传入一个自包含检索目标、"
+        "必要的实体、时间范围及回答粒度；可按独立目标委派多个本类子代理。"
+        "每个子代理最多检索 3 次，只处理分配的目标，依据片段总结并保留缺证和冲突。返回由代码封装的 "
         "kb_retrieval_report，主助手按顶层 status 处理，只用 answer 作事实正文，"
         "只引用 sources 内的文件；无需要求子代理手写报告 JSON。"
     ),
-    runnable=structured_rag_summary_agent,
+    runnable=structured_retrieval_agent,
 )

@@ -1,5 +1,5 @@
 import { ref, computed, watch, onMounted, onUnmounted, type Ref } from 'vue'
-import { fetchFiles, uploadFiles, deleteFile, buildVector, fetchIndexHealth, repairIndexHealth, type FileItem, type HealthReport } from '../api'
+import { fetchFiles, uploadFiles, deleteFile, buildKnowledgeIndex, fetchIndexHealth, repairIndexHealth, type FileItem, type HealthReport } from '../api'
 import { useNotice } from './useNotice'
 import type { ConfirmAction } from './useConfirmation'
 
@@ -59,7 +59,7 @@ export function useKnowledge(isAdmin: Readonly<Ref<boolean>>, active: Readonly<R
     const failed = results.find(result => result.status === 'rejected')
     if (failed?.status === 'rejected') throw failed.reason
   }
-  function loadFiles() { return run('loading', refreshAll) }
+  function loadKnowledgeState() { return run('loading', refreshAll) }
   function selectFiles() { if (!knowledgeBusy.value) fileInput.value?.click() }
 
   async function handleUpload(fileList: FileList | File[]) {
@@ -103,7 +103,7 @@ export function useKnowledge(isAdmin: Readonly<Ref<boolean>>, active: Readonly<R
   }
   function handleBuild() {
     return run('building', async () => {
-      const result = await buildVector()
+      const result = await buildKnowledgeIndex()
       await refreshAll(true)
       const errors = result.failures.map(f => `${f.file.split(/[\\/]/).pop()}：${f.error}`)
       show([result.message, ...errors].join('；'), errors.length ? 'error' : 'success')
@@ -140,13 +140,13 @@ export function useKnowledge(isAdmin: Readonly<Ref<boolean>>, active: Readonly<R
     }
     if (!disposed) pollTimer = setTimeout(poll, 60_000)
   }
-  watch(active, visible => { if (visible) void loadFiles() }, { immediate: true })
+  watch(active, visible => { if (visible) void loadKnowledgeState() }, { immediate: true })
   onMounted(() => { if (isAdmin.value) void poll() })
   onUnmounted(() => { disposed = true; clearTimeout(pollTimer); uploadAbort.abort() })
   function formatHealthTime(iso: string | null) { return iso ? new Date(iso).toLocaleString() : '从未' }
 
   return { files, filteredFiles, search, statusFilter, uploadResults, loadError, selectFiles, clearNotice,
     knowledgeLoading, knowledgeBuilding, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput,
-    deletingName, health, healthChecking, healthRepairing, healthIssueCount, knowledgeBusy, loadFiles, onFileSelect,
+    deletingName, health, healthChecking, healthRepairing, healthIssueCount, knowledgeBusy, loadKnowledgeState, onFileSelect,
     onDrop, handleDeleteFile, handleBuild, handleHealthCheck, handleHealthRepair, formatHealthTime }
 }

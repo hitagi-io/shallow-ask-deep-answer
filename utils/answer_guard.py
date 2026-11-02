@@ -1,9 +1,9 @@
 """回答输出校验：裁决“仅知识库”模式的流式输出，并处理降级响应；通用模式仅过滤工具消息。
 
-两种模式（与前端「仅知识库」开关一一对应）：
+两种模式（与前端的问答模式选择一一对应）：
 - kb_only=True（默认，严格模式）：事实性内容只能来自知识库。子代理在出口由代码根据
   检索 artifact 生成结构化报告；本模块只认结构报告，不扫描任何失败短句。模型文本
-  先缓冲，当前回合拿到 status=ok 且来源可校验后才增量放行；回合结束时再校验引用，
+  先缓冲，当前回合收齐任务报告且至少一份 status=ok 后才增量放行；回合结束时再校验引用，
   校验失败则用 replace 事件用固定文案整段替换已下发内容。
 - kb_only=False（通用模式）：模型自身知识 + 必要时联网搜索，没有固定文案约定；
   本模块只过滤工具消息（并记录联网异常标记），模型文本实时透传。
@@ -17,7 +17,7 @@ from utils.retrieval_protocol import (
     STATUS_ERROR,
     STATUS_OK,
     looks_like_report,
-    parse_direct_answer_content,
+    parse_clarification_content,
     parse_retrieval_report,
     split_answer_and_citations,
 )
@@ -30,7 +30,7 @@ SEARCH_ERROR_MARKER = "__SEARCH_UNAVAILABLE__"
 SEARCH_EMPTY_MARKER = "__SEARCH_EMPTY__"
 
 COPY_KB_DOWN = "抱歉，知识库检索服务暂时不可用，请稍后重试。"
-COPY_KB_MISS = "抱歉，内部知识库中未找到相关资料。您可以关闭「仅知识库」开关后重试。"
+COPY_KB_MISS = "抱歉，内部知识库中未找到相关资料。您可以切换到「通用问答」后重试。"
 COPY_KB_UNVERIFIED = "抱歉，本次回答未能通过知识库依据校验，请稍后重试。"
 
 _COPY_BY_WINNER = {
@@ -46,17 +46,17 @@ class AnswerGuard:
 
     调用方（guarded_stream）负责从流中取出消息并区分工具消息与文本消息；
     本类维护单回合状态：拿到 status=ok 报告后允许增量放行，finish() 返回最终
-    校验动作（追加来源行 / 整段替换 / 无输出）。
+    校验动作（补全来源后整段替换 / 无输出）。
     """
 
     def __init__(self) -> None:
         self.terminated = False
         self._buffer: list[str] = []
         self._reports: list[dict] = []
-        self._direct_category: str | None = None
+        self._clarification: str | None = None
         self._task_seen = False
         self._task_call_ids: set[str] = set()
-        self._direct_call_ids: set[str] = set()
+        self._clarification_call_ids: set[str] = set()
         self._seen_tools: list[str] = []
         # status=ok 报告到达后进入增量放行：后续文本边生成边下发
         self._releasing = False
@@ -67,17 +67,20 @@ class AnswerGuard:
         if tool_name == "task":
             self._task_seen = True
             if tool_call_id:
+                if tool_call_id not in self._task_call_ids:
+                    # 检索前的计划或推测不属于最终答案。
+                    self._buffer.clear()
+                    self._releasing = False
                 self._task_call_ids.add(tool_call_id)
-        elif tool_name == "mark_direct_answer" and tool_call_id:
-            self._direct_call_ids.add(tool_call_id)
+        elif tool_name == "ask_kb_clarification" and tool_call_id:
+            self._clarification_call_ids.add(tool_call_id)
 
-    def begin_release(self) -> str | None:
-        """进入增量放行；返回此前已缓冲、需要一次性补发的文本。"""
+    def begin_release(self) -> None:
+        """全部已派任务返回后放行，丢弃检索完成前的计划和推测。"""
         if self.terminated or self._releasing:
             return None
         self._releasing = True
-        pending = self._buffer_text()
-        return pending or None
+        self._buffer.clear()
 
     def feed_tool(
         self,
@@ -85,7 +88,7 @@ class AnswerGuard:
         tool_name: str | None = None,
         tool_call_id: str | None = None,
     ) -> str | None:
-        """处理一条工具消息：只接受结构化报告/直答声明，不解析失败短句。
+        """处理一条工具消息：只接受结构化报告/澄清请求，不解析失败短句。
 
         返回 None（无状态变化）、"generating"（可进入生成阶段）或
         "release"（拿到 status=ok 报告，可开始增量放行）。
@@ -107,6 +110,8 @@ class AnswerGuard:
             ):
                 logger.warning("[输出校验] 结构化检索报告未匹配到对应的 task 调用，已忽略该结果")
                 return None
+            if any(r["task_call_id"] == tool_call_id for r in self._reports):
+                return None
             report["task_call_id"] = tool_call_id
             self._reports.append(report)
             sources = "、".join(report["sources"][:CITATION_SOURCE_LIMIT]) or "-"
@@ -115,22 +120,23 @@ class AnswerGuard:
                 f"reason={report.get('reason') or '-'} sources={sources} "
                 f"task_call={tool_call_id or '-'}"
             )
-            return "release" if report["status"] == STATUS_OK else "generating"
+            complete = {r["task_call_id"] for r in self._reports} == self._task_call_ids
+            has_evidence = any(r["status"] == STATUS_OK for r in self._reports)
+            return "release" if complete and has_evidence and not self._clarification_call_ids else "generating"
 
         if looks_like_report(text):
             logger.error("[输出校验] 结构化检索报告解析失败，当前回合按无有效证据处理")
 
-        category = parse_direct_answer_content(text)
-        if category is not None:
+        question = parse_clarification_content(text)
+        if question is not None:
             if (
                 not tool_call_id
-                or tool_call_id not in self._direct_call_ids
-                or tool_name not in (None, "mark_direct_answer")
+                or tool_call_id not in self._clarification_call_ids
+                or tool_name not in (None, "ask_kb_clarification")
             ):
-                logger.warning("[输出校验] 直答声明未匹配到对应的 mark_direct_answer 调用，已忽略该结果")
+                logger.warning("[输出校验] 澄清结果未匹配到对应工具调用，已忽略该结果")
                 return None
-            self._direct_category = category
-            logger.info(f"[输出校验] 已确认直接回答分支 category={category}")
+            self._clarification = question
             return "generating"
         return None
 
@@ -142,15 +148,19 @@ class AnswerGuard:
         return text if self._releasing else None
 
     def finish(self) -> tuple[str, str]:
-        """流耗尽后执行最终校验，这是输出放行的唯一位置。
+        """流耗尽后执行最终校验，必要时覆盖此前增量放行的内容。
 
         返回 (action, text)：
-        - ("append", suffix)：在已下发内容后追加后缀（如补发的来源行）；
         - ("replace", text)：整段替换为 text（固定文案或完整回答）；
         - ("none", "")：无可输出。
         """
         if self.terminated:
             return ("none", "")
+
+        if self._clarification_call_ids and self._task_seen:
+            return self._terminate("unverified", "澄清回合不应同时执行检索")
+        if self._task_call_ids != {r["task_call_id"] for r in self._reports}:
+            return self._terminate("unverified", "部分检索任务缺少有效报告")
 
         ok_reports = [report for report in self._reports if report["status"] == STATUS_OK]
         if ok_reports:
@@ -164,14 +174,13 @@ class AnswerGuard:
             statuses = "、".join(sorted({report["status"] for report in self._reports}))
             return self._terminate("unverified", f"结构化报告状态不可用（{statuses}）")
 
-        if self._direct_category is not None and not self._task_seen:
-            return self._finish_direct()
+        if self._clarification is not None and not self._task_seen:
+            self._buffer.clear()
+            return ("replace", self._clarification)
 
         if self._buffer_text().strip():
-            if self._direct_category is not None:
-                return self._terminate("unverified", "已声明直答但本轮仍调用了 task")
             tools = f"（已见工具：{'、'.join(self._seen_tools)}）" if self._seen_tools else ""
-            return self._terminate("unverified", f"无检索证据且未声明可直接回答{tools}")
+            return self._terminate("unverified", f"无检索证据或有效澄清请求{tools}")
         return ("none", "")
 
 
@@ -202,21 +211,8 @@ class AnswerGuard:
             "\n\n参考来源（内部知识库）："
             f"{'、'.join(sources[:CITATION_SOURCE_LIMIT])}"
         )
-        # 已增量下发的正文保持不变，只把缺失的来源行追加到末尾
-        return ("append", suffix) if self._releasing else ("replace", f"{body}{suffix}")
-
-    def _finish_direct(self) -> tuple[str, str]:
-        text = self._buffer_text()
-        if not text.strip():
-            return ("none", "")
-        # rewrite / provided_text 要原样保留用户文本（其中可能自带“来源：”行），
-        # 只有问候与身份直答不允许出现来源标注。
-        if self._direct_category in ("greeting", "identity"):
-            _, cited = split_answer_and_citations(text)
-            if cited:
-                return self._terminate("unverified", "直答分支不应出现来源标注")
-        self._buffer.clear()
-        return ("replace", text)
+        # 后续依赖任务可能重置正文；最终替换也会移除早先已流出的中间答案。
+        return ("replace", f"{body}{suffix}")
 
     def _buffer_text(self) -> str:
         return "".join(self._buffer)
@@ -312,9 +308,10 @@ def _general_stream(raw_stream, should_stop=None):
 def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
     """把 Agent 的原始消息流包装为"用户可见文本流"。
 
-    严格模式先缓冲模型文本；拿到 status=ok 报告后进入增量放行（边生成边下发），
+    严格模式先缓冲模型文本；收齐任务报告且有 status=ok 时进入增量放行，
     回合结束时校验来源引用：缺少引用时补发“参考来源”行，校验失败则下发 replace
-    事件，用固定文案整段替换已下发内容。没有有效证据的回合始终只输出固定文案。
+    事件，用固定文案整段替换已下发内容。澄清回合只输出工具返回的问句；
+    其余没有有效证据的回合只输出固定文案。
 
     输出元素协议：
     - str：正常文本增量；
@@ -371,10 +368,7 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
                     if event:
                         yield event
                     if hint == "release":
-                        pending = guard.begin_release()
-                        if pending:
-                            emitted.append(pending)
-                            yield pending
+                        guard.begin_release()
                 continue
 
             delta = guard.feed_text(_chunk_text(chunk))
@@ -393,9 +387,7 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
             return
 
         emitted_text = "".join(emitted)
-        if action == "append":
-            yield text
-        elif not emitted_text:
+        if not emitted_text:
             yield text
         elif emitted_text != text:
             # 已下发内容与最终校验结果不一致（引用越界、降级文案等），整段替换

@@ -2,6 +2,7 @@
 llm_request_timeout_seconds: 120
 llm_max_retries: 1
 
+# 检索子代理（rag/retrieval_agent.py）；保留 rag_summary_* 配置键兼容现有部署。
 rag_summary_model: "deepseek-v4.1-flash-1017"
 rag_summary_model_provider: "openai"
 rag_summary_model_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"

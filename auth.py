@@ -53,6 +53,7 @@ REGISTER_RATE_WINDOW_SECONDS = int(os.getenv("REGISTER_RATE_WINDOW_SECONDS", "36
 
 # 对话并发槽位的跨进程咨询锁（advisory lock）命名空间（二参数形式：classid, user_id）。
 _CHAT_SLOT_LOCK_CLASS = 0x64656573
+_CONVERSATION_CREATE_LOCK_CLASS = 0x64656563
 
 
 _pool: ConnectionPool | None = None
@@ -101,13 +102,12 @@ def init_db():
                         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
-                cur.execute("ALTER TABLE users DROP COLUMN IF EXISTS locked_until")
-                cur.execute("ALTER TABLE users DROP COLUMN IF EXISTS failed_attempts")
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS conversations (
                         id          VARCHAR(36) PRIMARY KEY,
                         user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                         title       VARCHAR(255) NOT NULL DEFAULT '新对话',
+                        kb_only     BOOLEAN,
                         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
@@ -119,6 +119,8 @@ def init_db():
                         role            VARCHAR(10) NOT NULL CHECK (role IN ('user', 'assistant')),
                         content         TEXT NOT NULL,
                         status          VARCHAR(20),
+                        generation_id   BIGINT,
+                        kb_only         BOOLEAN,
                         created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
@@ -126,7 +128,6 @@ def init_db():
                     "CREATE INDEX IF NOT EXISTS idx_conversations_user_updated "
                     "ON conversations (user_id, updated_at DESC, id DESC)"
                 )
-                cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS generation_id BIGINT")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_messages_conversation "
                     "ON messages (conversation_id, id)"
@@ -139,6 +140,7 @@ def init_db():
                         conversation_id     VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                         user_id             INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                         request_id          VARCHAR(64) NOT NULL,
+                        kb_only             BOOLEAN,
                         status              VARCHAR(16) NOT NULL DEFAULT 'running'
                             CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
                         cancel_requested    BOOLEAN NOT NULL DEFAULT FALSE,
@@ -163,7 +165,6 @@ def init_db():
                         attempted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
-                cur.execute("ALTER TABLE rate_limits ALTER COLUMN key TYPE VARCHAR(128)")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_rate_limits_lookup "
                     "ON rate_limits (scope, key, attempted_at)"
@@ -325,8 +326,8 @@ def _rate_consume(cur, scope: str, key: str, limit: int, window_seconds: int, no
     return True
 
 
-def check_rate(scope: str, key: str, limit: int, window_seconds: int) -> bool:
-    """记录并检查 key 在窗口期内的尝试次数，超限返回 False。
+def consume_rate_limit(scope: str, key: str, limit: int, window_seconds: int) -> bool:
+    """检查限额并在获准时记录一次尝试、返回 True；超限返回 False。
 
     以数据库为计数载体，并在同一事务内按 (scope, key) 持有事务级咨询锁（advisory lock）：
     检查与插入因此成为原子操作，多进程部署下同一限流键也只会放行到上限，
@@ -352,7 +353,7 @@ def register(username: str, password: str, ip: str | None = None) -> dict:
     if err:
         return {"ok": False, "error": err}
 
-    if ip and not check_rate("register", ip, REGISTER_RATE_LIMIT, REGISTER_RATE_WINDOW_SECONDS):
+    if ip and not consume_rate_limit("register", ip, REGISTER_RATE_LIMIT, REGISTER_RATE_WINDOW_SECONDS):
         return {"ok": False, "error": "注册过于频繁，请稍后再试", "rate_limited": True}
 
     with _connection() as conn:
@@ -463,16 +464,18 @@ def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None)
                 raise ValueError()
         except (ValueError, TypeError, UnicodeError) as exc:
             raise ValueError("无效的会话分页游标") from exc
-        boundary = " AND (updated_at, id) < (%s, %s)"
+        boundary = " AND (c.updated_at, c.id) < (%s, %s)"
         params.extend([stamp, conv_id])
     params.append(limit + 1)
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT id, title, updated_at, "
-                "updated_at AT TIME ZONE current_setting('TIMEZONE') AS display_time "
-                "FROM conversations WHERE user_id = %s" + boundary +
-                " ORDER BY updated_at DESC, id DESC LIMIT %s", params,
+                "SELECT c.id, c.title, c.updated_at, "
+                "c.updated_at AT TIME ZONE current_setting('TIMEZONE') AS display_time, "
+                "EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id) AS has_messages, "
+                "c.kb_only "
+                "FROM conversations c WHERE c.user_id = %s" + boundary +
+                " ORDER BY c.updated_at DESC, c.id DESC LIMIT %s", params,
             )
             rows = cur.fetchall()
     page = rows[:limit]
@@ -484,19 +487,26 @@ def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None)
         ).encode()).decode()
     return {
         "conversations": [{"id": r["id"], "title": r["title"],
-                           "updatedAt": r["display_time"].isoformat()} for r in page],
+                           "updatedAt": r["display_time"].isoformat(),
+                           "hasMessages": r["has_messages"], "kbOnly": r["kb_only"]} for r in page],
         "next_cursor": next_cursor,
     }
 
 
-def list_messages(user_id: int, conv_id: str, limit: int = 50, before: int | None = None) -> dict | None:
-    """验证归属后按消息 ID 向前翻页，页内按时间正序返回。"""
+def list_messages(
+    user_id: int,
+    conv_id: str,
+    limit: int = 50,
+    before: int | None = None,
+) -> dict | None:
+    """验证归属后读取会话消息及固定模式，按 ID 向前翻页，页内正序返回。"""
     limit = max(1, min(limit, 100))
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT id FROM conversations WHERE id = %s AND user_id = %s FOR SHARE",
+            cur.execute("SELECT id, kb_only FROM conversations WHERE id = %s AND user_id = %s FOR SHARE",
                         (conv_id, user_id))
-            if cur.fetchone() is None:
+            conversation = cur.fetchone()
+            if conversation is None:
                 return None
             params: list = [conv_id]
             boundary = ""
@@ -504,27 +514,59 @@ def list_messages(user_id: int, conv_id: str, limit: int = 50, before: int | Non
                 boundary = " AND id < %s"
                 params.append(before)
             params.append(limit + 1)
-            cur.execute("SELECT id, role, content, status FROM messages WHERE conversation_id = %s" +
+            cur.execute('SELECT id, role, content, status, kb_only AS "kbOnly" FROM messages '
+                        "WHERE conversation_id = %s" +
                         boundary + " ORDER BY id DESC LIMIT %s", params)
             rows = cur.fetchall()
     page = rows[:limit]
     return {"messages": list(reversed(page)),
+            "kbOnly": conversation["kb_only"],
             "next_before": page[-1]["id"] if len(rows) > limit else None}
 
 
 
-def create_conversation(user_id: int, conv_id: str, title: str) -> bool:
-    """创建会话；id 已存在（含属于他人的会话）时返回 False，不抛异常。"""
+def create_conversation(user_id: int, conv_id: str, title: str) -> dict | None:
+    """复用用户唯一的空白会话，否则创建；ID 冲突时返回 None。"""
     with _connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO conversations (id, user_id, title) VALUES (%s, %s, %s) "
-                "ON CONFLICT (id) DO NOTHING",
-                (conv_id, user_id, title),
-            )
-            created = cur.rowcount > 0
+        with conn.cursor(row_factory=dict_row) as cur:
+            # 同一用户跨标签页、跨进程的新建操作串行化，不依赖前端是否加载了全部分页。
+            cur.execute("SELECT pg_advisory_xact_lock(%s, %s)",
+                        (_CONVERSATION_CREATE_LOCK_CLASS, user_id))
+            while True:
+                cur.execute(
+                    "SELECT c.id FROM conversations c WHERE c.user_id = %s "
+                    "AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id) "
+                    "ORDER BY c.updated_at DESC, c.id DESC LIMIT 1",
+                    (user_id,),
+                )
+                empty = cur.fetchone()
+                if empty is None:
+                    cur.execute(
+                        "INSERT INTO conversations (id, user_id, title) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (id) DO NOTHING RETURNING id, title, "
+                        "updated_at AT TIME ZONE current_setting('TIMEZONE') AS display_time",
+                        (conv_id, user_id, title),
+                    )
+                    row = cur.fetchone()
+                    break
+                # 与发送、删除共用会话锁，再次核实它仍为空，避免覆盖刚开始的对话。
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(empty["id"]),))
+                cur.execute(
+                    "UPDATE conversations c SET updated_at = CURRENT_TIMESTAMP "
+                    "WHERE c.id = %s AND c.user_id = %s "
+                    "AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id) "
+                    "RETURNING c.id, c.title, "
+                    "c.updated_at AT TIME ZONE current_setting('TIMEZONE') AS display_time",
+                    (empty["id"], user_id),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    break
         conn.commit()
-        return created
+        if row is None:
+            return None
+        return {"id": row["id"], "title": row["title"],
+                "updatedAt": row["display_time"].isoformat(), "hasMessages": False, "kbOnly": None}
 
 
 def update_conversation_title(user_id: int, conv_id: str, title: str) -> bool:
@@ -549,7 +591,7 @@ def _conversation_lock_key(conv_id: str) -> int:
 
 
 _GENERATION_REPLAY_QUERY = """
-    SELECT g.id, g.status, g.error, g.user_message_id, g.assistant_message_id,
+    SELECT g.id, g.status, g.error, g.user_message_id, g.assistant_message_id, g.kb_only,
            m.content AS assistant_content
     FROM generations g
     LEFT JOIN messages m ON m.id = g.assistant_message_id
@@ -565,7 +607,7 @@ def _reap_stale_generations(cur, conv_id: str, stale_seconds: float) -> int:
     running 状态。
     """
     cur.execute(
-        "SELECT id, assistant_message_id FROM generations "
+        "SELECT id, assistant_message_id, kb_only FROM generations "
         "WHERE conversation_id = %s AND status = 'running' "
         "AND heartbeat_at < now() - make_interval(secs => %s) "
         "FOR UPDATE",
@@ -576,9 +618,9 @@ def _reap_stale_generations(cur, conv_id: str, stale_seconds: float) -> int:
         message_id = row["assistant_message_id"]
         if message_id is None:
             cur.execute(
-                "INSERT INTO messages (conversation_id, role, content, status, generation_id) "
-                "VALUES (%s, 'assistant', %s, 'error', %s) RETURNING id",
-                (conv_id, "（回答中断）", row["id"]),
+                "INSERT INTO messages (conversation_id, role, content, status, generation_id, kb_only) "
+                "VALUES (%s, 'assistant', %s, 'error', %s, %s) RETURNING id",
+                (conv_id, "（回答中断）", row["id"], row["kb_only"]),
             )
             message_id = cur.fetchone()["id"]
         cur.execute(
@@ -597,16 +639,20 @@ def begin_generation(
     request_id: str,
     content: str,
     stale_seconds: float,
+    kb_only: bool = True,
 ) -> dict:
     """登记一次生成任务，并原子写入用户消息。
 
     同一会话同时只允许一个运行中的任务（由数据库部分唯一索引保证），
-    同一 request_id 重复到达时返回既有任务，供调用方幂等重放。
+    首次接受消息时固定会话模式，后续请求不得更改；模式绑定与消息原子提交。
+    同一模式的 request_id 重复到达时返回既有任务，跨模式复用则拒绝重放。
 
     返回：
     - {"status": "started", "generation_id": ..., "user_message_id": ...}
     - {"status": "replay", "generation": {...}}
     - {"status": "busy"}
+    - {"status": "mode_conflict"}：请求编号已经用于其他模式
+    - {"status": "conversation_mode_conflict"}：会话已经固定为其他模式
     - {"status": "not_found"}：会话不存在或不属于当前用户
     """
     with _connection() as conn:
@@ -614,12 +660,16 @@ def begin_generation(
             # 与删除会话共用同一把事务级咨询锁（advisory lock），避免「登记—删除」互相穿插
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
             cur.execute(
-                "SELECT id FROM conversations WHERE id = %s AND user_id = %s FOR SHARE",
+                "SELECT id, kb_only FROM conversations WHERE id = %s AND user_id = %s FOR SHARE",
                 (conv_id, user_id),
             )
-            if cur.fetchone() is None:
+            conversation = cur.fetchone()
+            if conversation is None:
                 conn.rollback()
                 return {"status": "not_found"}
+            if conversation["kb_only"] is not None and conversation["kb_only"] != kb_only:
+                conn.rollback()
+                return {"status": "conversation_mode_conflict"}
 
             _reap_stale_generations(cur, conv_id, stale_seconds)
 
@@ -627,13 +677,15 @@ def begin_generation(
             existing = cur.fetchone()
             if existing is not None:
                 conn.commit()
+                if existing["kb_only"] != kb_only:
+                    return {"status": "mode_conflict"}
                 return {"status": "replay", "generation": existing}
 
             try:
                 cur.execute(
-                    "INSERT INTO generations (conversation_id, user_id, request_id) "
-                    "VALUES (%s, %s, %s) RETURNING id",
-                    (conv_id, user_id, request_id),
+                    "INSERT INTO generations (conversation_id, user_id, request_id, kb_only) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    (conv_id, user_id, request_id, kb_only),
                 )
                 generation_id = cur.fetchone()["id"]
             except psycopg.errors.UniqueViolation:
@@ -649,13 +701,15 @@ def begin_generation(
                     conv_exists = cur2.fetchone() is not None
                 conn.commit()
                 if existing is not None:
+                    if existing["kb_only"] != kb_only:
+                        return {"status": "mode_conflict"}
                     return {"status": "replay", "generation": existing}
                 return {"status": "busy" if conv_exists else "not_found"}
 
             cur.execute(
-                "INSERT INTO messages (conversation_id, role, content, generation_id) "
-                "VALUES (%s, 'user', %s, %s) RETURNING id",
-                (conv_id, content, generation_id),
+                "INSERT INTO messages (conversation_id, role, content, generation_id, kb_only) "
+                "VALUES (%s, 'user', %s, %s, %s) RETURNING id",
+                (conv_id, content, generation_id, kb_only),
             )
             user_message_id = cur.fetchone()["id"]
             cur.execute(
@@ -663,8 +717,8 @@ def begin_generation(
                 (user_message_id, generation_id),
             )
             cur.execute(
-                "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = %s",
-                (conv_id,),
+                "UPDATE conversations SET kb_only = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (kb_only, conv_id),
             )
         conn.commit()
         return {
@@ -706,7 +760,7 @@ def finish_generation(
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT conversation_id, status FROM generations WHERE id = %s FOR UPDATE",
+                "SELECT conversation_id, status, kb_only FROM generations WHERE id = %s FOR UPDATE",
                 (generation_id,),
             )
             row = cur.fetchone()
@@ -714,9 +768,9 @@ def finish_generation(
                 conn.rollback()
                 return None
             cur.execute(
-                "INSERT INTO messages (conversation_id, role, content, status, generation_id) "
-                "VALUES (%s, 'assistant', %s, %s, %s) RETURNING id",
-                (row["conversation_id"], content, message_status, generation_id),
+                "INSERT INTO messages (conversation_id, role, content, status, generation_id, kb_only) "
+                "VALUES (%s, 'assistant', %s, %s, %s, %s) RETURNING id",
+                (row["conversation_id"], content, message_status, generation_id, row["kb_only"]),
             )
             message_id = cur.fetchone()["id"]
             cur.execute(

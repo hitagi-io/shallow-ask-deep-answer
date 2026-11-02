@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
-import { apiMe, clearAuth, getUser, setUnauthorizedHandler, type UserInfo } from './api'
+import { apiMe, clearAuth, getStoredUser, setUnauthorizedHandler, type UserInfo } from './api'
 import AuthView from './components/AuthView.vue'
 import WorkspaceView from './components/WorkspaceView.vue'
 
 const user = ref<UserInfo | null>(null)
-const checkingAuth = ref(!!getUser())
+const checkingAuth = ref(!!getStoredUser())
 const authError = ref('')
 
 function endSession(error = '') {

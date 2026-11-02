@@ -14,12 +14,12 @@ import psycopg
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from main_deep_agent import MainDeepAgent, PG_CHECKPOINT_POOL_MAX
+from chat_agent import ChatAgent, PG_CHECKPOINT_POOL_MAX
 from rag.vector_store import get_vector_store
 from rag.index_health import IndexHealth
-from utils.file_tool import list_files_with_allowed_type, get_file_md5_hex, read_md5_set
+from utils.knowledge_files import list_supported_files, compute_file_md5, read_indexed_md5s
 from utils.config_loader import vector_db_config
-from utils.path_tool import get_abs_path
+from utils.project_paths import resolve_project_path
 from utils.pg_lock import SingleInstanceGuard, exclusive_section, shared_section
 from utils.stream_bridge import StreamBridge
 from utils.logging_config import configure_logging, get_logger
@@ -30,7 +30,7 @@ from auth import (
     init_db,
     register,
     login,
-    check_rate,
+    consume_rate_limit,
     verify_token,
     get_user_cached,
     list_conversations,
@@ -120,18 +120,16 @@ app = FastAPI(
     openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
 )
 
-agent = MainDeepAgent()
+init_db()
+
+agent = ChatAgent()
 vector_store = get_vector_store()
 index_health = IndexHealth()
 
-knowledge_dir = get_abs_path(vector_db_config["knowledge_dir"])
+knowledge_dir = resolve_project_path(vector_db_config["knowledge_dir"])
 allowed_types = vector_db_config["allowed_types"]
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
-
-init_db()
-
-
 
 _health_report: dict | None = None
 _health_report_at: float = 0.0
@@ -170,7 +168,7 @@ def _replace_and_index(tmp_path: str, dest: str) -> dict:
     新版本入库并校验通过后才清理旧向量；失败则回滚磁盘文件，旧索引保持可用。
     """
     with _index_write_section():
-        return vector_store.replace_file(dest, tmp_path)
+        return vector_store.replace_and_index_file(dest, tmp_path)
 
 
 def _format_repair_summary(repair: dict) -> str:
@@ -404,9 +402,10 @@ def api_list_messages(
 @app.post("/api/conversations")
 def api_create_conversation(req: CreateConversationRequest, user: dict = Depends(get_current_user)):
     conv_id = str(uuid.uuid4())
-    if not create_conversation(user["user_id"], conv_id, req.title):
+    conversation = create_conversation(user["user_id"], conv_id, req.title)
+    if conversation is None:
         raise HTTPException(status_code=500, detail="创建会话失败，请稍后重试")
-    return {"id": conv_id, "title": req.title, "messages": []}
+    return {**conversation, "messages": []}
 
 
 @app.patch("/api/conversations/{conv_id}")
@@ -524,7 +523,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="消息不能为空")
     if not await asyncio.to_thread(
-        check_rate, "chat", str(user["user_id"]), CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_SECONDS
+        consume_rate_limit, "chat", str(user["user_id"]), CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_SECONDS
     ):
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
 
@@ -547,6 +546,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
             req.request_id,
             req.message,
             CHAT_GENERATION_STALE_SECONDS,
+            req.kb_only,
         )
     except Exception as e:
         await _release_chat_slot(user["user_id"], slot)
@@ -559,6 +559,14 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     if begun["status"] == "busy":
         await _release_chat_slot(user["user_id"], slot)
         raise HTTPException(status_code=409, detail="当前会话已有回答正在生成，请稍后再试")
+
+    if begun["status"] == "mode_conflict":
+        await _release_chat_slot(user["user_id"], slot)
+        raise HTTPException(status_code=409, detail="请求编号已用于其他问答模式，请重新发送")
+
+    if begun["status"] == "conversation_mode_conflict":
+        await _release_chat_slot(user["user_id"], slot)
+        raise HTTPException(status_code=409, detail="此会话的问答模式已固定，请开启新对话后切换模式")
 
     if begun["status"] == "replay":
         generation = begun["generation"]
@@ -630,7 +638,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
             # 共享取消事件：桥接层 stop() 后，kb 模式的缓冲循环也会停止读取上游
             cancel_event = threading.Event()
             bridge = StreamBridge(
-                agent.ask_deep_agent(
+                agent.stream_answer(
                     req.message,
                     thread_key,
                     kb_only=req.kb_only,
@@ -733,11 +741,11 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
 @app.get("/api/files")
 def list_files(user: dict = Depends(require_admin)):
     os.makedirs(knowledge_dir, exist_ok=True)
-    files = list_files_with_allowed_type(knowledge_dir, tuple(allowed_types))
-    indexed_set = read_md5_set()
+    files = list_supported_files(knowledge_dir, tuple(allowed_types))
+    indexed_set = read_indexed_md5s()
     items = []
     for f in files:
-        md5_hex = get_file_md5_hex(f)
+        md5_hex = compute_file_md5(f)
         indexed = bool(md5_hex) and md5_hex in indexed_set
         items.append({"name": os.path.basename(f), "path": f, "indexed": indexed})
     return {"files": items}
@@ -804,9 +812,9 @@ def delete_file(filename: str, user: dict = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="文件不存在")
     try:
         with _index_write_section():
-            md5_hex = get_file_md5_hex(file_path)
+            md5_hex = compute_file_md5(file_path)
             os.remove(file_path)
-            vector_store.delete_file(file_path, md5_hex)
+            vector_store.delete_file_index(file_path, md5_hex)
         return {"message": f"已删除: {safe_name}"}
     except TimeoutError as e:
         logger.error(f"[知识库] 删除失败 file={safe_name}：等待索引写锁超时（{e}）")
@@ -819,11 +827,13 @@ def delete_file(filename: str, user: dict = Depends(require_admin)):
         raise HTTPException(status_code=500, detail="文件已删除，但向量/索引记录清理失败，请稍后执行一次「修复」")
 
 
-@app.post("/api/vector/build")
-def build_vector(user: dict = Depends(require_admin)):
+# 保留路由名，以维持原有反向路由名称和 OpenAPI operationId。
+@app.post("/api/vector/build", name="build_vector")
+def build_knowledge_index(user: dict = Depends(require_admin)):
+    """为缺少 MD5 索引记录的知识库内容补建索引。"""
     try:
         with _index_write_section():
-            failures = vector_store.do_store()
+            failures = vector_store.index_pending_files()
     except TimeoutError as e:
         logger.error(f"[知识库] 构建失败：等待索引写锁超时（{e}）")
         raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
