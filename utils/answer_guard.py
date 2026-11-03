@@ -206,13 +206,19 @@ class AnswerGuard:
                 "unverified", f"回答引用了本轮检索证据之外的文件：{'、'.join(invalid)}"
             )
 
-        self._buffer.clear()
         if cited:
+            self._buffer.clear()
             return ("replace", text)
+        # 召回过的文件不一定支撑回答。只有每份成功报告都明确给出引用时，
+        # 才能为缺失来源行的整合回答补齐出处；部分报告缺引用也不能猜测。
+        if any(not report["cited_sources"] for report in ok_reports):
+            return self._terminate("unverified", "回答未标注来源，且部分成功报告缺少引用归属")
+        cited_sources = _merge_sources(ok_reports, field="cited_sources")
         suffix = (
             "\n\n参考来源（内部知识库）："
-            f"{'、'.join(sources[:CITATION_SOURCE_LIMIT])}"
+            f"{'、'.join(cited_sources[:CITATION_SOURCE_LIMIT])}"
         )
+        self._buffer.clear()
         # 后续依赖任务可能重置正文；最终替换也会移除早先已流出的中间答案。
         return ("replace", f"{body}{suffix}")
 
@@ -311,8 +317,9 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
     """把 Agent 的原始消息流包装为"用户可见文本流"。
 
     严格模式先缓冲模型文本；收齐任务报告且有 status=ok 时进入增量放行，
-    回合结束时校验来源引用：缺少引用时补发“参考来源”行，校验失败则下发 replace
-    事件，用固定文案整段替换已下发内容。澄清回合只输出工具返回的问句；
+    回合结束时校验来源引用：缺少引用时仅按各成功报告的明确引用补发来源行。
+    需要自动补引用但任一成功报告缺少引用归属时，或显式引用校验失败时，
+    下发 replace 事件，用固定文案整段替换已下发内容。澄清回合只输出工具返回的问句；
     其余没有有效证据的回合只输出固定文案。
 
     输出元素协议：
@@ -403,10 +410,10 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
                 logger.error(f"[输出校验] 关闭上游消息流失败，继续结束请求：{e}")
 
 
-def _merge_sources(reports: list[dict]) -> list[str]:
+def _merge_sources(reports: list[dict], field: str = "sources") -> list[str]:
     sources = []
     for report in reports:
-        for source in report["sources"]:
+        for source in report[field]:
             if source not in sources:
                 sources.append(source)
     return sources

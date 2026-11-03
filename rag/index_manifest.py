@@ -79,7 +79,7 @@ class ManifestStore:
 
     def __init__(self, config: dict):
         self.conninfo = os.getenv(
-            "PG_CONNECTION_STRING", "postgresql://postgres:postgres@localhost:5432/deepagent_rag"
+            "PG_CONNECTION_STRING", "postgresql://postgres:postgres@localhost:5432/shallow_ask_deep_answer"
         )
         self.namespace = text_sha256(json.dumps([
             config["milvus_uri"], config["collection_name"],

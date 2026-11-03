@@ -10,7 +10,7 @@ import logging
 import os
 
 
-LOGGER_NAME = "deepagent_rag"
+LOGGER_NAME = "shallow_ask_deep_answer"
 _CONFIGURED = False
 
 

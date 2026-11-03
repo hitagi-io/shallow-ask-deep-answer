@@ -12,7 +12,7 @@ import { useConfirmation } from '../composables/useConfirmation'
 
 const props = defineProps<{ user: UserInfo }>()
 const emit = defineEmits<{ logout: [] }>()
-const MODE_KEY = 'deepagent_mode'
+const MODE_KEY = 'shallow_ask_deep_answer_mode'
 const isAdmin = computed(() => props.user.role === 'admin')
 const mode = ref<AppMode>(isAdmin.value && localStorage.getItem(MODE_KEY) === 'knowledge' ? 'knowledge' : 'chat')
 watch(mode, value => localStorage.setItem(MODE_KEY, value), { immediate: true })

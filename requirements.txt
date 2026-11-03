@@ -1,36 +1,37 @@
-# Python 3.12.13（项目 conda 环境；核对时须禁用用户级 site-packages）
-# 安装：python -m pip install -r requirements.txt
-# 核对：PYTHONNOUSERSITE=1 python -m pip list
+# 版本基于 shallow-ask-deep-answer 环境（Python 3.13.18）核对
+# 在目标虚拟环境中执行；-s 禁用用户级 site-packages
+# 安装：python -s -m pip install -r requirements.txt
+# 检查：python -s -m pip check
 
 # Agent / LLM
-deepagents==0.5.3
-langchain==1.3.14
-langchain-core==1.7.0
-langchain-openai==1.3.5
+deepagents==0.7.32
+langchain==1.4.8
+langchain-core==1.7.4
+langchain-openai==1.7.3
 langchain-community==0.4.2
 langchain-text-splitters==1.1.3
 langchain-tavily==0.2.18
-langgraph==1.2.9
-langgraph-checkpoint-postgres==3.1.3
+langgraph==1.2.19
+langgraph-checkpoint-postgres==3.2.0
 
 # 检索 / 解析
 langchain-milvus==0.4.0
-pymilvus==3.0.1
-dashscope==2.0.1
-pypdf==6.21.2
+pymilvus==3.0.2
+dashscope==2.0.3
+pypdf==6.21.4
 docx2txt==0.9
 
 # API / 存储
-fastapi==0.141.1
+fastapi==0.162.0
 uvicorn[standard]==0.54.0
-python-multipart==0.0.32
-pydantic==2.14.1
-psycopg[binary,pool]==3.3.5
-psycopg-pool==3.3.1
-anyio==4.15.1
+python-multipart==0.0.33
+pydantic==2.14.2
+psycopg[binary,pool]==3.3.7
+psycopg-pool==3.3.3
+anyio==4.16.0
 
 # 认证 / 配置
 PyJWT==2.15.1
-argon2-cffi==23.1.0
+argon2-cffi==25.1.0
 python-dotenv==1.2.4
 PyYAML==6.0.3

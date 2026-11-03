@@ -22,7 +22,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   }
   const conversations = ref<Record<string, Conversation>>({})
   const currentId = ref('')
-  const selectionKey = `deepagent_conversation_${getStoredUser()?.id ?? ''}`
+  const selectionKey = `shallow_ask_deep_answer_conversation_${getStoredUser()?.id ?? ''}`
   const drafts = ref<Record<string, string>>({})
   const input = computed({ get: () => drafts.value[currentId.value] || '', set: value => { drafts.value[currentId.value] = value } })
   const loading = ref(false)

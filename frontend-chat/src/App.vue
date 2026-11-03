@@ -12,7 +12,7 @@ function endSession(error = '') {
   clearAuth()
   user.value = null
   authError.value = error
-  localStorage.setItem('deepagent_mode', 'chat')
+  localStorage.setItem('shallow_ask_deep_answer_mode', 'chat')
 }
 setUnauthorizedHandler(() => endSession('登录已过期，请重新登录'))
 onMounted(async () => {

@@ -49,8 +49,8 @@ export interface FileItem {
 
 // ---------- auth helpers ----------
 
-const TOKEN_KEY = 'deepagent_token'
-const USER_KEY = 'deepagent_user'
+const TOKEN_KEY = 'shallow_ask_deep_answer_token'
+const USER_KEY = 'shallow_ask_deep_answer_user'
 
 function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)

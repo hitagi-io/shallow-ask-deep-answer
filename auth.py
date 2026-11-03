@@ -26,7 +26,7 @@ logger = get_logger(__name__)
 
 load_dotenv()
 
-PG_CONN = os.getenv("PG_CONNECTION_STRING", "postgresql://postgres:postgres@localhost:5432/deepagent_rag")
+PG_CONN = os.getenv("PG_CONNECTION_STRING", "postgresql://postgres:postgres@localhost:5432/shallow_ask_deep_answer")
 PG_POOL_MIN = int(os.getenv("PG_POOL_MIN", "2"))
 # 多 worker 部署时需把业务池与检查点池的总量控制在 PG 上限内。
 PG_POOL_MAX = int(os.getenv("PG_POOL_MAX", "20"))
