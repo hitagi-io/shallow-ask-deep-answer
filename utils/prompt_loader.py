@@ -1,6 +1,7 @@
 import os
 from string import Template
 
+from utils.config_loader import get_kb_subagent_max_retrieval_calls
 from utils.answer_guard import (
     COPY_KB_DOWN,
     COPY_KB_MISS,
@@ -46,6 +47,7 @@ def render_kb_agent_prompt():
     """
     return _render(
         'kb_agent_prompt.txt',
+        kb_subagent_max_retrieval_calls=get_kb_subagent_max_retrieval_calls(),
         report_protocol=REPORT_PROTOCOL,
         status_ok=STATUS_OK,
         status_empty=STATUS_EMPTY,
@@ -62,6 +64,7 @@ def render_retrieval_agent_prompt():
     """渲染检索子代理提示词，并注入协议标记和固定文案。"""
     return _render(
         'retrieval_agent_prompt.txt',
+        kb_subagent_max_retrieval_calls=get_kb_subagent_max_retrieval_calls(),
         sentinel_kb_down=SENTINEL_KB_DOWN,
         sentinel_kb_miss=SENTINEL_KB_MISS,
         retrieval_error_marker=RETRIEVAL_ERROR_MARKER,

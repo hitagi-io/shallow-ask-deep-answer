@@ -136,3 +136,8 @@ class ManifestStore:
         with self._connect() as conn:
             conn.execute("DELETE FROM index_manifests WHERE namespace = %s AND content_sha256 = %s",
                          (self.namespace, content_sha256))
+
+    def delete_all(self) -> None:
+        """只删除当前项目的索引清单。"""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM index_manifests WHERE namespace = %s", (self.namespace,))

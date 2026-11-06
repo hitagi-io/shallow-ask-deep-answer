@@ -4,10 +4,12 @@ import json
 from urllib.parse import urlsplit
 
 from utils.answer_guard import SEARCH_EMPTY_MARKER, SEARCH_ERROR_MARKER
+from utils.config_loader import agent_config
 
 
-SEARCH_RESULT_LIMIT = 5
-SEARCH_CONTENT_LIMIT = 3000
+# 配置在导入时已校验；请求、裁剪和模型可见的工具描述共用这些值。
+SEARCH_RESULT_LIMIT = agent_config["search_result_limit"]
+SEARCH_CONTENT_LIMIT = agent_config["search_content_limit"]
 
 
 def _text(value: object) -> str:

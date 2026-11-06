@@ -26,6 +26,8 @@ export interface ConversationSummary {
   hasMessages: boolean
   /** 首次发送后固定的会话模式；空白会话可在本地切换。 */
   kbOnly: boolean | null
+  project_id: string | null
+  project_name: string | null
 }
 
 export interface Conversation extends ConversationSummary, MessageHistory {}
@@ -37,7 +39,13 @@ export function withEmptyHistory(summary: ConversationSummary): Conversation {
 export interface UserInfo {
   id: number
   username: string
-  role: 'user' | 'admin'
+}
+
+export interface Project {
+  id: string
+  name: string
+  created_at: string
+  updated_at: string
 }
 
 export interface FileItem {
@@ -86,6 +94,7 @@ function authHeaders(): Record<string, string> {
 
 // 401 统一回调：由应用层注册（清空登录态并展示登录页）
 let unauthorizedHandler: (() => void) | null = null
+let credentialChange: Promise<void> | null = null
 
 export function setUnauthorizedHandler(fn: (() => void) | null) {
   unauthorizedHandler = fn
@@ -96,10 +105,12 @@ export function setUnauthorizedHandler(fn: (() => void) | null) {
  * 统一清除本地凭证并通知应用层回到登录页。
  * 登录接口不使用它——那里的 401 表示账号密码错误，而非会话过期。
  */
-async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+async function apiFetch(input: string, init?: RequestInit, waitForCredentialChange = true): Promise<Response> {
   const token = getToken()
   const res = await fetch(input, init)
-  if (res.status === 401 && token === getToken()) {
+  // An old in-flight request may be rejected between password rotation and saving the new token.
+  if (res.status === 401 && waitForCredentialChange && credentialChange) await credentialChange
+  if (!init?.signal?.aborted && res.status === 401 && token === getToken()) {
     clearAuth()
     unauthorizedHandler?.()
   }
@@ -144,10 +155,48 @@ export async function apiLogin(username: string, password: string): Promise<User
 }
 
 export async function apiMe(): Promise<UserInfo> {
+  const token = getToken()
   const res = await apiFetch('/api/auth/me', { headers: authHeaders() })
   if (!res.ok) throw new Error('未登录')
   const data = await res.json()
+  if (!token || token !== getToken()) throw new Error('登录状态已变更')
+  localStorage.setItem(USER_KEY, JSON.stringify(data.user))
   return data.user
+}
+
+export async function apiUpdateAccount(changes: { username?: string; current_password?: string; new_password?: string }): Promise<UserInfo> {
+  if (credentialChange) throw new Error('账号信息正在保存，请稍候')
+  let settle!: () => void
+  credentialChange = new Promise<void>(resolve => { settle = resolve })
+  try {
+    const res = await apiFetch('/api/auth/me', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify(changes),
+    }, false)
+    if (!res.ok) throw new Error(await errorMessage(res, '保存失败，请重试'))
+    const data = await res.json()
+    if (changes.new_password !== undefined || data.reauthenticate) clearAuth()
+    else saveAuth(data.token, data.user)
+    return data.user
+  } finally { credentialChange = null; settle() }
+}
+
+export async function apiVerifyDeletion(password: string): Promise<{ confirmation_token: string; confirmation_text: string }> {
+  const res = await apiFetch('/api/auth/deletion-verification', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ password }),
+  })
+  if (!res.ok) throw new Error(await errorMessage(res, '身份验证失败，请重试'))
+  return res.json()
+}
+
+export async function apiDeleteAccount(confirmation_token: string, confirmation_text: string): Promise<void> {
+  const res = await apiFetch('/api/auth/me', {
+    method: 'DELETE', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ confirmation_token, confirmation_text }),
+  })
+  if (!res.ok) throw new Error(await errorMessage(res, '未能确认注销结果，请重新登录查看账号状态后再试'))
+  clearAuth()
 }
 
 // ---------- conversation API ----------
@@ -163,7 +212,7 @@ export async function fetchConversations(cursor?: string | null): Promise<{
 }
 
 export async function fetchMessages(id: string, before?: number | null): Promise<{
-  messages: Message[]; next_before: number | null; kbOnly: boolean | null; active_generation: { request_id: string } | null
+  messages: Message[]; next_before: number | null; kbOnly: boolean | null; project_id: string | null; project_name: string | null; active_generation: { request_id: string } | null
 }> {
   const query = new URLSearchParams({ limit: '50' })
   if (before != null) query.set('before', String(before))
@@ -217,6 +266,8 @@ export interface GenerationSnapshot {
   assistant_message_id: number
   user_message_id: number
   kb_only: boolean
+  project_id: string | null
+  project_name: string | null
   elapsed_seconds: number
   phase: string
   error: string | null
@@ -255,7 +306,7 @@ export async function streamChat(
   onSnapshot: (snapshot: GenerationSnapshot) => void,
   onConnection: (reconnecting: boolean) => void,
   signal: AbortSignal,
-  submission?: { message: string; kbOnly: boolean },
+  submission?: { message: string; kbOnly: boolean; projectId: string | null },
 ): Promise<StreamOutcome> {
   let started = !submission
   let submit = submission
@@ -268,7 +319,7 @@ export async function streamChat(
       const res = await apiFetch(initial ? '/api/chat/stream' : `${generationPath(conversationId, requestId)}/stream`, {
         method: initial ? 'POST' : 'GET',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: initial ? JSON.stringify({ message: initial.message, thread_id: conversationId, request_id: requestId, kb_only: initial.kbOnly }) : undefined,
+        body: initial ? JSON.stringify({ message: initial.message, thread_id: conversationId, request_id: requestId, kb_only: initial.kbOnly, project_id: initial.projectId }) : undefined,
         signal,
       })
       if (!res.ok) {
@@ -319,14 +370,75 @@ export async function streamChat(
 
 // ---------- knowledge API ----------
 
-export async function fetchFiles(): Promise<FileItem[]> {
-  const res = await apiFetch('/api/files', { headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '获取文件列表失败'))
-  const data = await res.json()
+function projectPath(id: string) { return `/api/projects/${encodeURIComponent(id)}` }
+
+function knowledgeTimeout(value: unknown): number {
+  const milliseconds = Number(value)
+  return Number.isFinite(milliseconds) && milliseconds > 0 && milliseconds <= 2_147_483_647
+    ? milliseconds : 65_000
+}
+
+export const KNOWLEDGE_REQUEST_TIMEOUT_MS = knowledgeTimeout(import.meta.env?.VITE_KNOWLEDGE_REQUEST_TIMEOUT_MS)
+export interface KnowledgeRequestOptions { signal?: AbortSignal; timeoutMs?: number }
+export function isRequestCancelled(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError'
+}
+
+async function fetchKnowledgeJson<T>(url: string, fallback: string, options: KnowledgeRequestOptions): Promise<T> {
+  const controller = new AbortController()
+  const cancel = () => controller.abort(new DOMException('请求已取消', 'AbortError'))
+  const timeout = setTimeout(() => controller.abort(new DOMException('读取知识库状态超时，请稍后重试', 'TimeoutError')),
+    options.timeoutMs === undefined ? KNOWLEDGE_REQUEST_TIMEOUT_MS : knowledgeTimeout(options.timeoutMs))
+  let rejectAborted: () => void = () => {}
+  const aborted = new Promise<never>((_, reject) => {
+    rejectAborted = () => reject(controller.signal.reason)
+    controller.signal.addEventListener('abort', rejectAborted, { once: true })
+  })
+  options.signal?.addEventListener('abort', cancel, { once: true })
+  if (options.signal?.aborted) cancel()
+  try {
+    // Keep the deadline active through response parsing, including error responses.
+    const request = async () => {
+      controller.signal.throwIfAborted()
+      const res = await apiFetch(url, { headers: authHeaders(), signal: controller.signal })
+      controller.signal.throwIfAborted()
+      if (!res.ok) throw new Error(await errorMessage(res, fallback))
+      return await res.json() as T
+    }
+    return await Promise.race([request(), aborted])
+  } finally {
+    clearTimeout(timeout)
+    options.signal?.removeEventListener('abort', cancel)
+    controller.signal.removeEventListener('abort', rejectAborted)
+  }
+}
+
+export async function fetchProjects(): Promise<Project[]> {
+  const res = await apiFetch('/api/projects', { headers: authHeaders() })
+  if (!res.ok) throw new Error(await errorMessage(res, '获取项目失败'))
+  return (await res.json()).projects
+}
+
+export async function saveProject(name: string, id?: string): Promise<Project> {
+  const res = await apiFetch(id ? projectPath(id) : '/api/projects', {
+    method: id ? 'PATCH' : 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ name }),
+  })
+  if (!res.ok) throw new Error(await errorMessage(res, id ? '重命名项目失败' : '创建项目失败'))
+  return (await res.json()).project
+}
+
+export async function deleteProject(id: string): Promise<void> {
+  const res = await apiFetch(projectPath(id), { method: 'DELETE', headers: authHeaders() })
+  if (!res.ok) throw new Error(await errorMessage(res, '删除项目失败'))
+}
+
+export async function fetchFiles(projectId: string, options: KnowledgeRequestOptions = {}): Promise<FileItem[]> {
+  const data = await fetchKnowledgeJson<{ files: FileItem[] }>(`${projectPath(projectId)}/files`, '获取文件列表失败', options)
   return data.files
 }
 
-export async function uploadFiles(files: File[], onUploaded?: () => void, signal?: AbortSignal): Promise<{
+export async function uploadFiles(projectId: string, files: File[], onUploaded?: () => void, signal?: AbortSignal): Promise<{
   uploaded: { name: string; overwritten: boolean; indexed: boolean; error: string | null }[]
   errors: { name: string; error: string }[]
 }> {
@@ -335,7 +447,7 @@ export async function uploadFiles(files: File[], onUploaded?: () => void, signal
   const token = getToken()
   const res = await new Promise<Response>((resolve, reject) => {
     const xhr = new XMLHttpRequest()
-    xhr.open('POST', '/api/files/upload')
+    xhr.open('POST', `${projectPath(projectId)}/files/upload`)
     for (const [key, value] of Object.entries(authHeaders())) xhr.setRequestHeader(key, value)
     const abort = () => xhr.abort()
     xhr.upload.onload = () => onUploaded?.()
@@ -354,14 +466,14 @@ export async function uploadFiles(files: File[], onUploaded?: () => void, signal
   return res.json()
 }
 
-export async function deleteFile(name: string): Promise<void> {
-  const res = await apiFetch(`/api/files/${encodeURIComponent(name)}`, { method: 'DELETE', headers: authHeaders() })
+export async function deleteFile(projectId: string, name: string): Promise<void> {
+  const res = await apiFetch(`${projectPath(projectId)}/files/${encodeURIComponent(name)}`, { method: 'DELETE', headers: authHeaders() })
   if (!res.ok) throw new Error(await errorMessage(res, '删除失败'))
 }
 
 /** 为尚未记录的知识库内容补建索引。 */
-export async function buildKnowledgeIndex(): Promise<{ message: string; failures: { file: string; error: string }[] }> {
-  const res = await apiFetch('/api/vector/build', { method: 'POST', headers: authHeaders() })
+export async function buildKnowledgeIndex(projectId: string): Promise<{ message: string; failures: { file: string; error: string }[] }> {
+  const res = await apiFetch(`${projectPath(projectId)}/vector/build`, { method: 'POST', headers: authHeaders() })
   if (!res.ok) throw new Error(await errorMessage(res, '构建失败'))
   return res.json()
 }
@@ -391,14 +503,12 @@ export interface HealthReport {
   }
 }
 
-export async function fetchIndexHealth(refresh = false): Promise<HealthReport> {
-  const res = await apiFetch(`/api/index/health${refresh ? '?refresh=1' : ''}`, { headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '获取索引健康状态失败'))
-  return res.json()
+export async function fetchIndexHealth(projectId: string, refresh = false, options: KnowledgeRequestOptions = {}): Promise<HealthReport> {
+  return fetchKnowledgeJson<HealthReport>(`${projectPath(projectId)}/index/health${refresh ? '?refresh=1' : ''}`, '获取索引健康状态失败', options)
 }
 
-export async function repairIndexHealth(): Promise<HealthReport> {
-  const res = await apiFetch('/api/index/health/repair', { method: 'POST', headers: authHeaders() })
+export async function repairIndexHealth(projectId: string): Promise<HealthReport> {
+  const res = await apiFetch(`${projectPath(projectId)}/index/health/repair`, { method: 'POST', headers: authHeaders() })
   if (!res.ok) throw new Error(await errorMessage(res, '修复失败'))
   return res.json()
 }

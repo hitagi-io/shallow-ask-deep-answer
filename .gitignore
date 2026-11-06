@@ -39,9 +39,6 @@ frontend-chat/dist/
 .env.*
 !.env.example
 
-# Knowledge base
-/knowledge/
-
 # Testing and Linting
 .pytest_cache/
 .mypy_cache/

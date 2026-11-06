@@ -28,6 +28,11 @@ const emit = defineEmits<{
   logout: []
 }>()
 const showGearMenu = ref(false)
+const gearButton = ref<HTMLButtonElement | null>(null)
+function closeGearMenu() {
+  showGearMenu.value = false
+  gearButton.value?.focus()
+}
 const conversationMenuId = ref('')
 function closeConversationMenu(restoreFocus = false) {
   const trigger = sidebar.value?.querySelector<HTMLButtonElement>('.conv-more[aria-expanded="true"]')
@@ -96,8 +101,11 @@ function toggleGearMenu() {
 }
 
 function navigateToKnowledge() {
+  navigateTo('knowledge')
+}
+function navigateTo(mode: AppMode) {
   showGearMenu.value = false
-  emit('navigate', 'knowledge')
+  emit('navigate', mode)
 }
 onMounted(() => document.addEventListener('click', onDocumentClick))
 onUnmounted(() => document.removeEventListener('click', onDocumentClick))
@@ -123,14 +131,19 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
 
     <input v-if="searchOpen" id="conversation-search" ref="searchInput" v-model="search" class="filter-input conversation-search" placeholder="搜索已加载的对话" aria-label="搜索已加载的对话" type="search" @keydown.esc.stop="toggleSearch" />
 
-    <ul class="conv-list">
-      <li v-if="!groups.length" class="no-results">没有匹配的对话</li>
+    <nav class="workspace-nav" aria-label="工作空间">
+      <button class="knowledge-entry" @click="navigateToKnowledge"><AppIcon name="book" :size="18" /><span>知识库</span><span v-if="healthIssueCount > 0" class="nav-badge">{{ healthIssueCount }}</span><AppIcon v-else name="arrow-up-right" :size="15" /></button>
+    </nav>
+    <div class="history-label"><span>最近对话</span><span class="history-count">{{ convList.length }}{{ hasMore ? '+' : '' }}</span></div>
+    <ul class="conv-list" aria-label="对话历史">
+      <li v-if="!groups.length" class="no-results">{{ search ? '没有找到匹配的对话' : '从一个问题开始，记录会保存在这里' }}</li>
       <template v-for="group in groups" :key="group.label">
       <li class="date-group">{{ group.label }}</li>
       <li v-for="c in group.items" :key="c.id" class="conversation-item" :class="{ active: c.id === currentId, 'menu-open': conversationMenuId === c.id }" @keydown.esc.stop="closeConversationMenu(true)">
         <button class="conv-btn" :disabled="conversationBusy" :aria-current="c.id === currentId ? 'page' : undefined" @click="emit('selectConversation', c.id)">
 
           <span class="conv-title">{{ c.title }}</span>
+          <span v-if="processingIds.includes(c.id)" class="conversation-progress" role="status" aria-label="正在生成回答"></span>
         </button>
         <button class="conv-more" :disabled="conversationBusy" :aria-expanded="conversationMenuId === c.id" :aria-controls="`conversation-actions-${c.id}`" :aria-label="`${c.title}的更多操作`" title="更多操作" @click="conversationMenuId = conversationMenuId === c.id ? '' : c.id">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
@@ -158,23 +171,22 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
       <div class="divider"></div>
       <div class="user-area">
         <div class="user-info">
-          <span class="user-avatar">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M12 12C14.7614 12 17 9.76142 17 7C17 4.23858 14.7614 2 12 2C9.23858 2 7 4.23858 7 7C7 9.76142 9.23858 12 12 12Z" fill="currentColor"/><path d="M12 14C7.58172 14 4 17.5817 4 22H20C20 17.5817 16.4183 14 12 14Z" fill="currentColor"/></svg>
-          </span>
-          <span class="user-name">{{ user.username }}</span>
-          <span class="user-role" :class="user.role">{{ user.role === 'admin' ? '管理员' : '用户' }}</span>
+          <span class="user-avatar" aria-hidden="true">{{ user.username.slice(0, 1).toLocaleUpperCase() }}</span>
+          <div class="user-details"><span class="user-name">{{ user.username }}</span><span class="user-space">我的私有空间</span></div>
         </div>
-        <div class="gear-wrapper">
-          <button class="btn-gear" @click="toggleGearMenu" title="设置">
+        <div class="gear-wrapper" @keydown.esc.stop="closeGearMenu">
+          <button ref="gearButton" class="btn-gear" @click="toggleGearMenu" title="账号设置" aria-label="账号设置" :aria-expanded="showGearMenu" aria-controls="account-menu">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.66a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             <span v-if="healthIssueCount > 0" class="badge">{{ healthIssueCount }}</span>
           </button>
-          <div v-if="showGearMenu" class="gear-menu">
-            <button v-if="user.role === 'admin'" @click="navigateToKnowledge">
+          <div v-if="showGearMenu" id="account-menu" class="gear-menu" role="group" aria-label="账号操作">
+            <button @click="navigateTo('account')">编辑信息</button>
+            <button @click="navigateToKnowledge">
               管理知识库
               <span v-if="healthIssueCount > 0" class="badge menu-badge">{{ healthIssueCount }}</span>
             </button>
-            <button class="logout-item" @click="emit('logout')">退出登录</button>
+            <button @click="navigateTo('about')">关于</button>
+            <button class="logout-item" @click="showGearMenu = false; emit('logout')">退出登录</button>
           </div>
         </div>
       </div>
@@ -189,59 +201,67 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
 </template>
 
 <style scoped>
-.conversation-search { margin: 0 10px 12px; width: calc(100% - 20px); }
-.conv-list .date-group, .conv-list .no-results { padding: 10px 12px; font-size: 11px; color: var(--muted); background: transparent; }
-.rename-form { display: flex; flex-direction: column; gap: 16px; }
-.rename-form input { width: 100%; min-width: 0; }
-.rename-form button { align-self: flex-end; }
-.sidebar { width: 256px; flex-shrink: 0; padding: 24px 12px 12px; background: var(--sidebar); display: flex; flex-direction: column; border-right: 1px solid var(--line); }
-.sidebar-header { display: flex; align-items: center; gap: 8px; padding: 0 8px 24px; flex-wrap: wrap; }
-.brand { display: flex; gap: 9px; align-items: center; flex: 1; white-space: nowrap; }
-.brand-name { font-weight: 650; font-size: 16px; letter-spacing: -.3px; }
-.btn-search { width: 30px; height: 30px; flex-shrink: 0; display: grid; place-items: center; border-radius: 6px; color: var(--muted); }
-.btn-search:hover, .btn-search.active { background: var(--hover); color: var(--text); }
-.btn-new { display: flex; align-items: center; gap: 9px; width: 100%; margin-top: 20px; padding: 10px 12px; background: var(--bg); border: 1px solid #dedede; border-radius: 9px; text-align: left; font-size: 13px; box-shadow: 0 1px 2px #00000004; }
-.btn-new:hover:not(:disabled) { background: var(--hover); }
+.sidebar { width: 276px; flex-shrink: 0; padding: 24px 16px 16px; background: var(--sidebar); display: flex; flex-direction: column; border-right: 1px solid var(--line); }
+.sidebar-header { display: flex; align-items: center; gap: 4px; padding: 0 4px 16px; flex-wrap: wrap; }
+.brand { display: flex; gap: 8px; align-items: center; flex: 1; white-space: nowrap; }
+.brand-name { font-weight: 650; font-size: 17px; letter-spacing: -.4px; }
+.btn-search, .mobile-close, .btn-gear { width: 32px; height: 32px; flex-shrink: 0; display: grid; place-items: center; border-radius: var(--radius-control); color: var(--muted); transition: background-color var(--duration-fast), color var(--duration-fast); }
+.btn-search:hover, .btn-search.active, .mobile-close:hover, .btn-gear:hover { background: var(--hover); color: var(--accent); }
+.btn-new { display: flex; align-items: center; justify-content: center; gap: 9px; width: 100%; min-height: 42px; margin-top: 24px; padding: 10px 12px; background: var(--accent); color: var(--on-accent); border: 1px solid transparent; border-radius: var(--radius-control); font-size: 13px; font-weight: 550; box-shadow: var(--shadow-sm); transition: background-color var(--duration-fast); }
+.btn-new:hover:not(:disabled) { background: var(--accent-hover); }
+.workspace-nav { padding: 0 4px 20px; margin-bottom: 16px; border-bottom: 1px solid var(--line); }
+.knowledge-entry { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 40px; padding: 8px 10px; border-radius: var(--radius-control); color: var(--muted); font-size: 13px; text-align: left; }
+.knowledge-entry > span:first-of-type { flex: 1; }
+.knowledge-entry:hover { background: var(--hover); color: var(--accent); }
+.nav-badge { min-width: 20px; padding: 1px 6px; border-radius: 6px; background: var(--warning-bg); color: var(--warning); font-size: 11px; text-align: center; }
+.history-label { display: flex; align-items: center; justify-content: space-between; padding: 0 12px 10px; font-size: 12px; color: var(--muted); }
+.history-count { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 11px; }
+.conversation-search { margin: 0 4px 16px; width: calc(100% - 8px); }
 .conv-list { list-style: none; margin: 0; padding: 0; flex: 1; overflow-y: auto; min-height: 0; }
-.conv-list li { display: flex; align-items: center; border-radius: 7px; margin-bottom: 3px; }
-.conv-list li:hover, .conv-list li.active { background: var(--hover); }
-.conv-btn { flex: 1; min-width: 0; padding: 10px 12px; text-align: left; font-size: 13px; }
+.conv-list li { display: flex; align-items: center; border-radius: var(--radius-control); margin-bottom: 4px; }
+.conv-list .date-group, .conv-list .no-results { padding: 10px 12px; font-size: 12px; color: var(--muted); background: transparent; }
+.conv-list .date-group { margin: 4px 0; font-size: 11px; }
+.conv-list .no-results { padding: 24px 16px; text-align: center; line-height: 1.9; }
+.conversation-item { flex-wrap: wrap; transition: background-color var(--duration-fast); border: 1px solid transparent; }
+.conversation-item:hover { background: var(--hover); }
+.conversation-item.active { background: var(--bg); border-color: var(--line); box-shadow: var(--shadow-sm); color: var(--accent); }
+.conv-btn { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; min-height: 40px; padding: 9px 11px; text-align: left; font-size: 13px; }
+.conv-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conversation-progress { flex-shrink: 0; width: 6px; height: 6px; margin-left: auto; border-radius: 50%; background: var(--accent); animation: pulse 1.3s ease-in-out infinite; }
+.conv-more { width: 30px; height: 30px; margin-right: 4px; flex-shrink: 0; display: grid; place-items: center; opacity: 0; color: var(--muted); border-radius: 7px; }
+.conversation-item:hover .conv-more, .conversation-item:focus-within .conv-more, .conversation-item.active .conv-more, .conversation-item.menu-open .conv-more { opacity: 1; }
+.conv-more:hover { color: var(--text); background: var(--hover); }
+.conversation-menu { flex-basis: 100%; margin: 0 6px 6px; padding: 4px; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--bg); box-shadow: var(--shadow-sm); }
+.conversation-menu button { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 34px; padding: 8px; border-radius: 7px; text-align: left; font-size: 12px; }
+.conversation-menu button:hover:not(:disabled) { background: var(--surface); }
+.conversation-menu .delete-action { color: var(--danger); }
 .conv-list .conversation-pagination { justify-content: center; margin: 12px 8px 4px; padding-top: 12px; border-top: 1px solid var(--line); border-radius: 0; background: transparent; }
-.load-more-button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 7px 12px; border: 1px solid var(--line); border-radius: 16px; color: var(--muted); font-size: 12px; }
+.load-more-button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 34px; padding: 7px 12px; border: 1px solid var(--line); border-radius: var(--radius-control); color: var(--muted); font-size: 12px; }
 .load-more-button:hover:not(:disabled) { background: var(--hover); color: var(--text); }
 .load-more-button:disabled { opacity: .6; cursor: wait; }
-.conv-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conversation-item { flex-wrap: wrap; }
-.conv-more { width: 30px; height: 30px; flex-shrink: 0; display: grid; place-items: center; opacity: 0; color: var(--muted); border-radius: 5px; }
-.conversation-item:hover .conv-more, .conversation-item:focus-within .conv-more, .conversation-item.active .conv-more, .conversation-item.menu-open .conv-more { opacity: 1; }
-.conv-more:hover { color: var(--text); background: var(--bg); }
-.conversation-menu { flex-basis: 100%; margin: 0 6px 6px; padding: 4px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); box-shadow: 0 4px 12px #00000008; }
-.conversation-menu button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 8px; border-radius: 5px; text-align: left; font-size: 12px; }
-.conversation-menu button:hover:not(:disabled) { background: var(--hover); }
-.conversation-menu .delete-action { color: var(--danger); }
-.sidebar-footer { margin-top: auto; padding: 12px 5px 0; }
-.divider { height: 1px; background: var(--line); margin-bottom: 14px; }
-.user-area, .user-info { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.sidebar-footer { margin-top: auto; padding: 12px 4px 0; }
+.divider { height: 1px; background: var(--line); margin-bottom: 16px; }
+.user-area, .user-info { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .user-info { flex: 1; }
-.user-avatar { width: 30px; height: 30px; background: #e5e5e7; color: #646466; border-radius: 50%; display: grid; place-items: center; flex-shrink: 0; }
-.user-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.user-role { font-size: 10px; color: var(--muted); white-space: nowrap; }
+.user-avatar { width: 36px; height: 36px; background: var(--accent-soft); border: 1px solid var(--accent-border); color: var(--accent); border-radius: 12px; display: grid; place-items: center; flex-shrink: 0; font-size: 14px; font-weight: 650; }
+.user-details { display: flex; flex-direction: column; min-width: 0; }
+.user-name { font-size: 13px; font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-space { font-size: 11px; color: var(--muted); }
 .gear-wrapper { position: relative; }
-.btn-gear { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 7px; position: relative; color: var(--muted); }
-.btn-gear:hover { background: var(--hover); }
-.badge { background: var(--danger); color: white; border-radius: 20px; font-size: 10px; padding: 1px 4px; position: absolute; top: -3px; right: -3px; }
+.btn-gear { position: relative; }
+.badge { background: var(--danger); color: var(--on-accent); border-radius: 20px; font-size: 10px; padding: 1px 4px; position: absolute; top: -3px; right: -3px; }
 .menu-badge { position: static; margin-left: 8px; }
-.gear-menu { position: absolute; bottom: 42px; right: 0; width: 180px; background: white; border: 1px solid var(--line); border-radius: 10px; padding: 5px; box-shadow: 0 8px 28px #00000014; z-index: 30; }
-.gear-menu button { display: block; padding: 10px; font-size: 13px; width: 100%; text-align: left; border-radius: 5px; }
+.gear-menu { position: absolute; bottom: 46px; right: 0; width: 200px; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-card); padding: 6px; box-shadow: var(--shadow-md); z-index: 30; }
+.gear-menu button { display: block; padding: 10px 12px; font-size: 13px; width: 100%; text-align: left; border-radius: var(--radius-control); }
 .gear-menu button:hover { background: var(--surface); }
 .logout-item { color: var(--danger); }
-.mobile-close { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 6px; color: var(--muted); flex-shrink: 0; }
-.mobile-close:hover { background: var(--hover); color: var(--text); }
-@media (min-width: 761px) {
-  .sidebar.collapsed { display: none; }
-}
+.rename-form { display: flex; flex-direction: column; gap: 20px; }
+.rename-form input { width: 100%; min-width: 0; }
+.rename-form button { align-self: flex-end; }
+@media (min-width: 761px) { .sidebar.collapsed { display: none; } }
 @media (max-width: 760px) {
-  .sidebar { position: fixed; inset: 0 auto 0 0; width: 272px; z-index: 50; visibility: hidden; transform: translateX(-100%); transition: transform .2s, visibility .2s; }
+  .sidebar { position: fixed; inset: 0 auto 0 0; width: min(300px, calc(100vw - 40px)); z-index: 50; visibility: hidden; transform: translateX(-100%); transition: transform .2s, visibility .2s; padding-bottom: max(16px, env(safe-area-inset-bottom)); box-shadow: var(--shadow-lg); }
   .sidebar.open { visibility: visible; transform: translateX(0); }
 }
+@media (hover: none) { .conv-more { opacity: 1; width: 36px; height: 36px; } }
 </style>

@@ -2,6 +2,20 @@
 llm_request_timeout_seconds: 120
 llm_max_retries: 1
 
+# 每个知识库子任务最多执行的检索次数（正整数，空结果和失败也计入）。
+kb_subagent_max_retrieval_calls: 3
+
+# 公开搜索：返回条数为 1～20；每条片段与综合摘要的字符上限为正整数。
+# 同时用于 Tavily 请求、结果裁剪与工具描述；修改后重启后端。
+search_result_limit: 5
+search_content_limit: 3000
+
+# 会话压缩：消息数或 token 数达到任一阈值时触发。
+# 三项均为正整数；保留消息数须小于消息数触发阈值。
+summary_trigger_messages: 30
+summary_trigger_tokens: 20000
+summary_keep_messages: 10
+
 # 检索子代理（rag/retrieval_agent.py）；保留 rag_summary_* 配置键兼容现有部署。
 rag_summary_model: "deepseek-v4.1-flash-1017"
 rag_summary_model_provider: "openai"

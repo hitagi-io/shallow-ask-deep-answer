@@ -11,15 +11,14 @@ from rag.vector_store import get_vector_store
 from utils.knowledge_files import list_supported_files, compute_file_sha256
 from utils.config_loader import vector_db_config
 from utils.logging_config import get_logger
-from utils.project_paths import resolve_project_path
 
 logger = get_logger(__name__)
 
 
 class IndexHealth:
-    def __init__(self):
-        self.vector_store = get_vector_store()
-        self.knowledge_dir = resolve_project_path(vector_db_config["knowledge_dir"])
+    def __init__(self, user_id: int, project_id: str):
+        self.vector_store = get_vector_store(user_id, project_id)
+        self.knowledge_dir = self.vector_store.knowledge_dir
         self.allowed_types = tuple(vector_db_config["allowed_types"])
         self._lock = threading.RLock()
 
@@ -113,13 +112,21 @@ class IndexHealth:
 
     def file_statuses(self) -> list[dict]:
         """文件列表与健康检查共用完整性判定，不把清单存在当成已正确入库。"""
+        snapshot = self.snapshot()
+        report = snapshot["report"]
+        if report["milvus_error"] or report["manifest_error"]:
+            raise RuntimeError("无法确认索引状态")
+        return snapshot["files"]
+
+    def snapshot(self) -> dict:
+        """一次只读扫描同时供健康报告和文件列表请求共享。"""
         with self._lock, self.vector_store._store_lock:
             report, state = self._scan()
-            if report["milvus_error"] or report["manifest_error"]:
-                raise RuntimeError("无法确认索引状态")
-            return [{"name": os.path.basename(path), "path": path,
-                     "indexed": digest in state["healthy_hashes"]}
-                    for path, digest in state["disk"].items()]
+            return {"report": report, "files": [
+                {"name": os.path.basename(path), "path": path,
+                 "indexed": digest in state["healthy_hashes"]}
+                for path, digest in state["disk"].items()
+            ]}
 
     def repair(self) -> dict:
         """按源文件重建异常内容；失败保留清单供重试，绝不据剩余向量补齐清单。"""

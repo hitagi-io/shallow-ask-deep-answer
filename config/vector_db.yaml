@@ -1,5 +1,5 @@
-# 当前清单格式使用独立集合（显式主键 + 动态分块元数据）。
-collection_name: knowledge_chunks_v1
+# 每个账号下的项目使用独立集合：前缀 + 账号 ID + 项目 UUID。
+collection_prefix: private_knowledge
 embedding_model: qwen3.7-text-embedding-flash
 # 索引管线修订号：解析规则或服务端模型行为变化时递增，触发完整重建。
 # 分块参数、嵌入模型与解析依赖版本也会自动计入索引版本指纹。
@@ -22,10 +22,11 @@ embedding_batch_size: 20
 
 k: 3
 
-knowledge_dir: knowledge
+# 源文件位于项目外，默认仓库同级 shallow-ask-deep-answer-data/账号 ID/项目 UUID。
+# 使用环境变量 KNOWLEDGE_STORAGE_ROOT 指定其他绝对路径。
 allowed_types: [".txt",".pdf",".docx"]
 
-# 索引健康自检间隔（小时）：检查 PostgreSQL 清单 / knowledge / Milvus 每一块内容
+# 索引健康自检间隔（小时）：逐项目检查 PostgreSQL 清单 / 源文件 / Milvus 每一块内容
 health_check_interval_hours: 6
 # 索引自愈：自检发现问题时自动执行修复并复查，直至通过
 # 单轮自愈最多执行修复的次数（防止异常情况下自愈循环不终止）

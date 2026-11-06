@@ -1,9 +1,11 @@
-import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
-import { fetchConversations, fetchMessages, createConversationApi, updateConversationTitle, deleteConversationApi, streamChat, cancelGeneration, getStoredUser, newRequestId, withEmptyHistory, type Conversation, type Message } from '../api'
+import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted, type Ref } from 'vue'
+import { fetchConversations, fetchMessages, createConversationApi, updateConversationTitle, deleteConversationApi, streamChat, cancelGeneration, getStoredUser, newRequestId, withEmptyHistory, type Conversation, type Message, type Project } from '../api'
 import { useNotice } from './useNotice'
 import type { ConfirmAction } from './useConfirmation'
 
-export function useChat(confirmAction: ConfirmAction = async () => false) {
+const PROJECT_REQUIRED_NOTICE = '请先选择一个可用项目，再发送知识库问题'
+
+export function useChat(projects: Ref<Project[]>, confirmAction: ConfirmAction = async () => false) {
   let disposed = false
   // 输入框随内容自适应高度；清空内容时需手动复位（程序化清空不会触发 input 事件）
   const inputEl = ref<HTMLTextAreaElement | null>(null)
@@ -30,8 +32,11 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   const nextCursor = ref<string | null>(null)
   const loadingMore = ref(false)
   const conversationBusy = ref(false)
-  const failedAttempts = ref<Record<string, { text: string; mode: boolean; requestId: string }>>({})
-  const canRetrySend = computed(() => failedAttempts.value[currentId.value]?.mode === kbOnly.value)
+  const failedAttempts = ref<Record<string, { text: string; mode: boolean; projectId: string | null; requestId: string }>>({})
+  const canRetrySend = computed(() => {
+    const attempt = failedAttempts.value[currentId.value]
+    return !!attempt && attempt.mode === kbOnly.value && attempt.projectId === projectId.value && projectReady.value
+  })
   const following = ref(true)
   const visibleCount = ref(50)
   interface GenerationRun {
@@ -65,29 +70,13 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   let thinkingTimer: number | null = null
   const chatArea = ref<HTMLElement | null>(null)
   const kbOnly = computed(() => conversations.value[currentId.value]?.kbOnly ?? true)
+  const projectId = computed(() => conversations.value[currentId.value]?.project_id || null)
+  const selectedProject = computed(() => projects.value.find(project => project.id === projectId.value))
+  const projectReady = computed(() => !kbOnly.value || !!selectedProject.value)
+  watch(projectReady, ready => {
+    if (ready && persistNotice.value === PROJECT_REQUIRED_NOTICE) clearNotice()
+  })
   const isEmptyConversation = (conv: Conversation) => !conv.hasMessages && conv.messages.length === 0
-  const suggestions = computed(() => kbOnly.value ? [
-    { label: '总结资料中的关键结论', prompt: '请总结【请填写文档名称或资料主题】中的关键结论，重点关注【请填写你关注的问题】。' },
-    { label: '查找相关规定与操作流程', prompt: '请查找关于【请填写具体事项】的相关规定与操作流程。' },
-    { label: '对比不同文档中的观点', prompt: '请对比【请填写文档一名称】与【请填写文档二名称】在【请填写对比主题】上的观点，说明异同。' },
-  ] : [
-    { label: '用易懂的方式解释概念', prompt: '请用通俗易懂的语言解释【请填写想了解的概念】，并结合具体例子说明。' },
-    { label: '起草一段文字', prompt: '请帮我写一份【请填写文案类型】，主题是【请填写主题】，面向【请填写读者】，语气希望【请填写语气或风格】。' },
-    { label: '梳理思路与行动方案', prompt: '我想实现【请填写目标】，目前的情况是【请填写背景与限制】。请帮我梳理思路，并给出可执行的步骤。' },
-  ])
-  function useSuggestion(text: string) {
-    input.value = text
-    nextTick(() => {
-      const textarea = inputEl.value
-      if (!textarea) return
-      textarea.style.height = 'auto'
-      textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`
-      textarea.focus()
-      const placeholder = /【[^】]+】/.exec(text)
-      if (placeholder) textarea.setSelectionRange(placeholder.index, placeholder.index + placeholder[0].length)
-    })
-  }
-
   async function initConversations() {
     if (loading.value) return
     loading.value = true
@@ -142,6 +131,10 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
       conv.messagesLoaded = true
       if (page.messages.length) conv.hasMessages = true
       if (page.kbOnly != null) conv.kbOnly = page.kbOnly
+      if (page.kbOnly != null) {
+        conv.project_id = page.project_id
+        conv.project_name = page.project_name
+      }
       if (page.active_generation && !runs.value[id]) {
         void observeGeneration(id, page.active_generation.request_id)
       }
@@ -201,12 +194,15 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     })
   }
 
-  async function newConversation(mode = kbOnly.value) {
+  async function newConversation(mode = kbOnly.value, selectedProjectId: string | null = null) {
     if (conversationBusy.value || loading.value) return
     const active = conversations.value[currentId.value]
     const empty = active && isEmptyConversation(active) ? active : convList.value.find(isEmptyConversation)
     if (empty) {
       empty.kbOnly = mode
+      empty.project_id = mode ? selectedProjectId : null
+      empty.project_name = projects.value.find(project => project.id === empty.project_id)?.name || null
+      delete failedAttempts.value[empty.id]
       currentId.value = empty.id
       return
     }
@@ -222,6 +218,8 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
         return
       }
       conv.kbOnly = mode
+      conv.project_id = mode ? selectedProjectId : null
+      conv.project_name = projects.value.find(project => project.id === conv.project_id)?.name || null
       conversations.value[conv.id] = conv
       currentId.value = conv.id
     } catch (e) {
@@ -232,6 +230,11 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   async function switchMode(mode: boolean) {
     if (mode === kbOnly.value) return
     await newConversation(mode)
+  }
+
+  async function selectProject(id: string | null) {
+    if (!kbOnly.value || id === projectId.value || (id && !projects.value.some(project => project.id === id))) return
+    await newConversation(true, id)
   }
 
   function selectConversation(id: string) {
@@ -274,6 +277,19 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     } catch (e) { handlePersistError('重命名', e); return false }
     finally { conversationBusy.value = false }
   }
+  async function removeProjectConversations(id: string) {
+    for (const conv of Object.values(conversations.value)) {
+      if (conv.project_id !== id) continue
+      controllers.get(conv.id)?.abort()
+      delete conversations.value[conv.id]
+      delete drafts.value[conv.id]
+      delete failedAttempts.value[conv.id]
+    }
+    if (!conversations.value[currentId.value]) {
+      currentId.value = convList.value[0]?.id || ''
+      if (!currentId.value) await newConversation()
+    }
+  }
   function retryMessage(index: number) {
     const question = current.value?.messages.slice(0, index).reverse().find(m => m.role === 'user')
     if (question && !isProcessing.value) void sendMessage(question.content, current.value?.messages[index].kbOnly ?? kbOnly.value)
@@ -304,7 +320,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
   }
 
   async function observeGeneration(id: string, requestId: string, submission?: {
-    text: string; mode: boolean; user: Message; assistant: Message; hadMessages: boolean
+    text: string; mode: boolean; projectId: string | null; user: Message; assistant: Message; hadMessages: boolean
   }) {
     const conv = conversations.value[id]
     if (!conv || runs.value[id] || disposed) return
@@ -330,6 +346,9 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
         assistant.id = snapshot.assistant_message_id
         assistant.content = snapshot.assistant_content || ''
         assistant.kbOnly = snapshot.kb_only
+        conv.kbOnly = snapshot.kb_only
+        conv.project_id = snapshot.project_id
+        conv.project_name = snapshot.project_name
         assistant.status = snapshot.status === 'running' ? 'streaming' : snapshot.status === 'failed' ? 'error' : snapshot.status
         if (submission) {
           const savedUser = conv.messages.find(m => m.id === snapshot.user_message_id)
@@ -340,12 +359,12 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
         run.thinking = snapshot.status === 'running' && !assistant.content
         if (run.stopping && snapshot.status === 'running') void requestStop(id, run)
         if (currentId.value === id) scrollToBottom()
-      }, value => { run.reconnecting = value }, ac.signal, submission ? { message: submission.text, kbOnly: submission.mode } : undefined)
+      }, value => { run.reconnecting = value }, ac.signal, submission ? { message: submission.text, kbOnly: submission.mode, projectId: submission.projectId } : undefined)
       if (disposed) return
       if (!outcome.started && submission) {
         conv.messages = conv.messages.filter(m => m !== submission.user && m !== submission.assistant)
         conv.hasMessages = submission.hadMessages
-        failedAttempts.value[id] = { text: submission.text, mode: submission.mode, requestId }
+        failedAttempts.value[id] = { text: submission.text, mode: submission.mode, projectId: submission.projectId, requestId }
         handlePersistError('发送消息', new Error(outcome.error || '未能确认是否发送成功，请重试'))
       } else {
         delete failedAttempts.value[id]
@@ -367,6 +386,10 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     const convId = currentId.value
     const conv = conversations.value[convId]
     if (!conv || answerMode !== kbOnly.value || !conv.messagesLoaded || conv.messagesLoading) return
+    if (!projectReady.value) {
+      showNotice(PROJECT_REQUIRED_NOTICE, 'error')
+      return
+    }
     const hadMessages = conv.hasMessages
     conv.hasMessages = true
     conv.kbOnly = answerMode
@@ -380,7 +403,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     }
     if (retryText == null) { input.value = ''; resetInputHeight() }
     jumpToLatest()
-    await observeGeneration(convId, previousRequestId || newRequestId(), { text, mode: answerMode, user, assistant, hadMessages })
+    await observeGeneration(convId, previousRequestId || newRequestId(), { text, mode: answerMode, projectId: answerMode ? conv.project_id : null, user, assistant, hadMessages })
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -402,6 +425,7 @@ export function useChat(confirmAction: ConfirmAction = async () => false) {
     window.removeEventListener('focus', refreshCurrent)
     if (thinkingTimer !== null) clearInterval(thinkingTimer)
   })
-  return { input, inputEl, chatArea, current, currentId, convList, hasEmptyConv, isProcessing, processingIds, reconnecting, stopping, isThinking, thinkingSeconds, thinkingPhase, kbOnly, switchMode, suggestions, useSuggestion, newConversation, selectConversation, deleteConversation, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
-    nextCursor, loadingMore, loadMoreConversations, loadMessages, hasEarlier, loading, loadError, initConversations, conversationBusy, renameConversation, following, onScroll, jumpToLatest, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend }
+  return { input, inputEl, chatArea, current, currentId, convList, hasEmptyConv, isProcessing, processingIds, reconnecting, stopping, isThinking, thinkingSeconds, thinkingPhase, kbOnly, switchMode, newConversation, selectConversation, deleteConversation, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
+    nextCursor, loadingMore, loadMoreConversations, loadMessages, hasEarlier, loading, loadError, initConversations, conversationBusy, renameConversation, following, onScroll, jumpToLatest, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend,
+    projectId, selectedProject, projectReady, selectProject, removeProjectConversations }
 }

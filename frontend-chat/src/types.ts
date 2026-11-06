@@ -1,1 +1,1 @@
-export type AppMode = 'chat' | 'knowledge'
+export type AppMode = 'chat' | 'knowledge' | 'account' | 'about'

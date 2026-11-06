@@ -55,7 +55,8 @@ const html = computed(() => {
       <BrandMark />
     </div>
     <div class="bubble-wrap">
-      <div v-if="message.role === 'assistant' && thinking" class="thinking">
+      <div v-if="message.role === 'assistant'" class="message-author">浅问深答<span v-if="streaming" class="streaming-label">正在回答</span></div>
+      <div v-if="message.role === 'assistant' && thinking" class="thinking" role="status">
         <span class="thinking-dot"></span>
         <span class="thinking-dot" style="animation-delay:0.15s"></span>
         <span class="thinking-dot" style="animation-delay:0.3s"></span>
@@ -77,9 +78,9 @@ const html = computed(() => {
         </button>
         <span role="status" aria-live="polite">{{ copyNotice }}</span>
       </div>
-      <div v-if="message.role === 'assistant' && message.thinkingTime != null && message.content" class="thinking-time">· 用时 {{ formatDuration(message.thinkingTime) }}</div>
+      <div v-if="message.role === 'assistant' && message.thinkingTime != null && message.content" class="thinking-time">用时 {{ formatDuration(message.thinkingTime) }}</div>
       <div v-if="message.role === 'assistant' && (message.status === 'cancelled' || message.status === 'error') && message.content" class="message-note" :class="message.status">
-        {{ message.status === 'cancelled' ? '· 已停止回答' : '· 回答未完成，可重新提问' }}
+        {{ message.status === 'cancelled' ? '已停止回答' : '回答未完成，可重新提问' }}
       </div>
       <div v-if="message.role === 'user'" class="bubble">{{ message.content }}</div>
       <span v-if="streaming && message.role === 'assistant'" class="cursor">▌</span>
@@ -88,32 +89,34 @@ const html = computed(() => {
 </template>
 
 <style scoped>
-.message-actions { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); margin-top: 12px; }
-.message-actions [role="status"] { margin-left: 8px; }
-.feedback-button { transition: background-color .15s, color .15s, transform .15s; }
-.feedback-button.selected { color: var(--text); }
+.message-author { display: flex; align-items: center; gap: 10px; margin: 0 0 8px; color: var(--accent); font-size: 12px; line-height: 1.5; font-weight: 600; }
+.streaming-label { color: var(--muted); font-size: 10px; font-weight: 400; }
+.message-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; font-size: 12px; color: var(--muted); margin-top: 14px; }
+.message-actions [role="status"] { margin-left: 8px; overflow-wrap: anywhere; }
+.feedback-button { transition: background-color var(--duration-fast), color var(--duration-fast), transform var(--duration-fast); }
+.feedback-button.selected { color: var(--accent); background: var(--accent-soft); }
 .feedback-button.selected svg { fill: currentColor; }
 .feedback-button:active { transform: scale(.9); }
 @media (prefers-reduced-motion: reduce) {
   .feedback-button { transition: none; }
   .feedback-button:active { transform: none; }
 }
-.markdown-body :deep(pre button) { margin: 0 0 10px auto; }
-.message { display: flex; gap: 12px; max-width: 768px; margin: 0 auto 36px; }
-.avatar { width: 28px; height: 28px; display: grid; place-items: center; flex-shrink: 0; margin-top: 4px; }
-.avatar .brand-mark { width: 22px; height: 22px; }
+.markdown-body :deep(pre button) { margin: 0 0 10px auto; color: var(--muted); }
+.message { display: flex; gap: 14px; max-width: 768px; margin: 0 auto 32px; }
+.avatar { width: 32px; height: 32px; display: grid; place-items: center; flex-shrink: 0; border: 1px solid var(--accent-border); border-radius: 10px; background: var(--accent-soft); }
+.avatar .brand-mark { width: 22px; height: 22px; color: var(--accent); }
 .message.user { justify-content: flex-end; }
 .bubble-wrap { min-width: 0; flex: 1; }
 .message.user .bubble-wrap { flex: 0 1 auto; max-width: 85%; }
 .bubble { font-size: 15px; line-height: 1.85; overflow-wrap: anywhere; }
-.message.user .bubble { background: #f3f3f3; border-radius: 16px; padding: 10px 18px; white-space: pre-wrap; }
+.message.user .bubble { background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 18px; padding: 12px 18px; color: var(--text); white-space: pre-wrap; }
 .thinking { display: flex; gap: 5px; align-items: center; min-height: 32px; }
-.thinking-dot { width: 4px; height: 4px; background: #777; border-radius: 50%; animation: pulse 1.3s infinite; }
+.thinking-dot { flex-shrink: 0; width: 4px; height: 4px; background: var(--accent); border-radius: 50%; animation: pulse 1.3s infinite; }
 .thinking-text { color: var(--muted); font-size: 12px; margin-left: 6px; }
-.thinking-time { font-size: 11px; color: #898989; margin-top: 10px; }
-.message-note { font-size: 11px; color: #898989; margin-top: 10px; }
+.thinking-time { display: inline-block; font-size: 11px; color: var(--muted); margin-top: 8px; }
+.message-note { display: inline-block; padding: 2px 8px; border-radius: 6px; background: var(--surface); font-size: 11px; color: var(--muted); margin: 8px 0 0 8px; }
 .message-note.error { color: var(--danger); }
-.cursor { animation: pulse 1s infinite; }
+.cursor { color: var(--accent); animation: pulse 1s infinite; }
 .markdown-body :deep(p) { margin: 0 0 14px; }
 .markdown-body :deep(p:last-child) { margin-bottom: 0; }
 .markdown-body :deep(h1), .markdown-body :deep(h2), .markdown-body :deep(h3), .markdown-body :deep(h4) { line-height: 1.5; font-weight: 650; margin: 24px 0 12px; letter-spacing: -.3px; }
@@ -121,21 +124,30 @@ const html = computed(() => {
 .markdown-body :deep(h2) { font-size: 20px; }
 .markdown-body :deep(h3) { font-size: 17px; }
 .markdown-body :deep(h4) { font-size: 15px; }
+.markdown-body :deep(> :first-child) { margin-top: 0; }
 .markdown-body :deep(ul), .markdown-body :deep(ol) { padding-left: 24px; margin: 12px 0; }
 .markdown-body :deep(li) { margin: 5px 0; }
-.markdown-body :deep(a) { color: #365e93; text-decoration: underline; text-underline-offset: 3px; }
-.markdown-body :deep(blockquote) { border-left: 3px solid #ddd; padding-left: 16px; margin: 18px 0; color: #666; }
-.markdown-body :deep(code) { font-family: var(--font-mono); font-size: .86em; background: #f1f1f1; padding: 3px 5px; border-radius: 4px; }
-.markdown-body :deep(pre) { background: #f7f7f8; border: 1px solid var(--line); border-radius: 10px; padding: 16px; overflow-x: auto; line-height: 1.65; }
+.markdown-body :deep(a[href]) { color: var(--link); font-weight: 500; text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; border-radius: 3px; transition: color var(--duration-fast), background-color var(--duration-fast); }
+.markdown-body :deep(a[href]:hover), .markdown-body :deep(a[href]:focus-visible) { color: var(--link-hover); background-color: var(--link-soft); text-decoration-thickness: 2px; }
+.markdown-body :deep(a[href]:focus-visible) { outline: 2px solid var(--link); outline-offset: 3px; }
+.markdown-body :deep(blockquote) { border-left: 3px solid var(--accent-border); border-radius: 0 10px 10px 0; background: var(--surface); padding: 12px 16px; margin: 18px 0; color: var(--muted); }
+.markdown-body :deep(code) { font-family: var(--font-mono); font-size: .86em; background: var(--surface); padding: 3px 6px; border-radius: 5px; }
+.markdown-body :deep(pre) { max-width: 100%; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-card); padding: 14px 16px; overflow-x: auto; line-height: 1.65; }
 .markdown-body :deep(pre code) { background: none; padding: 0; }
-.markdown-body :deep(table) { display: block; overflow-x: auto; border-collapse: collapse; margin: 18px 0; font-size: 13px; }
-.markdown-body :deep(th), .markdown-body :deep(td) { border: 1px solid var(--line); padding: 9px 12px; text-align: left; }
-.markdown-body :deep(th) { background: #f7f7f7; font-weight: 600; }
+.markdown-body :deep(table) { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 18px 0; font-size: 13px; line-height: 1.7; }
+.markdown-body :deep(th), .markdown-body :deep(td) { border: 1px solid var(--line); padding: 10px 14px; text-align: left; }
+.markdown-body :deep(th) { background: var(--surface); color: var(--text); font-weight: 600; white-space: nowrap; }
+.markdown-body :deep(tbody tr:nth-child(even)) { background: var(--canvas); }
 .markdown-body :deep(hr) { border: 0; border-top: 1px solid var(--line); margin: 24px 0; }
-.markdown-body :deep(img) { max-width: 100%; border-radius: 8px; }
+.markdown-body :deep(img) { max-width: 100%; height: auto; border-radius: var(--radius-control); }
 @media (max-width: 760px) {
-  .message { gap: 8px; margin-bottom: 28px; }
+  .message { gap: 10px; margin-bottom: 28px; }
+  .avatar { width: 28px; height: 28px; border-radius: 9px; }
+  .avatar .brand-mark { width: 19px; height: 19px; }
   .message.user .bubble-wrap { max-width: 92%; }
+  .message.user .bubble { padding: 10px 14px; }
   .bubble { font-size: 14px; }
+  .markdown-body :deep(pre) { padding: 12px; }
+  .markdown-body :deep(th), .markdown-body :deep(td) { padding: 8px 10px; }
 }
 </style>

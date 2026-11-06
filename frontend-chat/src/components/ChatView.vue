@@ -1,16 +1,37 @@
 <script setup lang="ts">
-import { nextTick } from 'vue'
-import BrandMark from './BrandMark.vue'
+import { computed, nextTick } from 'vue'
 import ChatMessage from './ChatMessage.vue'
+import BrandMark from './BrandMark.vue'
 import AppIcon from './AppIcon.vue'
 import AppNotice from './AppNotice.vue'
 import type { useChat } from '../composables/useChat'
+import type { useProjects } from '../composables/useProjects'
 
-const props = defineProps<{ chat: ReturnType<typeof useChat> }>()
+const props = defineProps<{ chat: ReturnType<typeof useChat>; projects: ReturnType<typeof useProjects> }>()
+const emit = defineEmits<{ manage: [] }>()
+const { projects: projectList, loading: projectsLoading, error: projectsError, load: reloadProjects } = props.projects
 const { input, inputEl, chatArea, current, isProcessing, isThinking, thinkingSeconds, thinkingPhase, reconnecting, stopping,
-  kbOnly, switchMode, suggestions, useSuggestion, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
+  kbOnly, switchMode, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice, projectId, selectedProject, projectReady, selectProject,
   loading, loadError, initConversations, conversationBusy, following, onScroll, jumpToLatest,
   loadMessages, hasEarlier, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend } = props.chat
+const suggestions = computed(() => kbOnly.value ? [
+  { icon: 'file' as const, title: '提炼重点', detail: '快速读懂项目资料', prompt: '请总结这个项目资料中的核心内容，并列出关键要点。' },
+  { icon: 'book' as const, title: '查找依据', detail: '让答案有据可查', prompt: '请帮我查找资料中关于以下问题的规定，并注明来源：' },
+  { icon: 'folder' as const, title: '梳理关联', detail: '连接分散的知识', prompt: '请梳理这个项目中各份资料的关联，以及需要关注的差异。' },
+] : [
+  { icon: 'book' as const, title: '理解一个概念', detail: '把复杂问题讲清楚', prompt: '请用通俗的语言和具体例子，帮我理解这个概念：' },
+  { icon: 'file' as const, title: '整理思路', detail: '从想法到清晰表达', prompt: '请帮我梳理以下想法，整理成结构清晰、重点明确的内容：' },
+  { icon: 'folder' as const, title: '制定计划', detail: '把目标拆成下一步', prompt: '请帮我将这个目标拆解为可执行的步骤，并标出优先级：' },
+])
+async function useSuggestion(prompt: string) {
+  input.value = prompt
+  await nextTick()
+  if (inputEl.value) {
+    inputEl.value.style.height = 'auto'
+    inputEl.value.style.height = `${Math.min(inputEl.value.scrollHeight, 120)}px`
+    inputEl.value.focus()
+  }
+}
 function resizeInput(event: Event) {
   const textarea = event.target as HTMLTextAreaElement
   textarea.style.height = 'auto'
@@ -27,21 +48,36 @@ async function clearInput() {
 </script>
 
 <template>
+  <header class="chat-header">
+    <div class="chat-heading">
+      <span class="chat-eyebrow">对话工作台</span>
+      <h1 :title="current?.messages.length ? current.title : undefined">{{ current?.messages.length ? current.title : '开启新的思考' }}</h1>
+    </div>
+    <span class="mode-indicator" :class="{ 'knowledge-mode': kbOnly }"><span></span>{{ kbOnly ? '知识库问答' : '通用问答' }}</span>
+  </header>
   <div class="chat-region">
-  <div ref="chatArea" class="chat-area" tabindex="0" aria-label="对话消息" @scroll.passive="onScroll">
-    <div v-if="loading" class="empty" role="status">正在加载会话…</div>
+  <div ref="chatArea" class="chat-area" :class="{ 'chat-area-empty': loading || !!loadError || !current?.messages.length }" tabindex="0" aria-label="对话消息" @scroll.passive="onScroll">
+    <div v-if="loading" class="empty loading-state" role="status"><span class="loading-ring" aria-hidden="true"></span>正在加载会话…</div>
     <div v-else-if="loadError" class="empty" role="alert"><p>{{ loadError }}</p><button class="text-action" @click="initConversations">重新加载</button></div>
     <template v-if="current && !loading && !loadError">
-      <div v-if="current.messagesLoading && !current.messagesLoaded" class="empty" role="status">正在加载消息…</div>
+      <div v-if="current.messagesLoading && !current.messagesLoaded" class="empty loading-state" role="status"><span class="loading-ring" aria-hidden="true"></span>正在加载消息…</div>
       <div v-if="current.messagesError" role="alert" class="history-button">
         {{ current.messagesError }}
         <button class="text-action" :disabled="current.messagesLoading" @click="current.messagesLoaded ? showEarlier() : loadMessages()">重试加载</button>
       </div>
       <div v-if="current.messagesLoaded && current.messages.length === 0" class="empty welcome-state">
-        <BrandMark class="empty-seal" />
-        <p class="empty-title">有什么想了解的？</p>
-        <p class="empty-hint">{{ kbOnly ? '可以询问资料中的规定、流程或具体内容。' : '可以提问，也可以让我帮您写作、翻译或梳理思路。' }}</p>
-        <div class="suggestions"><button v-for="(suggestion, i) in suggestions" :key="suggestion.label" @click="useSuggestion(suggestion.prompt)"><span class="suggestion-index">0{{ i + 1 }}</span><span>{{ suggestion.label }}</span><AppIcon class="suggestion-arrow" name="arrow-up-right" :size="16" /></button></div>
+        <div class="welcome-brand"><BrandMark /></div>
+        <p class="welcome-kicker">浅问深答 · 让知识为你所用</p>
+        <h2>{{ kbOnly ? '连接你的知识，找到可靠答案' : '每个好答案，都从一个问题开始' }}</h2>
+        <p class="welcome-description">{{ kbOnly ? '选择一个项目，从资料中提炼重点、查找依据，发现新的联系。' : '理解复杂概念、整理零散想法，或一起探索下一步。' }}</p>
+        <div class="suggestions" aria-label="提问建议">
+          <button v-for="suggestion in suggestions" :key="suggestion.title" class="suggestion-card" :disabled="conversationBusy" @click="useSuggestion(suggestion.prompt)">
+            <AppIcon :name="suggestion.icon" :size="19" />
+            <strong>{{ suggestion.title }}</strong>
+            <span>{{ suggestion.detail }}</span>
+            <AppIcon name="arrow-up-right" :size="14" class="suggestion-arrow" />
+          </button>
+        </div>
       </div>
 
       <button v-if="hasEarlier" class="history-button text-action" :disabled="current.messagesLoading" @click="showEarlier">{{ current.messagesLoading ? '正在加载…' : '查看更早的消息' }}</button>
@@ -68,16 +104,23 @@ async function clearInput() {
   <div class="input-bar">
     <div class="input-inner">
       <div class="input-options">
-        <div class="mode-switch" role="group" aria-label="问答模式">
-          <button :class="{ active: kbOnly }" :aria-pressed="kbOnly" :disabled="conversationBusy || loading || !current || !!loadError" @click="switchMode(true)">知识库问答</button>
-          <button :class="{ active: !kbOnly }" :aria-pressed="!kbOnly" :disabled="conversationBusy || loading || !current || !!loadError" @click="switchMode(false)">通用问答</button>
-        </div>
-        <span class="mode-description">{{ kbOnly ? '根据知识库资料回答' : '解答日常问题，必要时联网查找资料' }}</span>
+        <button class="knowledge-toggle" :class="{ active: kbOnly }" :aria-pressed="kbOnly" :disabled="conversationBusy || loading || !current || !!loadError" @click="switchMode(!kbOnly)" title="选中使用知识库，取消使用通用问答">
+          <AppIcon name="book" :size="15" />知识库
+        </button>
+        <label class="project-selector" :class="{ disabled: !kbOnly }">
+          <AppIcon name="folder" :size="15" />
+          <select :value="projectId || ''" aria-label="当前知识库项目" :disabled="!kbOnly || projectsLoading || conversationBusy || loading || !current || !!loadError" @change="selectProject(($event.target as HTMLSelectElement).value || null)">
+            <option value="">{{ !kbOnly ? '通用模式 · 无需项目' : projectsLoading ? '正在加载项目…' : '选择项目' }}</option>
+            <option v-if="projectId && !selectedProject" :value="projectId" disabled>项目已不可用</option>
+            <option v-for="project in projectList" :key="project.id" :value="project.id">{{ project.name }}</option>
+          </select>
+        </label>
+        <button class="manage-link" @click="emit('manage')" title="管理我的知识库">管理项目<AppIcon name="arrow-up-right" :size="13" /></button>
       </div>
       <div class="input-row">
         <textarea
           ref="inputEl"
-          v-model="input" :placeholder="isProcessing ? '可以先写下一个问题…' : kbOnly ? '想了解知识库中的哪些内容？' : '输入问题，或描述您想完成的事…'" aria-label="输入问题" rows="1"
+          v-model="input" :placeholder="isProcessing ? '可以先写下一个问题…' : kbOnly ? (projectReady ? '想了解这个项目中的哪些内容？' : '请先选择项目，再开始知识库问答…') : '输入问题，或描述您想完成的事…'" aria-label="输入问题" rows="1"
           @keydown="onKeydown"
           @input="resizeInput"
           />
@@ -85,63 +128,115 @@ async function clearInput() {
         <button v-if="isProcessing" :disabled="stopping" class="btn-send" @click="stopStreaming" aria-label="停止回答" title="停止回答">
           <svg width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="3" fill="currentColor"/></svg>
         </button>
-        <button v-else class="btn-send" :disabled="!input.trim() || !current?.messagesLoaded || current?.messagesLoading || loading || conversationBusy" @click="sendMessage()" aria-label="发送消息" title="发送消息"><AppIcon name="arrow-up" :size="20" /></button>
+        <button v-else class="btn-send" :disabled="!input.trim() || !projectReady || !current?.messagesLoaded || current?.messagesLoading || loading || conversationBusy" @click="sendMessage()" aria-label="发送消息" :title="projectReady ? '发送消息' : '请先选择项目'"><AppIcon name="arrow-up" :size="20" /></button>
       </div>
     </div>
-    <p class="composer-hint">重要信息请核对来源</p>
+    <p v-if="kbOnly && projectsError" class="composer-hint project-error" role="alert">{{ projectsError }} <button class="text-action" @click="reloadProjects">重试</button></p>
+    <p class="composer-hint composer-footer"><span class="keyboard-hint">Enter 发送<span class="hint-divider">·</span>Shift + Enter 换行</span><span>重要信息请核对来源</span></p>
   </div>
 </template>
 
 <style scoped>
-.history-button { display: block; margin: 0 auto 28px; }
-.chat-region { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+.chat-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 76px; padding: 14px 32px 14px 68px; border-bottom: 1px solid var(--line); background: var(--bg); }
+.chat-heading { min-width: 0; }
+.chat-eyebrow { display: block; margin-bottom: 3px; color: var(--muted); font-size: 11px; letter-spacing: .06em; }
+.chat-heading h1 { overflow: hidden; margin: 0; color: var(--text); font-size: 15px; font-weight: 600; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+.mode-indicator { display: inline-flex; align-items: center; gap: 7px; flex-shrink: 0; padding: 6px 10px; border: 1px solid var(--line); border-radius: 99px; color: var(--muted); font-size: 11px; }
+.mode-indicator > span { width: 5px; height: 5px; border-radius: 50%; background: var(--subtle); }
+.mode-indicator.knowledge-mode { color: var(--accent); border-color: var(--accent-border); background: var(--accent-soft); }
+.mode-indicator.knowledge-mode > span { background: var(--accent); }
+.history-button { display: block; margin: 0 auto 28px; max-width: 100%; text-align: center; overflow-wrap: anywhere; }
+.chat-region { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; container: chat-content / size; }
 .chat-navigation { position: absolute; right: max(8px, calc((100% - 768px) / 2 - 48px)); bottom: 16px; }
-.jump-latest { flex-shrink: 0; display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid var(--line); border-radius: 50%; background: var(--bg); color: var(--muted); box-shadow: 0 2px 8px #0001; }
+.jump-latest { flex-shrink: 0; display: grid; place-items: center; width: 38px; height: 38px; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--bg); color: var(--accent); box-shadow: var(--shadow-sm); }
 .jump-latest:hover { background: var(--surface); color: var(--text); }
-.latest-button { align-self: center; padding: 8px 16px; border: 1px solid var(--line); border-radius: 24px; background: var(--bg); font-size: 12px; box-shadow: 0 2px 8px #0001; }
-.chat-area { flex: 1; min-height: 0; overflow-y: auto; padding: 52px 32px 24px; }
-.welcome-state { padding: 24px 0 clamp(48px, calc(10vh - 24px), 80px); }
-.empty-seal { width: 42px; height: 42px; margin-bottom: 20px; }
-.empty-title { font-size: clamp(25px, 3vw, 32px); letter-spacing: -1px; font-weight: 600; margin: 0 0 12px; }
-.empty-hint { font-size: 14px; color: var(--muted); margin: 0; }
-.suggestions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; width: 100%; max-width: 680px; margin-top: 36px; }
-.suggestions button { border: 1px solid var(--line); border-radius: 10px; text-align: left; padding: 15px; display: flex; flex-wrap: wrap; align-items: center; gap: 13px; font-size: 12px; line-height: 1.6; transition: background .15s, border-color .15s; }
-.suggestions button:hover { background: var(--surface); border-color: #ccc; }
-.suggestion-index { width: 100%; color: #969696; font-family: var(--font-mono); font-size: 11px; }
-.suggestions button > span:nth-child(2) { flex: 1; }
-.suggestion-arrow { color: var(--muted); }
-.input-bar { padding: 12px 32px 16px; }
-.input-inner { display: flex; flex-direction: column; max-width: 768px; margin: 0 auto; border: 1px solid #dedede; border-radius: 17px; padding: 10px 14px; box-shadow: 0 4px 20px #00000005; background: white; }
-.input-inner:focus-within { border-color: #aaa; box-shadow: 0 4px 20px #00000008; }
-.input-row { order: 0; display: flex; gap: 12px; align-items: flex-end; }
-.input-row textarea { width: 100%; min-width: 0; resize: none; border: 0; background: transparent; padding: 6px 0; font-size: 14px; line-height: 1.7; min-height: 48px; max-height: 120px; }
+.latest-button { align-self: center; max-width: calc(100% - 24px); padding: 9px 16px; border: 1px solid var(--danger-border); border-radius: var(--radius-control); background: var(--danger-bg); color: var(--danger); font-size: 12px; }
+.chat-area { flex: 1; min-height: 0; overflow-y: auto; padding: 36px 32px 24px; scroll-padding-bottom: 24px; }
+/* Auto margins center short empty states and leave tall content scrollable from the top. */
+.chat-area.chat-area-empty { display: flex; flex-direction: column; padding-block: 20px; }
+.chat-area-empty > .empty { flex-shrink: 0; min-height: auto; width: 100%; margin-block: auto; padding-block: 0; }
+.loading-state { gap: 14px; color: var(--muted); font-size: 13px; }
+.loading-ring { width: 24px; height: 24px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+.welcome-state { max-width: 768px; margin-inline: auto; }
+.welcome-brand { display: grid; place-items: center; width: 62px; height: 62px; margin-bottom: 22px; border: 1px solid var(--accent-border); border-radius: 20px; background: var(--accent-soft); }
+.welcome-brand .brand-mark { width: 34px; height: 34px; color: var(--accent); }
+.welcome-kicker { margin: 0 0 12px; color: var(--accent); font-size: 12px; font-weight: 550; letter-spacing: .1em; }
+.welcome-state h2 { margin: 0; font-size: clamp(22px, 2.4vw, 30px); font-weight: 600; line-height: 1.5; letter-spacing: -.04em; text-wrap: balance; }
+.welcome-description { max-width: 480px; margin: 14px 0 0; color: var(--muted); font-size: 13px; line-height: 1.85; text-wrap: balance; }
+.suggestions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; width: 100%; max-width: 636px; margin-top: 36px; }
+.suggestion-card { position: relative; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; padding: 18px 16px; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--bg); text-align: left; transition: border-color var(--duration-fast), background-color var(--duration-fast), box-shadow var(--duration-fast); }
+.suggestion-card > .app-icon { margin-bottom: 6px; color: var(--accent); }
+.suggestion-card strong { font-size: 13px; font-weight: 600; }
+.suggestion-card > span { color: var(--muted); font-size: 11px; line-height: 1.5; }
+.suggestion-card .suggestion-arrow { position: absolute; top: 18px; right: 16px; color: var(--subtle); }
+.suggestion-card:hover:not(:disabled) { border-color: var(--accent-border); background: var(--accent-soft); box-shadow: var(--shadow-sm); }
+.input-bar { flex-shrink: 0; padding: 12px 32px 18px; }
+.input-inner { display: flex; flex-direction: column; max-width: 768px; margin: 0 auto; border: 1px solid var(--line-strong); border-radius: var(--radius-panel); padding: 14px 16px 12px; box-shadow: var(--shadow-md); background: var(--bg); transition: border-color var(--duration-fast), box-shadow var(--duration-fast); }
+.input-inner:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-md); }
+.input-row { order: 0; display: flex; gap: 8px; align-items: flex-end; }
+.input-row textarea { width: 100%; min-width: 0; resize: none; border: 0; border-radius: 0; box-shadow: none; background: transparent; padding: 6px 0; font-size: 14px; line-height: 1.75; min-height: 52px; max-height: 120px; }
 .input-row textarea:focus-visible { outline: none; }
-.btn-clear { flex-shrink: 0; height: 34px; padding: 0 8px; border-radius: 7px; color: var(--muted); font-size: 12px; }
+.btn-clear { flex-shrink: 0; height: 38px; padding: 0 8px; border-radius: var(--radius-control); color: var(--muted); font-size: 12px; }
 .btn-clear:hover { background: var(--surface); color: var(--text); }
-.btn-send { width: 34px; height: 34px; border-radius: 50%; background: var(--accent); color: white; flex-shrink: 0; display: grid; place-items: center; transition: background-color .15s; }
+.btn-send { width: 38px; height: 38px; border-radius: 12px; background: var(--accent); color: var(--bg); flex-shrink: 0; display: grid; place-items: center; transition: background-color var(--duration-fast); }
 .btn-send:hover:not(:disabled) { background: var(--accent-hover); }
-.input-options { order: 1; display: flex; align-items: center; gap: 12px; margin-top: 8px; }
-.mode-switch { display: flex; gap: 3px; background: #f4f4f4; padding: 3px; border-radius: 7px; }
-.mode-switch button { font-size: 11px; color: var(--muted); padding: 5px 9px; border-radius: 5px; }
-.mode-switch button.active { background: white; color: var(--text); box-shadow: 0 1px 3px #00000012; }
-.mode-description { font-size: 11px; color: var(--muted); }
-.composer-hint { font-size: 10px; color: #858585; text-align: center; margin: 11px 0 0; }
-.composer-hint span { margin: 0 6px; color: #b5b5b5; }
+.input-options { order: 1; display: flex; align-items: center; gap: 12px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.knowledge-toggle { display: inline-flex; gap: 6px; align-items: center; min-height: 32px; padding: 5px 9px; border: 1px solid var(--line); border-radius: var(--radius-control); color: var(--muted); font-size: 12px; white-space: nowrap; }
+.knowledge-toggle:hover:not(:disabled) { background: var(--surface); }
+.knowledge-toggle.active { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent); }
+.project-selector { display: flex; align-items: center; gap: 7px; flex: 1; color: var(--muted); min-width: 0; }
+.project-selector select { width: 100%; max-width: 260px; min-width: 0; border: 0; border-radius: 6px; background: transparent; font-size: 12px; color: var(--text); padding: 6px 18px 6px 0; cursor: pointer; text-overflow: ellipsis; }
+.project-selector select:focus-visible { background-color: var(--surface); }
+.project-selector.disabled { opacity: .65; }
+.project-selector select:disabled { cursor: not-allowed; }
+.manage-link { display: inline-flex; align-items: center; gap: 4px; min-height: 32px; margin-left: auto; padding: 4px; border-radius: 6px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.manage-link:hover { color: var(--accent); background: var(--surface); }
+.composer-hint { font-size: 11px; color: var(--muted); text-align: center; margin: 12px 0 0; line-height: 1.5; }
+.composer-hint.project-error { color: var(--danger); }
+.composer-footer { display: flex; justify-content: space-between; gap: 12px; max-width: 748px; margin: 12px auto 0; }
+.hint-divider { padding: 0 8px; color: var(--subtle); }
 .persist-notice { flex-shrink: 0; margin: 0 auto; width: min(768px, calc(100% - 64px)); }
 @media (max-width: 760px) {
-  .chat-area { padding: 40px 18px 24px; }
-  .empty-title { font-size: 26px; }
-  .suggestions { grid-template-columns: 1fr; max-width: 360px; gap: 8px; margin-top: 26px; }
-  .suggestions button { padding: 11px 14px; }
-  .suggestion-index { width: auto; }
+  .chat-header { min-height: 72px; padding: 12px 16px 12px 64px; gap: 12px; }
+  .chat-heading h1 { font-size: 14px; }
+  .mode-indicator { padding: 5px 8px; font-size: 10px; }
+  .chat-area { padding: 24px 18px 16px; }
+  .welcome-brand { width: 54px; height: 54px; margin-bottom: 18px; border-radius: 18px; }
+  .welcome-state h2 { max-width: 320px; font-size: 24px; }
+  .welcome-description { max-width: 320px; font-size: 12px; }
+  .suggestions { gap: 8px; margin-top: 28px; }
+  .suggestion-card { padding: 14px 12px; border-radius: 12px; }
+  .suggestion-card strong { font-size: 12px; }
+  .suggestion-card > span { font-size: 10px; }
+  .suggestion-card .suggestion-arrow { display: none; }
   .input-bar { padding: 8px 12px max(12px, env(safe-area-inset-bottom)); }
   .persist-notice { width: calc(100% - 24px); }
   .input-inner { padding: 10px 12px; }
-  .mode-description { display: none; }
+  .input-options { gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .project-selector { flex: 1 1 100px; }
+  .project-selector select { max-width: 190px; }
+  .keyboard-hint { display: none; }
+  .composer-footer { justify-content: center; font-size: 10px; margin-top: 10px; }
+  .chat-navigation { right: 14px; bottom: 8px; }
 }
-@media (max-height: 650px) {
-  .welcome-state { padding: 8px 0; }
-  .empty-seal { display: none; }
+@container chat-content (max-height: 480px) {
+  .chat-area.chat-area-empty { padding-block: 12px; }
+  .welcome-brand { width: 42px; height: 42px; margin-bottom: 12px; border-radius: 14px; }
+  .welcome-brand .brand-mark { width: 28px; height: 28px; }
+  .welcome-kicker { margin-bottom: 8px; }
+  .welcome-state h2 { font-size: 22px; }
+  .welcome-description { margin-top: 10px; }
   .suggestions { margin-top: 20px; }
+  .suggestion-card { padding: 12px; }
+}
+@container chat-content (max-height: 360px) {
+  .welcome-brand { display: none; }
+  .suggestions { margin-top: 16px; }
+}
+@media (max-width: 380px) {
+  .suggestion-card { gap: 6px; padding: 12px 8px; }
+  .suggestion-card > .app-icon { margin-bottom: 2px; }
+  .suggestion-card > span { display: none; }
+  .manage-link { font-size: 10px; }
 }
 </style>

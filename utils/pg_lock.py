@@ -9,10 +9,18 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 
 import psycopg
 
 PG_LOCK_KEY_SETUP = 0x64656571
+
+
+def project_index_lock_key(user_id: int, project_id: str) -> int:
+    """每个账号项目独立的稳定咨询锁，不阻塞其他项目的索引操作。"""
+    from uuid import UUID
+    scope = f"knowledge-index:{int(user_id)}:{UUID(str(project_id))}"
+    return int.from_bytes(hashlib.sha256(scope.encode()).digest()[:8], "big", signed=True)
 
 
 @contextmanager

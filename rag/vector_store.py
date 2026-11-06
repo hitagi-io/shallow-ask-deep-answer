@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import threading
 import uuid
+from collections import OrderedDict
 
 from langchain_community.embeddings import DashScopeEmbeddings
 import langchain_community.embeddings.dashscope as _dashscope_embeddings
@@ -15,7 +17,7 @@ from dotenv import load_dotenv
 from rag.index_manifest import IndexManifest, ManifestStore, chunks_match, current_index_version, text_sha256
 from utils.config_loader import vector_db_config
 from utils.knowledge_files import list_supported_files, compute_file_sha256, get_document_loader
-from utils.project_paths import resolve_project_path
+from utils.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
 from utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -25,30 +27,39 @@ _embedding_batch_size = vector_db_config.get("embedding_batch_size")
 if _embedding_batch_size:
     _dashscope_embeddings.BATCH_SIZE[vector_db_config["embedding_model"]] = int(_embedding_batch_size)
 
-_vector_store_instance: VectorStore | None = None
+_vector_stores: OrderedDict[tuple[int, str], VectorStore] = OrderedDict()
 _lock = threading.Lock()
+_MAX_CACHED_PROJECTS = 128
 _INDEX_MAX_ATTEMPTS = 3
 _INDEX_RETRY_SLEEP = 1.0
 _INDEX_FAIL_GENERIC = "入库失败，详见服务端日志"
 
 
-def get_vector_store() -> "VectorStore":
-    global _vector_store_instance
-    if _vector_store_instance is None:
-        with _lock:
-            if _vector_store_instance is None:
-                _vector_store_instance = VectorStore()
-    return _vector_store_instance
+def get_vector_store(user_id: int, project_id: str) -> "VectorStore":
+    scope = knowledge_scope(user_id, project_id)
+    with _lock:
+        if scope not in _vector_stores:
+            _vector_stores[scope] = VectorStore(*scope)
+            if len(_vector_stores) > _MAX_CACHED_PROJECTS:
+                _vector_stores.popitem(last=False)
+        _vector_stores.move_to_end(scope)
+        return _vector_stores[scope]
 
 
 class VectorStore:
     _ITER_BATCH_SIZE = 1000
 
-    def __init__(self):
-        self.manifests = ManifestStore(vector_db_config)
+    def __init__(self, user_id: int, project_id: str):
+        self.user_id, self.project_id = knowledge_scope(user_id, project_id)
+        self.knowledge_dir = get_knowledge_dir(self.user_id, self.project_id)
+        prefix = vector_db_config["collection_prefix"]
+        if not isinstance(prefix, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", prefix):
+            raise ValueError("collection_prefix 必须是以字母开头的字母、数字或下划线，最多 80 字符")
+        collection_name = f"{prefix}_u{self.user_id}_p{uuid.UUID(self.project_id).hex}"
+        self.manifests = ManifestStore({**vector_db_config, "collection_name": collection_name})
         self.index_version = current_index_version(vector_db_config)
         self.vector_store = Milvus(
-            collection_name=vector_db_config["collection_name"],
+            collection_name=collection_name,
             embedding_function=DashScopeEmbeddings(model=vector_db_config["embedding_model"]),
             connection_args={
                 "uri": vector_db_config["milvus_uri"],
@@ -69,7 +80,22 @@ class VectorStore:
         self._store_lock = threading.RLock()
 
     def get_retriever(self):
+        with self._store_lock:
+            vs = self.vector_store
+            # 另一个 worker 可能刚为之前的空项目创建集合，补齐客户端字段与检索配置。
+            if vs.client.has_collection(collection_name=vs.collection_name) and not vs.fields:
+                vs._init()
         return self._retriever
+
+    def drop_project_index(self) -> None:
+        """调用方持有项目排他锁并禁止新生成后，清除此项目的向量及清单。"""
+        with self._store_lock:
+            vs = self.vector_store
+            if vs.client.has_collection(collection_name=vs.collection_name):
+                vs.client.drop_collection(collection_name=vs.collection_name)
+            self.manifests.delete_all()
+            with _lock:
+                _vector_stores.pop((self.user_id, self.project_id), None)
 
     def chunk_rows(self, expression: str = "") -> list[dict]:
         """强一致性游标遍历；空集合属于正常初始状态，连接错误继续抛出。"""
@@ -101,15 +127,16 @@ class VectorStore:
         return self.chunk_rows(f"content_sha256 == {json.dumps(sha256)}")
 
     def manifest_is_current(self, manifest: IndexManifest, rows: list[dict] | None = None) -> bool:
+        source = scoped_knowledge_file(self.knowledge_dir, manifest.source)
         if (manifest.state != "ready" or manifest.index_version != self.index_version
-                or compute_file_sha256(manifest.source) != manifest.content_sha256):
+                or compute_file_sha256(source) != manifest.content_sha256):
             return False
         return chunks_match(manifest, self._content_rows(manifest.content_sha256) if rows is None else rows)
 
     def index_pending_files(self, file_paths=None) -> list[dict]:
         """补建未入库或校验失败的内容；成功后清理同路径的过期版本。"""
         paths = file_paths if file_paths is not None else list_supported_files(
-            vector_db_config["knowledge_dir"], tuple(vector_db_config["allowed_types"])
+            self.knowledge_dir, tuple(vector_db_config["allowed_types"])
         )
         failures = []
         with self._store_lock:
@@ -132,7 +159,7 @@ class VectorStore:
         重建已有内容时保留旧清单和向量，失败只删除本次预分配的主键。
         调用方须持有 API 层的 PostgreSQL 索引写锁。
         """
-        file_path = resolve_project_path(file_path)
+        file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
         result = {"file": file_path, "chunks": None, "ok": False, "error": _INDEX_FAIL_GENERIC}
         with self._store_lock:
             sha256 = compute_file_sha256(file_path)
@@ -204,6 +231,7 @@ class VectorStore:
             return result
 
     def pks_by_source(self, file_path: str) -> list:
+        file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
         return [row["pk"] for row in self.chunk_rows(f"source == {json.dumps(file_path)}")]
 
     def delete_vectors_by_source(self, file_path: str) -> int:
@@ -220,7 +248,7 @@ class VectorStore:
 
     def _another_file_with_same_content(self, file_path: str, sha256: str) -> str | None:
         norm_self = os.path.normcase(os.path.abspath(file_path))
-        for path in list_supported_files(vector_db_config["knowledge_dir"], tuple(vector_db_config["allowed_types"])):
+        for path in list_supported_files(self.knowledge_dir, tuple(vector_db_config["allowed_types"])):
             if os.path.normcase(os.path.abspath(path)) == norm_self:
                 continue
             digest = compute_file_sha256(path)
@@ -232,7 +260,7 @@ class VectorStore:
 
     def _retire_source_versions(self, file_path: str, keep_sha256: str | None = None) -> None:
         """过期内容先转移到同内容副本；无副本时先删向量再删清单，失败仍可追踪。"""
-        file_path = resolve_project_path(file_path)
+        file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
         for sha256, record in self.manifests.all().items():
             if os.path.normcase(record.source) != os.path.normcase(file_path) or sha256 == keep_sha256:
                 continue
@@ -254,7 +282,8 @@ class VectorStore:
 
     def replace_and_index_file(self, file_path: str, tmp_path: str) -> dict:
         """覆盖失败回滚源文件；提交新清单前始终保留旧向量和清单。"""
-        file_path = resolve_project_path(file_path)
+        file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
+        tmp_path = scoped_knowledge_file(self.knowledge_dir, tmp_path)
         with self._store_lock:
             existed = os.path.isfile(file_path)
             backup = os.path.join(os.path.dirname(file_path), f".bak_{uuid.uuid4().hex}")

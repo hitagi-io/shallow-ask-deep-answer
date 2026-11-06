@@ -5,12 +5,10 @@ import os
 import re
 import random
 import threading
-import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
-import psycopg
 from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -47,13 +45,13 @@ LOGIN_IP_RATE_LIMIT = int(os.getenv("LOGIN_IP_RATE_LIMIT", "100"))
 LOGIN_IP_RATE_WINDOW_SECONDS = int(os.getenv("LOGIN_IP_RATE_WINDOW_SECONDS", "60"))
 LOGIN_ACCOUNT_IP_MAX_ATTEMPTS = int(os.getenv("LOGIN_ACCOUNT_IP_MAX_ATTEMPTS", "5"))
 LOGIN_ACCOUNT_IP_WINDOW_SECONDS = int(os.getenv("LOGIN_ACCOUNT_IP_WINDOW_SECONDS", "900"))
-USER_CACHE_TTL_SECONDS = int(os.getenv("USER_CACHE_TTL_SECONDS", "30"))
 REGISTER_RATE_LIMIT = int(os.getenv("REGISTER_RATE_LIMIT", "5"))
 REGISTER_RATE_WINDOW_SECONDS = int(os.getenv("REGISTER_RATE_WINDOW_SECONDS", "3600"))
 
 # 对话并发槽位的跨进程咨询锁（advisory lock）命名空间（二参数形式：classid, user_id）。
 _CHAT_SLOT_LOCK_CLASS = 0x64656573
 _CONVERSATION_CREATE_LOCK_CLASS = 0x64656563
+_ACCOUNT_LOCK_CLASS = 0x64656561
 
 
 _pool: ConnectionPool | None = None
@@ -88,7 +86,7 @@ def _connection():
 
 
 def init_db():
-    """创建所需表（users、conversations、messages、rate_limits）。"""
+    """在全新数据库中创建账号、私有项目、会话及生成任务结构。"""
     with exclusive_section(PG_CONN, PG_LOCK_KEY_SETUP):
         with _connection() as conn:
             with conn.cursor() as cur:
@@ -97,19 +95,38 @@ def init_db():
                         id          SERIAL PRIMARY KEY,
                         username    VARCHAR(50) UNIQUE NOT NULL,
                         password    VARCHAR(255) NOT NULL,
-                        role        VARCHAR(10) NOT NULL DEFAULT 'user'
-                            CHECK (role IN ('user', 'admin')),
                         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS projects (
+                        id          VARCHAR(36) PRIMARY KEY,
+                        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        name        VARCHAR(80) NOT NULL CHECK (length(trim(name)) > 0),
+                        created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE (user_id, id)
+                    );
+                """)
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER NOT NULL DEFAULT 0")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_projects_user_updated "
+                    "ON projects (user_id, updated_at DESC, id DESC)"
+                )
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS conversations (
                         id          VARCHAR(36) PRIMARY KEY,
                         user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                         title       VARCHAR(255) NOT NULL DEFAULT '新对话',
                         kb_only     BOOLEAN,
+                        project_id  VARCHAR(36),
                         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE (user_id, id),
+                        FOREIGN KEY (user_id, project_id) REFERENCES projects(user_id, id) ON DELETE CASCADE,
+                        CHECK ((kb_only IS NULL AND project_id IS NULL)
+                            OR (kb_only IS TRUE AND project_id IS NOT NULL)
+                            OR (kb_only IS FALSE AND project_id IS NULL))
                     );
                 """)
                 cur.execute("""
@@ -129,6 +146,10 @@ def init_db():
                     "ON conversations (user_id, updated_at DESC, id DESC)"
                 )
                 cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_conversations_project "
+                    "ON conversations (user_id, project_id)"
+                )
+                cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_messages_conversation "
                     "ON messages (conversation_id, id)"
                 )
@@ -137,27 +158,35 @@ def init_db():
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS generations (
                         id                  BIGSERIAL PRIMARY KEY,
-                        conversation_id     VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                        conversation_id     VARCHAR(36) NOT NULL,
                         user_id             INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                         request_id          VARCHAR(64) NOT NULL,
-                        kb_only             BOOLEAN,
+                        kb_only             BOOLEAN NOT NULL,
+                        project_id          VARCHAR(36),
                         status              VARCHAR(16) NOT NULL DEFAULT 'running'
                             CHECK (status IN ('running', 'completed', 'failed', 'cancelled')),
                         cancel_requested    BOOLEAN NOT NULL DEFAULT FALSE,
                         error               TEXT,
+                        phase               TEXT NOT NULL DEFAULT 'thinking',
                         user_message_id     BIGINT,
                         assistant_message_id BIGINT,
                         heartbeat_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         updated_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE (conversation_id, request_id)
+                        UNIQUE (conversation_id, request_id),
+                        FOREIGN KEY (user_id, conversation_id) REFERENCES conversations(user_id, id) ON DELETE CASCADE,
+                        FOREIGN KEY (user_id, project_id) REFERENCES projects(user_id, id) ON DELETE CASCADE,
+                        CHECK ((kb_only AND project_id IS NOT NULL) OR (NOT kb_only AND project_id IS NULL))
                     );
                 """)
                 cur.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS uq_generations_running "
                     "ON generations (conversation_id) WHERE status = 'running'"
                 )
-                cur.execute("ALTER TABLE generations ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT 'thinking'")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_generations_project "
+                    "ON generations (user_id, project_id)"
+                )
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS rate_limits (
                         id           BIGSERIAL PRIMARY KEY,
@@ -225,11 +254,11 @@ def _validate_password(password: str) -> str | None:
 
 
 
-def _create_token(user_id: int, username: str, role: str) -> str:
+def _create_token(user_id: int, username: str, auth_version: int = 0) -> str:
     payload = {
         "user_id": user_id,
         "username": username,
-        "role": role,
+        "auth_version": auth_version,
         "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
@@ -238,46 +267,21 @@ def _create_token(user_id: int, username: str, role: str) -> str:
 def verify_token(token: str) -> dict | None:
     """验证 JWT，返回 payload 或 None。"""
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return payload if payload.get("purpose", "access") == "access" else None
     except jwt.PyJWTError:
         return None
 
 
 def get_user_by_id(user_id: int) -> dict | None:
-    """按 id 查询用户（不缓存），返回 {'id', 'username', 'role'}；不存在返回 None。"""
+    """按 id 查询用户及凭证版本（不缓存）；不存在返回 None。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT id, username, role FROM users WHERE id = %s",
+                "SELECT id, username, auth_version FROM users WHERE id = %s",
                 (user_id,),
             )
             return cur.fetchone()
-
-
-_user_cache: dict[int, tuple[float, dict | None]] = {}
-_user_cache_lock = threading.Lock()
-_USER_CACHE_MAX_ENTRIES = 20000
-
-
-def get_user_cached(user_id: int) -> dict | None:
-    """带短 TTL 缓存的用户查询，供 JWT 验签后的账号复核使用。"""
-    now = time.monotonic()
-    with _user_cache_lock:
-        cached = _user_cache.get(user_id)
-        if cached is not None and now - cached[0] < USER_CACHE_TTL_SECONDS:
-            return cached[1]
-    user = get_user_by_id(user_id)
-    with _user_cache_lock:
-        if len(_user_cache) >= _USER_CACHE_MAX_ENTRIES:
-            expired = [k for k, v in _user_cache.items() if now - v[0] >= USER_CACHE_TTL_SECONDS]
-            if expired:
-                for k in expired:
-                    _user_cache.pop(k, None)
-            else:
-                _user_cache.clear()
-        _user_cache[user_id] = (now, user)
-    return user
-
 
 
 _RATE_PURGE_PROBABILITY = 0.01
@@ -344,7 +348,7 @@ def consume_rate_limit(scope: str, key: str, limit: int, window_seconds: int) ->
 
 
 def register(username: str, password: str, ip: str | None = None) -> dict:
-    """注册新用户（角色固定为 user）。返回 {'ok': True} 或 {'ok': False, 'error': ...}。"""
+    """注册新用户。返回 {'ok': True} 或 {'ok': False, 'error': ...}。"""
     username = username.strip()
     if not username or len(username) < 2:
         return {"ok": False, "error": "用户名至少 2 个字符"}
@@ -361,9 +365,9 @@ def register(username: str, password: str, ip: str | None = None) -> dict:
     with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO users (username, password, role) VALUES (%s, %s, %s) "
+                "INSERT INTO users (username, password) VALUES (%s, %s) "
                 "ON CONFLICT (username) DO NOTHING",
-                (username, password_hash, "user"),
+                (username, password_hash),
             )
             created = cur.rowcount > 0
         conn.commit()
@@ -417,7 +421,7 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
                 _rate_record(cur, "login_ip", ip, now)
 
             cur.execute(
-                "SELECT id, username, password, role FROM users WHERE username = %s",
+                "SELECT id, username, password, auth_version FROM users WHERE username = %s",
                 (username,),
             )
             row = cur.fetchone()
@@ -438,17 +442,123 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
                 return {"ok": False, "error": "尝试过于频繁，请稍后再试", "rate_limited": True}
         return {"ok": False, "error": "用户名或密码错误"}
 
-    token = _create_token(row["id"], row["username"], row["role"])
+    token = _create_token(row["id"], row["username"], row["auth_version"])
     return {
         "ok": True,
         "token": token,
         "user": {
             "id": row["id"],
             "username": row["username"],
-            "role": row["role"],
         },
     }
 
+
+
+_PROJECT_FIELDS = "id, name, created_at, updated_at"
+
+
+def _project_name(name: str) -> str:
+    name = name.strip()
+    if not 1 <= len(name) <= 80:
+        raise ValueError("项目名称需为 1～80 个字符")
+    return name
+
+
+def list_projects(user_id: int) -> list[dict]:
+    with _connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT {_PROJECT_FIELDS} FROM projects WHERE user_id = %s "
+                        "ORDER BY updated_at DESC, id DESC", (user_id,))
+            return cur.fetchall()
+
+
+def list_project_scopes() -> list[dict]:
+    """内部维护任务枚举存储范围；不作为用户接口返回。"""
+    with _connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT id, user_id FROM projects ORDER BY user_id, id")
+            return cur.fetchall()
+
+
+def get_project(user_id: int, project_id: str) -> dict | None:
+    with _connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT {_PROJECT_FIELDS} FROM projects WHERE id = %s AND user_id = %s",
+                        (project_id, user_id))
+            return cur.fetchone()
+
+
+@contextmanager
+def project_access(user_id: int, project_id: str):
+    """文件及索引操作持有项目读锁，防止归属检查与外部操作之间发生项目删除。"""
+    with _connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"SELECT {_PROJECT_FIELDS} FROM projects WHERE id = %s AND user_id = %s FOR SHARE",
+                        (project_id, user_id))
+            project = cur.fetchone()
+        yield project
+
+
+def account_write_access(cur, user_id: int) -> None:
+    """与注销互斥；等待结束后重新验证账号，防止旧请求在删除后创建数据。"""
+    cur.execute("SELECT pg_advisory_xact_lock_shared(%s, %s)", (_ACCOUNT_LOCK_CLASS, user_id))
+    cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+    if cur.fetchone() is None:
+        raise ValueError("账号不存在或已被注销")
+
+
+def create_project(user_id: int, name: str) -> dict:
+    name = _project_name(name)
+    with _connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            account_write_access(cur, user_id)
+            cur.execute("INSERT INTO projects (id, user_id, name) VALUES (%s, %s, %s) "
+                        f"RETURNING {_PROJECT_FIELDS}", (str(uuid.uuid4()), user_id, name))
+            project = cur.fetchone()
+        conn.commit()
+        return project
+
+
+def update_project(user_id: int, project_id: str, name: str) -> dict | None:
+    name = _project_name(name)
+    with _connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("UPDATE projects SET name = %s, updated_at = CURRENT_TIMESTAMP "
+                        f"WHERE id = %s AND user_id = %s RETURNING {_PROJECT_FIELDS}",
+                        (name, project_id, user_id))
+            project = cur.fetchone()
+        conn.commit()
+        return project
+
+
+def delete_project(user_id: int, project_id: str, stale_seconds: float = 120, cleanup=None) -> dict:
+    """删除私有项目及其会话；运行中拒绝删除。cleanup(ids) 在持锁事务内清理外部存储。"""
+    with _connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            # 与登记生成保持相同顺序：项目行锁在先，会话咨询锁在后。
+            cur.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s FOR UPDATE",
+                        (project_id, user_id))
+            if cur.fetchone() is None:
+                return {"status": "not_found", "conversation_ids": []}
+            cur.execute("SELECT id FROM conversations WHERE project_id = %s AND user_id = %s ORDER BY id",
+                        (project_id, user_id))
+            conversation_ids = [row["id"] for row in cur.fetchall()]
+            for conv_id in conversation_ids:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
+                cur.execute("SELECT id FROM conversations WHERE id = %s AND user_id = %s FOR UPDATE",
+                            (conv_id, user_id))
+                _reap_stale_generations(cur, conv_id, stale_seconds)
+            cur.execute("SELECT 1 FROM generations WHERE project_id = %s AND user_id = %s "
+                        "AND status = 'running' LIMIT 1", (project_id, user_id))
+            if cur.fetchone() is not None:
+                conn.commit()
+                return {"status": "busy", "conversation_ids": conversation_ids}
+        if cleanup is not None:
+            cleanup(conversation_ids)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM projects WHERE id = %s AND user_id = %s", (project_id, user_id))
+        conn.commit()
+        return {"status": "deleted", "conversation_ids": conversation_ids}
 
 
 def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None) -> dict:
@@ -473,8 +583,9 @@ def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None)
                 "SELECT c.id, c.title, c.updated_at, "
                 "c.updated_at AT TIME ZONE current_setting('TIMEZONE') AS display_time, "
                 "EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id) AS has_messages, "
-                "c.kb_only "
-                "FROM conversations c WHERE c.user_id = %s" + boundary +
+                "c.kb_only, c.project_id, p.name AS project_name "
+                "FROM conversations c LEFT JOIN projects p ON p.id = c.project_id AND p.user_id = c.user_id "
+                "WHERE c.user_id = %s" + boundary +
                 " ORDER BY c.updated_at DESC, c.id DESC LIMIT %s", params,
             )
             rows = cur.fetchall()
@@ -488,7 +599,8 @@ def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None)
     return {
         "conversations": [{"id": r["id"], "title": r["title"],
                            "updatedAt": r["display_time"].isoformat(),
-                           "hasMessages": r["has_messages"], "kbOnly": r["kb_only"]} for r in page],
+                           "hasMessages": r["has_messages"], "kbOnly": r["kb_only"],
+                           "project_id": r["project_id"], "project_name": r["project_name"]} for r in page],
         "next_cursor": next_cursor,
     }
 
@@ -504,7 +616,9 @@ def list_messages(
     limit = max(1, min(limit, 100))
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT id, kb_only FROM conversations WHERE id = %s AND user_id = %s FOR SHARE",
+            cur.execute("SELECT c.id, c.kb_only, c.project_id, p.name AS project_name FROM conversations c "
+                        "LEFT JOIN projects p ON p.id = c.project_id AND p.user_id = c.user_id "
+                        "WHERE c.id = %s AND c.user_id = %s FOR SHARE OF c",
                         (conv_id, user_id))
             conversation = cur.fetchone()
             if conversation is None:
@@ -528,6 +642,7 @@ def list_messages(
     page = rows[:limit]
     return {"messages": list(reversed(page)),
             "kbOnly": conversation["kb_only"],
+            "project_id": conversation["project_id"], "project_name": conversation["project_name"],
             "active_generation": active_generation,
             "next_before": page[-1]["id"] if len(rows) > limit else None}
 
@@ -537,6 +652,7 @@ def create_conversation(user_id: int, conv_id: str, title: str) -> dict | None:
     """复用用户唯一的空白会话，否则创建；ID 冲突时返回 None。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            account_write_access(cur, user_id)
             # 同一用户跨标签页、跨进程的新建操作串行化，不依赖前端是否加载了全部分页。
             cur.execute("SELECT pg_advisory_xact_lock(%s, %s)",
                         (_CONVERSATION_CREATE_LOCK_CLASS, user_id))
@@ -574,7 +690,8 @@ def create_conversation(user_id: int, conv_id: str, title: str) -> dict | None:
         if row is None:
             return None
         return {"id": row["id"], "title": row["title"],
-                "updatedAt": row["display_time"].isoformat(), "hasMessages": False, "kbOnly": None}
+                "updatedAt": row["display_time"].isoformat(), "hasMessages": False, "kbOnly": None,
+                "project_id": None, "project_name": None}
 
 
 def update_conversation_title(user_id: int, conv_id: str, title: str) -> bool:
@@ -600,11 +717,13 @@ def _conversation_lock_key(conv_id: str) -> int:
 
 _GENERATION_REPLAY_QUERY = """
     SELECT g.id, g.request_id, g.status, g.error, g.phase,
-           g.user_message_id, g.assistant_message_id, g.kb_only,
+           g.user_message_id, g.assistant_message_id, g.kb_only, g.project_id,
+           p.name AS project_name,
            EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - g.created_at)) AS elapsed_seconds,
            m.content AS assistant_content
     FROM generations g
     LEFT JOIN messages m ON m.id = g.assistant_message_id
+    LEFT JOIN projects p ON p.id = g.project_id AND p.user_id = g.user_id
     WHERE g.conversation_id = %s AND g.request_id = %s
 """
 
@@ -626,16 +745,8 @@ def _reap_stale_generations(cur, conv_id: str, stale_seconds: float) -> int:
     rows = cur.fetchall()
     for row in rows:
         message_id = row["assistant_message_id"]
-        if message_id is None:
-            cur.execute(
-                "INSERT INTO messages (conversation_id, role, content, status, generation_id, kb_only) "
-                "VALUES (%s, 'assistant', %s, 'error', %s, %s) RETURNING id",
-                (conv_id, "回答已中断，请重新提问。", row["id"], row["kb_only"]),
-            )
-            message_id = cur.fetchone()["id"]
-        else:
-            cur.execute("UPDATE messages SET status = 'error', content = CASE WHEN content = '' "
-                        "THEN '回答已中断，请重新提问。' ELSE content END WHERE id = %s", (message_id,))
+        cur.execute("UPDATE messages SET status = 'error', content = CASE WHEN content = '' "
+                    "THEN '回答已中断，请重新提问。' ELSE content END WHERE id = %s", (message_id,))
         cur.execute(
             "UPDATE generations SET status = 'failed', error = %s, "
             "assistant_message_id = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
@@ -653,12 +764,13 @@ def begin_generation(
     content: str,
     stale_seconds: float,
     kb_only: bool = True,
+    project_id: str | None = None,
 ) -> dict:
     """登记一次生成任务，并原子写入用户消息。
 
     同一会话同时只允许一个运行中的任务（由数据库部分唯一索引保证），
-    首次接受消息时固定会话模式，后续请求不得更改；模式绑定与消息原子提交。
-    同一模式的 request_id 重复到达时返回既有任务，跨模式复用则拒绝重放。
+    首次接受消息时固定会话模式和私有项目，绑定与消息原子提交。
+    request_id 重放也必须匹配模式和项目；归属检查不依赖前端传入用户信息。
 
     返回：
     - {"status": "started", "generation_id": ..., "user_message_id": ...}
@@ -666,14 +778,28 @@ def begin_generation(
     - {"status": "busy"}
     - {"status": "mode_conflict"}：请求编号已经用于其他模式
     - {"status": "conversation_mode_conflict"}：会话已经固定为其他模式
+    - {"status": "project_required"}：知识库模式未选择项目
+    - {"status": "project_not_found"}：项目不存在或不属于当前用户
+    - {"status": "project_conflict"}：通用模式携带项目，或重放使用了不同项目
+    - {"status": "conversation_project_conflict"}：会话已经固定为其他项目
     - {"status": "not_found"}：会话不存在或不属于当前用户
     """
+    if kb_only and not project_id:
+        return {"status": "project_required"}
+    if not kb_only and project_id is not None:
+        return {"status": "project_conflict"}
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            account_write_access(cur, user_id)
+            if project_id is not None:
+                cur.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s FOR SHARE",
+                            (project_id, user_id))
+                if cur.fetchone() is None:
+                    return {"status": "project_not_found"}
             # 与删除会话共用同一把事务级咨询锁（advisory lock），避免「登记—删除」互相穿插
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
             cur.execute(
-                "SELECT id, kb_only FROM conversations WHERE id = %s AND user_id = %s FOR SHARE",
+                "SELECT id, kb_only, project_id FROM conversations WHERE id = %s AND user_id = %s FOR UPDATE",
                 (conv_id, user_id),
             )
             conversation = cur.fetchone()
@@ -683,6 +809,8 @@ def begin_generation(
             if conversation["kb_only"] is not None and conversation["kb_only"] != kb_only:
                 conn.rollback()
                 return {"status": "conversation_mode_conflict"}
+            if conversation["kb_only"] is not None and conversation["project_id"] != project_id:
+                return {"status": "conversation_project_conflict"}
 
             _reap_stale_generations(cur, conv_id, stale_seconds)
 
@@ -692,32 +820,22 @@ def begin_generation(
                 conn.commit()
                 if existing["kb_only"] != kb_only:
                     return {"status": "mode_conflict"}
+                if existing["project_id"] != project_id:
+                    return {"status": "project_conflict"}
                 return {"status": "replay", "generation": existing}
 
-            try:
-                cur.execute(
-                    "INSERT INTO generations (conversation_id, user_id, request_id, kb_only) "
-                    "VALUES (%s, %s, %s, %s) RETURNING id",
-                    (conv_id, user_id, request_id, kb_only),
-                )
-                generation_id = cur.fetchone()["id"]
-            except psycopg.errors.UniqueViolation:
-                # 并发登记：可能是其他请求占用了运行位，也可能是同一 request_id 同时到达
-                conn.rollback()
-                with conn.cursor(row_factory=dict_row) as cur2:
-                    cur2.execute(_GENERATION_REPLAY_QUERY, (conv_id, request_id))
-                    existing = cur2.fetchone()
-                    cur2.execute(
-                        "SELECT id FROM conversations WHERE id = %s AND user_id = %s",
-                        (conv_id, user_id),
-                    )
-                    conv_exists = cur2.fetchone() is not None
+            cur.execute("SELECT 1 FROM generations WHERE conversation_id = %s AND status = 'running'",
+                        (conv_id,))
+            if cur.fetchone() is not None:
                 conn.commit()
-                if existing is not None:
-                    if existing["kb_only"] != kb_only:
-                        return {"status": "mode_conflict"}
-                    return {"status": "replay", "generation": existing}
-                return {"status": "busy" if conv_exists else "not_found"}
+                return {"status": "busy"}
+
+            cur.execute(
+                "INSERT INTO generations (conversation_id, user_id, request_id, kb_only, project_id) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (conv_id, user_id, request_id, kb_only, project_id),
+            )
+            generation_id = cur.fetchone()["id"]
 
             cur.execute(
                 "INSERT INTO messages (conversation_id, role, content, generation_id, kb_only) "
@@ -736,8 +854,8 @@ def begin_generation(
                 (user_message_id, assistant_message_id, generation_id),
             )
             cur.execute(
-                "UPDATE conversations SET kb_only = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
-                (kb_only, conv_id),
+                "UPDATE conversations SET kb_only = %s, project_id = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (kb_only, project_id, conv_id),
             )
         conn.commit()
         return {
@@ -820,16 +938,8 @@ def finish_generation(
             if not content and message_status == "error":
                 content = error or "回答已中断，请重新提问。"
             message_id = row["assistant_message_id"]
-            if message_id is None:  # 兼容升级前已登记的任务
-                cur.execute(
-                    "INSERT INTO messages (conversation_id, role, content, status, generation_id, kb_only) "
-                    "VALUES (%s, 'assistant', %s, %s, %s, %s) RETURNING id",
-                    (row["conversation_id"], content, message_status, generation_id, row["kb_only"]),
-                )
-                message_id = cur.fetchone()["id"]
-            else:
-                cur.execute("UPDATE messages SET content = %s, status = %s WHERE id = %s",
-                            (content, message_status, message_id))
+            cur.execute("UPDATE messages SET content = %s, status = %s WHERE id = %s",
+                        (content, message_status, message_id))
             cur.execute(
                 "UPDATE generations SET status = %s, error = %s, assistant_message_id = %s, "
                 "updated_at = CURRENT_TIMESTAMP WHERE id = %s",
@@ -916,6 +1026,7 @@ def acquire_chat_slot(
     """
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            account_write_access(cur, user_id)
             cur.execute(
                 "SELECT pg_advisory_xact_lock(%s, %s)",
                 (_CHAT_SLOT_LOCK_CLASS, user_id),

@@ -5,6 +5,10 @@ import time
 import uuid
 import asyncio
 import threading
+import shutil
+import re
+from pathlib import Path
+from uuid import UUID
 from functools import partial
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -13,16 +17,19 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, R
 import anyio
 import psycopg
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from chat_agent import ChatAgent, PG_CHECKPOINT_POOL_MAX
 from rag.vector_store import get_vector_store
 from rag.index_health import IndexHealth
 from utils.config_loader import vector_db_config
-from utils.project_paths import resolve_project_path
-from utils.pg_lock import SingleInstanceGuard, exclusive_section, shared_section
+from utils.project_paths import get_knowledge_dir, get_knowledge_storage_root, scoped_knowledge_file
+from utils.pg_lock import SingleInstanceGuard, exclusive_section, project_index_lock_key
 from utils.generation_runner import run_generation
-from utils.health_report_cache import HealthReportCache
+from utils.health_report_cache import HealthReportCache, HealthReportInvalidated
+from utils.health_scan import HealthScanRunner, ProjectGoneError
+from utils.readiness import check_readiness
+from utils.request_wait import wait_for_client
 from utils.logging_config import configure_logging, get_logger
 from auth import (
     PASSWORD_MAX_LENGTH,
@@ -33,7 +40,7 @@ from auth import (
     login,
     consume_rate_limit,
     verify_token,
-    get_user_cached,
+    get_user_by_id,
     list_conversations,
     list_messages,
     create_conversation,
@@ -47,7 +54,15 @@ from auth import (
     acquire_chat_slot,
     bind_chat_slot_generation,
     release_chat_slot,
+    list_projects,
+    get_project,
+    create_project,
+    update_project,
+    delete_project,
+    project_access,
+    list_project_scopes,
 )
+from accounts import AccountError, update_account, prepare_deletion, delete_account
 
 logger = get_logger(__name__)
 configure_logging()
@@ -81,7 +96,7 @@ CHAT_GENERATION_STALE_SECONDS = max(
 
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
-# 就绪检查的依赖探测超时（秒）：PG 建连与 Milvus RPC 都受此限制，避免探针长期占用线程池。
+# 就绪检查的总时限（秒），覆盖进程启动、建连、查询及 RPC。
 READINESS_TIMEOUT_SECONDS = max(float(os.getenv("READINESS_TIMEOUT_SECONDS", "3")), 0.5)
 
 
@@ -108,6 +123,7 @@ def _warn_connection_budget() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    get_knowledge_storage_root()
     anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_SIZE
     logger.info(f"[启动] AnyIO 默认线程池并发额度为 {THREADPOOL_SIZE}，工作进程数为 {UVICORN_WORKERS}")
     _warn_connection_budget()
@@ -132,48 +148,65 @@ app = FastAPI(
 init_db()
 
 agent = ChatAgent()
-vector_store = get_vector_store()
-index_health = IndexHealth()
-
-knowledge_dir = resolve_project_path(vector_db_config["knowledge_dir"])
 allowed_types = vector_db_config["allowed_types"]
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
 
 HEALTH_REPORT_TTL_SECONDS = int(os.getenv("HEALTH_REPORT_TTL_SECONDS", "120"))
-_health_reports = HealthReportCache(HEALTH_REPORT_TTL_SECONDS)
+HEALTH_CHECK_TIMEOUT_SECONDS = max(float(os.getenv("HEALTH_CHECK_TIMEOUT_SECONDS", "60")), 0.5)
+HEALTH_CHECK_MAX_CONCURRENT = max(int(os.getenv("HEALTH_CHECK_MAX_CONCURRENT", "4")), 1)
+_health_reports: dict[tuple[int, str], HealthReportCache] = {}
+_health_reports_lock = threading.Lock()
+_health_scanner = HealthScanRunner(HEALTH_CHECK_TIMEOUT_SECONDS, HEALTH_CHECK_MAX_CONCURRENT)
+_readiness_report = HealthReportCache(1)
 
 
-def _set_health_report(report: dict) -> None:
-    """更新进程内报告缓存并刷新时间戳。"""
-    _health_reports.set(report)
+def _health_cache(user_id: int, project_id: str) -> HealthReportCache:
+    with _health_reports_lock:
+        return _health_reports.setdefault((user_id, project_id), HealthReportCache(HEALTH_REPORT_TTL_SECONDS))
+
+
+def _invalidate_health(user_id: int, project_id: str) -> None:
+    with _health_reports_lock:
+        cache = _health_reports.get((user_id, project_id))
+        if cache is not None:
+            # Keep any in-flight task registered until it has released its resources.
+            cache.invalidate()
+
+
+async def _request_health_snapshot(request: Request, user_id: int, project_id: str,
+                                   refresh: bool = False) -> dict:
+    async def check():
+        return await _health_scanner.scan(user_id, project_id, PG_CONN, INDEX_READ_LOCK_TIMEOUT_SECONDS)
+
+    try:
+        # require_project has already authenticated/authorized this request. Only
+        # the shared scan task acquires index/project locks and storage connections.
+        return await wait_for_client(request, _health_cache(user_id, project_id).get(check, refresh=refresh))
+    except ProjectGoneError:
+        raise HTTPException(status_code=404, detail="项目不存在或已被删除")
+    except HealthReportInvalidated:
+        raise HTTPException(status_code=503, detail="项目状态已变更，请重新检查")
+    except TimeoutError:
+        raise HTTPException(status_code=503, detail="索引检查超时，请稍后重试")
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("[索引健康检查] 检查失败 project_id=%s", project_id)
+        raise HTTPException(status_code=503, detail="无法确认索引状态，请稍后重试")
 
 
 _PG_LOCK_KEY_HEALTH = 0x64656570
 _HEALTH_LEADER_POLL_SECONDS = 60
-
-# 进程内锁无法协调多 worker，所有索引写操作还要持有这把 PG 锁。
-_PG_LOCK_KEY_INDEX_WRITE = 0x64656572
 
 INDEX_WRITE_LOCK_TIMEOUT_SECONDS = int(os.getenv("INDEX_WRITE_LOCK_TIMEOUT_SECONDS", "300"))
 
 INDEX_READ_LOCK_TIMEOUT_SECONDS = int(os.getenv("INDEX_READ_LOCK_TIMEOUT_SECONDS", "30"))
 
 
-def _index_write_section():
+def _index_write_section(user_id: int, project_id: str):
     """索引写操作的跨进程互斥段（写入方使用，带等待上限）。"""
-    return exclusive_section(PG_CONN, _PG_LOCK_KEY_INDEX_WRITE, INDEX_WRITE_LOCK_TIMEOUT_SECONDS)
-
-
-def _replace_and_index(tmp_path: str, dest: str) -> dict:
-    """原子替换 + 入库，整段持有索引写锁。
-
-    "是否存在同名文件"与替换、入库在同一互斥段内判定，并发上传同名文件时
-    后进入者能看到前一个请求的落地结果，不会把覆盖误判成新建。
-    新版本入库并校验通过后才清理旧向量；失败则回滚磁盘文件，旧索引保持可用。
-    """
-    with _index_write_section():
-        return vector_store.replace_and_index_file(dest, tmp_path)
+    return exclusive_section(PG_CONN, project_index_lock_key(user_id, project_id), INDEX_WRITE_LOCK_TIMEOUT_SECONDS)
 
 
 def _format_repair_summary(repair: dict) -> str:
@@ -187,13 +220,16 @@ def _format_repair_summary(repair: dict) -> str:
     )
 
 
-def _auto_heal_report() -> dict:
+def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
     """索引自动修复闭环：健康检查发现问题 → 自动修复 → 复查，直至检查通过或达到轮次上限。
 
     停止条件：report['healthy'] 为 True。Milvus 不可达或修复异常时立即终止，
     等待下一轮健康检查再试。
     """
-    with _index_write_section():
+    with _index_write_section(user_id, project_id), project_access(user_id, project_id) as project:
+        if project is None:
+            return None
+        index_health = IndexHealth(user_id, project_id)
         max_rounds = int(vector_db_config.get("health_auto_repair_max_rounds", 3))
         report = index_health.check()
         for _ in range(max_rounds):
@@ -209,6 +245,7 @@ def _auto_heal_report() -> dict:
             except Exception as e:
                 logger.error(f"[索引自动修复] 执行失败：{e}")
                 break
+        _invalidate_health(user_id, project_id)
         return report
 
 
@@ -234,10 +271,13 @@ async def _scheduled_health_loop():
             await asyncio.sleep(_HEALTH_LEADER_POLL_SECONDS)
             continue
         try:
-            report = await asyncio.to_thread(_auto_heal_report)
-            _set_health_report(report)
-            state = "健康" if report["healthy"] else f"发现 {len(report['issues'])} 类问题"
-            logger.info(f"[索引健康检查] 检查完成：{state}（文件 {report['stats']['files']} 个，向量块 {report['stats']['chunks']} 个）")
+            for scope in await asyncio.to_thread(list_project_scopes):
+                try:
+                    report = await asyncio.to_thread(_auto_heal_report, scope["user_id"], scope["id"])
+                    if report is not None:
+                        logger.info("[索引健康检查] 项目 %s 检查完成 healthy=%s", scope["id"], report["healthy"])
+                except Exception:
+                    logger.exception("[索引健康检查] 项目 %s 检查失败", scope["id"])
         except Exception as e:
             logger.error(f"[索引健康检查] 执行失败：{e}")
         next_run = time.monotonic() + interval
@@ -250,6 +290,12 @@ class ChatRequest(BaseModel):
     # 客户端生成的幂等键：同一会话内重复提交不会重复写消息或重复生成
     request_id: str = Field(pattern=r"^[0-9a-zA-Z_-]{8,64}$")
     kb_only: bool = True
+    project_id: str | None = None
+
+    @field_validator("project_id")
+    @classmethod
+    def normalize_project_id(cls, value: str | None) -> str | None:
+        return str(UUID(value)) if value is not None else None
 
 
 class RegisterRequest(BaseModel):
@@ -262,6 +308,21 @@ class LoginRequest(BaseModel):
     password: str = Field(max_length=PASSWORD_MAX_LENGTH)
 
 
+class UpdateAccountRequest(BaseModel):
+    username: str | None = Field(default=None, min_length=2, max_length=50)
+    current_password: str | None = Field(default=None, max_length=PASSWORD_MAX_LENGTH)
+    new_password: str | None = Field(default=None, max_length=PASSWORD_MAX_LENGTH)
+
+
+class DeletionVerificationRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
+
+
+class DeleteAccountRequest(BaseModel):
+    confirmation_token: str = Field(min_length=1, max_length=2048)
+    confirmation_text: str = Field(min_length=1, max_length=60)
+
+
 class CreateConversationRequest(BaseModel):
     title: str = Field(default="新对话", max_length=CONV_TITLE_MAX_CHARS)
 
@@ -270,13 +331,21 @@ class UpdateTitleRequest(BaseModel):
     title: str = Field(max_length=CONV_TITLE_MAX_CHARS)
 
 
+class ProjectRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("项目名称不能为空")
+        return value
+
+
 
 def get_current_user(authorization: str = Header(None)) -> dict:
-    """从 Authorization header 中解析 JWT，验签后复核账号存续与角色。
-
-    复核结果带短 TTL 缓存（USER_CACHE_TTL_SECONDS），避免每个请求都查库；
-    代价是删号/降权的最长生效延迟等于该 TTL。
-    """
+    """复核账号与凭证版本，让改密和注销在所有 worker 上立即生效。"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="未登录")
     token = authorization[7:]
@@ -286,51 +355,20 @@ def get_current_user(authorization: str = Header(None)) -> dict:
     user_id = payload.get("user_id")
     if user_id is None:
         raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
-    user = get_user_cached(user_id)
+    user = get_user_by_id(user_id)
     if user is None:
         raise HTTPException(status_code=401, detail="账号不存在或已被注销")
-    return {"user_id": user["id"], "username": user["username"], "role": user["role"]}
+    if payload.get("auth_version", 0) != user["auth_version"]:
+        raise HTTPException(status_code=401, detail="密码已更新，请重新登录")
+    return {"user_id": user["id"], "username": user["username"], "auth_version": user["auth_version"]}
 
 
-def require_admin(user: dict = Depends(get_current_user)) -> dict:
-    """仅允许管理员访问。"""
-    if user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="仅管理员可操作")
-    return user
+def require_project(project_id: UUID, user: dict = Depends(get_current_user)) -> dict:
+    project = get_project(user["user_id"], str(project_id))
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在或已被删除")
+    return {**project, "user_id": user["user_id"]}
 
-
-
-def _probe_postgres() -> dict:
-    """独立建连执行 SELECT 1，不占用业务连接池。"""
-    started = time.perf_counter()
-    try:
-        with psycopg.connect(
-            PG_CONN, connect_timeout=max(int(READINESS_TIMEOUT_SECONDS), 1)
-        ) as conn:
-            conn.execute("SELECT 1")
-        return {"ok": True, "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
-    except Exception as e:
-        logger.error(f"[就绪检查] PostgreSQL 不可用：{e}")
-        return {
-            "ok": False,
-            "error": "数据库不可用",
-            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
-        }
-
-
-def _probe_milvus() -> dict:
-    """复用检索实际使用的 Milvus 连接做一次轻量调用。"""
-    started = time.perf_counter()
-    try:
-        vector_store.vector_store.client.list_collections(timeout=READINESS_TIMEOUT_SECONDS)
-        return {"ok": True, "latency_ms": round((time.perf_counter() - started) * 1000, 1)}
-    except Exception as e:
-        logger.error(f"[就绪检查] Milvus 不可用：{e}")
-        return {
-            "ok": False,
-            "error": "向量库不可用",
-            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
-        }
 
 
 @app.get("/api/health")
@@ -340,9 +378,10 @@ def health():
 
 
 @app.get("/api/health/ready")
-def readiness():
-    """就绪检查：探测 PostgreSQL 与 Milvus，任一不可用返回 503。"""
-    checks = {"postgres": _probe_postgres(), "milvus": _probe_milvus()}
+async def readiness(request: Request):
+    """PG 与 Milvus 并行探测；超时结束检查并回收连接，返回暂未就绪。"""
+    checks = await wait_for_client(request, _readiness_report.get(
+        lambda: check_readiness(PG_CONN, vector_db_config["milvus_uri"], READINESS_TIMEOUT_SECONDS)))
     ready = all(item["ok"] for item in checks.values())
     return JSONResponse(
         status_code=200 if ready else 503,
@@ -375,7 +414,59 @@ def api_login(req: LoginRequest, request: Request):
 
 @app.get("/api/auth/me")
 def api_me(user: dict = Depends(get_current_user)):
-    return {"user": {"id": user["user_id"], "username": user["username"], "role": user["role"]}}
+    return {"user": {"id": user["user_id"], "username": user["username"]}}
+
+
+@app.patch("/api/auth/me")
+def api_update_account(req: UpdateAccountRequest, user: dict = Depends(get_current_user)):
+    try:
+        return update_account(user["user_id"], user["auth_version"], **req.model_dump())
+    except AccountError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.post("/api/auth/deletion-verification")
+def api_prepare_deletion(req: DeletionVerificationRequest, user: dict = Depends(get_current_user)):
+    try:
+        return prepare_deletion(user["user_id"], user["auth_version"], req.password)
+    except AccountError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.delete("/api/auth/me")
+def api_delete_account(req: DeleteAccountRequest, user: dict = Depends(get_current_user)):
+    user_id = user["user_id"]
+
+    def cleanup(project_ids, conversation_ids):
+        for conv_id in conversation_ids:
+            _purge_thread_checkpoints(f"{user_id}:{conv_id}")
+        for project_id in project_ids:
+            try:
+                get_vector_store(user_id, project_id).drop_project_index()
+                _remove_project_files(user_id, project_id)
+                agent.forget_project(user_id, project_id)
+            finally:
+                _invalidate_health(user_id, project_id)
+        # Only remove the now-empty account directory, never an unchecked subtree.
+        root = Path(get_knowledge_storage_root()).resolve()
+        account_dir = root / str(user_id)
+        if account_dir.resolve() != account_dir or account_dir.parent != root:
+            raise RuntimeError("无效的账号文件目录")
+        if account_dir.exists():
+            account_dir.rmdir()
+
+    try:
+        delete_account(user_id, user["auth_version"], req.confirmation_token, req.confirmation_text,
+                       cleanup=cleanup,
+                       stale_seconds=CHAT_GENERATION_STALE_SECONDS, slot_max_age=CHAT_SLOT_MAX_AGE_SECONDS)
+        return {"message": "账号及其项目、文档、索引和对话已注销删除"}
+    except AccountError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    except (TimeoutError, psycopg.errors.LockNotAvailable) as exc:
+        raise HTTPException(status_code=409, detail="账号资料正在处理其他操作，请稍后重试注销") from exc
+    except Exception as exc:
+        logger.exception("[账号] 注销清理未完成 user_id=%s", user_id)
+        raise HTTPException(status_code=503, detail="注销清理未完成，部分数据可能已删除。账号仍保留，请重试注销。") from exc
 
 
 
@@ -518,6 +609,7 @@ async def _run_generation(req: ChatRequest, user_id: int, generation_id: int, sl
         await run_generation(
             lambda should_stop: agent.stream_answer(
                 req.message, f"{user_id}:{req.thread_id}", kb_only=req.kb_only, should_stop=should_stop,
+                user_id=user_id, project_id=req.project_id,
             ),
             partial(save_generation_progress, generation_id),
             partial(finish_generation, generation_id),
@@ -529,9 +621,13 @@ async def _run_generation(req: ChatRequest, user_id: int, generation_id: int, sl
         await _release_chat_slot(user_id, slot)
 
 
-async def _generation_events(user_id: int, conv_id: str, request_id: str):
+async def _generation_events(user_id: int, conv_id: str, request_id: str, auth_version: int):
     previous = None
     while True:
+        account = await asyncio.to_thread(get_user_by_id, user_id)
+        if account is None or account["auth_version"] != auth_version:
+            # Reconnecting clients receive 401; old streams stop exposing snapshots.
+            return
         generation = await asyncio.to_thread(
             get_generation, user_id, conv_id, request_id, CHAT_GENERATION_STALE_SECONDS,
         )
@@ -557,7 +653,7 @@ async def resume_generation(conv_id: str, request_id: str, user: dict = Depends(
     )
     if generation is None:
         raise HTTPException(status_code=404, detail="未找到这次回答，请刷新页面后重试。")
-    return StreamingResponse(_generation_events(user["user_id"], conv_id, request_id),
+    return StreamingResponse(_generation_events(user["user_id"], conv_id, request_id, user["auth_version"]),
                              media_type="text/event-stream", headers=SSE_HEADERS)
 
 
@@ -572,14 +668,18 @@ async def stop_generation(conv_id: str, request_id: str, user: dict = Depends(ge
 async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="消息不能为空")
+    if req.kb_only and req.project_id is None:
+        raise HTTPException(status_code=400, detail="请先选择知识库项目")
+    if not req.kb_only and req.project_id is not None:
+        raise HTTPException(status_code=400, detail="通用模式不使用项目")
     existing = await asyncio.to_thread(
         get_generation, user["user_id"], req.thread_id, req.request_id, CHAT_GENERATION_STALE_SECONDS,
     )
     if existing is not None:
-        if existing["kb_only"] != req.kb_only:
-            raise HTTPException(status_code=409, detail="请求编号已用于其他问答模式，请重新发送")
+        if existing["kb_only"] != req.kb_only or existing["project_id"] != req.project_id:
+            raise HTTPException(status_code=409, detail="请求编号已用于其他模式或项目，请重新发送")
         # 幂等重放和恢复只订阅已有任务，不消耗新的并发槽位或发送额度。
-        return StreamingResponse(_generation_events(user["user_id"], req.thread_id, req.request_id),
+        return StreamingResponse(_generation_events(user["user_id"], req.thread_id, req.request_id, user["auth_version"]),
                                  media_type="text/event-stream", headers=SSE_HEADERS)
     if not await asyncio.to_thread(
         consume_rate_limit, "chat", str(user["user_id"]), CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_SECONDS
@@ -606,6 +706,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
             req.message,
             CHAT_GENERATION_STALE_SECONDS,
             req.kb_only,
+            req.project_id,
         )
     except Exception as e:
         await _release_chat_slot(user["user_id"], slot)
@@ -627,6 +728,17 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         await _release_chat_slot(user["user_id"], slot)
         raise HTTPException(status_code=409, detail="此会话的问答模式已固定，请开启新对话后切换模式")
 
+    project_errors = {
+        "project_required": (400, "请先选择知识库项目"),
+        "project_not_found": (404, "项目不存在或已被删除"),
+        "project_conflict": (409, "请求的项目与问答模式或原请求不一致"),
+        "conversation_project_conflict": (409, "此会话的项目已固定，请开启新对话后选择项目"),
+    }
+    if begun["status"] in project_errors:
+        await _release_chat_slot(user["user_id"], slot)
+        status, detail = project_errors[begun["status"]]
+        raise HTTPException(status_code=status, detail=detail)
+
     if begun["status"] == "replay":
         await _release_chat_slot(user["user_id"], slot)
     else:
@@ -639,153 +751,218 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         except Exception:
             logger.exception("[对话流] 关联并发槽位与生成任务失败")
 
-    return StreamingResponse(_generation_events(user["user_id"], req.thread_id, req.request_id),
+    return StreamingResponse(_generation_events(user["user_id"], req.thread_id, req.request_id, user["auth_version"]),
                              media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 
-@app.get("/api/files")
-def list_files(user: dict = Depends(require_admin)):
+@app.get("/api/projects")
+def api_list_projects(user: dict = Depends(get_current_user)):
+    return {"projects": list_projects(user["user_id"])}
+
+
+@app.post("/api/projects", status_code=201)
+def api_create_project(req: ProjectRequest, user: dict = Depends(get_current_user)):
+    return {"project": create_project(user["user_id"], req.name)}
+
+
+@app.patch("/api/projects/{project_id}")
+def api_update_project(req: ProjectRequest, project: dict = Depends(require_project)):
+    updated = update_project(project["user_id"], project["id"], req.name)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="项目不存在或已被删除")
+    return {"project": updated}
+
+
+def _remove_project_files(user_id: int, project_id: str) -> None:
+    # 目录只由经过规范化的账号与UUID构造；删除前再次确认完整路径边界。
+    target = Path(get_knowledge_dir(user_id, project_id)).resolve()
+    account_dir = Path(get_knowledge_dir(user_id, project_id)).parent.resolve()
+    if target.parent != account_dir or target.name != str(UUID(project_id)):
+        raise RuntimeError("无效的项目文件目录")
+    if target.exists():
+        shutil.rmtree(target)
+
+
+@app.delete("/api/projects/{project_id}")
+def api_delete_project(project: dict = Depends(require_project)):
+    user_id, project_id = project["user_id"], project["id"]
+
+    def cleanup(conversation_ids):
+        for conv_id in conversation_ids:
+            _purge_thread_checkpoints(f"{user_id}:{conv_id}")
+        store = get_vector_store(user_id, project_id)
+        store.drop_project_index()
+        _remove_project_files(user_id, project_id)
+        agent.forget_project(user_id, project_id)
+
     try:
-        with shared_section(PG_CONN, _PG_LOCK_KEY_INDEX_WRITE, INDEX_READ_LOCK_TIMEOUT_SECONDS):
-            return {"files": index_health.file_statuses()}
+        with _index_write_section(user_id, project_id):
+            result = delete_project(user_id, project_id, CHAT_GENERATION_STALE_SECONDS, cleanup)
+        if result["status"] == "not_found":
+            raise HTTPException(status_code=404, detail="项目不存在或已被删除")
+        if result["status"] == "busy":
+            raise HTTPException(status_code=409, detail="项目中有回答正在生成，请停止或等待完成后再删除")
+        _invalidate_health(user_id, project_id)
+        return {"message": "项目及其文档、相关对话已删除"}
+    except HTTPException:
+        raise
     except TimeoutError:
-        raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
+        raise HTTPException(status_code=503, detail="项目正在处理其他操作，请稍后重试")
     except Exception:
-        logger.exception("[知识库] 无法读取文件索引状态")
+        logger.exception("[项目] 删除失败 project_id=%s", project_id)
+        raise HTTPException(status_code=503, detail="项目清理未完成，请重试删除")
+    finally:
+        _invalidate_health(user_id, project_id)
+
+
+def _ensure_project(project):
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在或已被删除")
+
+
+def _safe_filename(filename: str) -> str:
+    # 跨平台拒绝目录、Windows设备名、流名称及会发生归一化冲突的名字。
+    if (not filename or len(filename) > 220 or filename.startswith(".")
+            or filename.rstrip(" .") != filename
+            or any(ord(c) < 32 or c in '<>:"/\\|?*' for c in filename)
+            or re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", filename, re.I)):
+        raise ValueError("无效的文件名")
+    return filename
+
+
+@app.get("/api/projects/{project_id}/files")
+async def list_files(request: Request, project: dict = Depends(require_project)):
+    user_id, project_id = project["user_id"], project["id"]
+    # Preserve the file endpoint's fresh-read semantics, while joining a health
+    # scan already running for this project instead of acquiring more connections.
+    snapshot = await _request_health_snapshot(request, user_id, project_id, refresh=True)
+    if snapshot["report"]["milvus_error"] or snapshot["report"]["manifest_error"]:
         raise HTTPException(status_code=503, detail="无法确认索引状态，请稍后重试")
+    return {"files": snapshot["files"]}
 
 
-async def _write_upload_to(f: UploadFile, tmp_path: str) -> int:
-    """分块写入上传内容并累计大小，超过上限立即中断，避免整文件读入内存。"""
+def _write_upload_to(file: UploadFile, tmp_path: str) -> None:
     max_bytes = MAX_UPLOAD_MB * 1024 * 1024
     size = 0
-    with open(tmp_path, "wb") as fp:
-        while chunk := await f.read(1024 * 1024):
+    with open(tmp_path, "wb") as output:
+        while chunk := file.file.read(1024 * 1024):
             size += len(chunk)
             if size > max_bytes:
                 raise ValueError(f"文件超过大小上限 {MAX_UPLOAD_MB} MB")
-            fp.write(chunk)
-    return size
+            output.write(chunk)
+    if size == 0:
+        raise ValueError("文件内容不能为空")
 
 
-@app.post("/api/files/upload")
-async def upload_files(files: list[UploadFile] = File(...), user: dict = Depends(require_admin)):
-    os.makedirs(knowledge_dir, exist_ok=True)
-    uploaded = []
-    errors = []
-    for f in files:
-        name = os.path.basename(f.filename or "")
-        if not name or name.startswith("."):
-            errors.append({"name": name or "(无名文件)", "error": "无效的文件名"})
-            continue
-        ext = os.path.splitext(name)[1].lower()
-        if ext not in allowed_types:
-            errors.append({"name": name, "error": f"不支持的文件类型: {ext}"})
-            continue
-        try:
-            dest = os.path.join(knowledge_dir, name)
-            tmp_path = os.path.join(knowledge_dir, f".tmp_{uuid.uuid4().hex}")
-            try:
-                await _write_upload_to(f, tmp_path)
-                index_result = await asyncio.to_thread(_replace_and_index, tmp_path, dest)
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            if not index_result["ok"]:
-                logger.error(f"[知识库] 入库失败 file={name}：{index_result['error']}")
-            uploaded.append({
-                "name": name,
-                "overwritten": index_result["overwritten"],
-                "indexed": index_result["ok"],
-                "error": None if index_result["ok"] else index_result["error"],
-            })
-        except TimeoutError as e:
-            logger.error(f"[知识库] 上传失败 file={name}：等待索引写锁超时（{e}）")
-            errors.append({"name": name, "error": "索引正被其他操作占用，请稍后重试"})
-        except Exception as e:
-            logger.error(f"[知识库] 上传失败 file={name}：{e}")
-            errors.append({"name": name, "error": "上传失败，详见服务端日志"})
-    return {"uploaded": uploaded, "errors": errors}
-
-
-@app.delete("/api/files/{filename}")
-def delete_file(filename: str, user: dict = Depends(require_admin)):
-    safe_name = os.path.basename(filename)
-    file_path = os.path.join(knowledge_dir, safe_name)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="文件不存在")
+@app.post("/api/projects/{project_id}/files/upload")
+def upload_files(files: list[UploadFile] = File(...), project: dict = Depends(require_project)):
+    user_id, project_id = project["user_id"], project["id"]
+    uploaded, errors = [], []
     try:
-        with _index_write_section():
+        with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
+            _ensure_project(current)
+            knowledge_dir = get_knowledge_dir(user_id, project_id)
+            os.makedirs(knowledge_dir, exist_ok=True)
+            store = get_vector_store(user_id, project_id)
+            for file in files:
+                name = file.filename or ""
+                tmp_path = os.path.join(knowledge_dir, f".tmp_{uuid.uuid4().hex}")
+                try:
+                    name = _safe_filename(name)
+                    extension = os.path.splitext(name)[1].lower()
+                    if extension not in allowed_types:
+                        raise ValueError(f"不支持的文件类型: {extension}")
+                    _write_upload_to(file, tmp_path)
+                    destination = scoped_knowledge_file(knowledge_dir, os.path.join(knowledge_dir, name))
+                    result = store.replace_and_index_file(destination, tmp_path)
+                    uploaded.append({"name": name, "overwritten": result["overwritten"],
+                                     "indexed": result["ok"], "error": result.get("error")})
+                except ValueError as exc:
+                    errors.append({"name": name or "(无名文件)", "error": str(exc)})
+                except Exception:
+                    logger.exception("[知识库] 上传失败 file=%s project_id=%s", name, project_id)
+                    errors.append({"name": name, "error": "上传失败，请稍后重试"})
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+            _invalidate_health(user_id, project_id)
+        return {"uploaded": uploaded, "errors": errors}
+    except TimeoutError:
+        raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
+
+
+@app.delete("/api/projects/{project_id}/files/{filename}")
+def delete_file(filename: str, project: dict = Depends(require_project)):
+    user_id, project_id = project["user_id"], project["id"]
+    try:
+        filename = _safe_filename(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    directory = get_knowledge_dir(user_id, project_id)
+    file_path = scoped_knowledge_file(directory, os.path.join(directory, filename))
+    try:
+        with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
+            _ensure_project(current)
+            if not os.path.isfile(file_path):
+                raise HTTPException(status_code=404, detail="文件不存在")
             os.remove(file_path)
-            vector_store.delete_file_index(file_path)
-        return {"message": f"已删除: {safe_name}"}
-    except TimeoutError as e:
-        logger.error(f"[知识库] 删除失败 file={safe_name}：等待索引写锁超时（{e}）")
+            _invalidate_health(user_id, project_id)
+            get_vector_store(user_id, project_id).delete_file_index(file_path)
+        return {"message": f"已删除: {filename}"}
+    except HTTPException:
+        raise
+    except TimeoutError:
         raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
-    except Exception as e:
-        if os.path.exists(file_path):
-            logger.error(f"[知识库] 删除失败 file={safe_name}：磁盘文件未删除，向量与索引记录未改动（{e}）")
-            raise HTTPException(status_code=500, detail="删除文件失败，请确认文件未被其他程序占用后重试")
-        logger.error(f"[知识库] 删除后清理失败 file={safe_name}：磁盘文件已删除，向量与索引记录未清理（{e}），需执行索引修复")
-        raise HTTPException(status_code=500, detail="文件已删除，但向量/索引记录清理失败，请稍后执行一次「修复」")
+    except Exception:
+        logger.exception("[知识库] 删除失败 file=%s project_id=%s", filename, project_id)
+        detail = "删除文件失败，请稍后重试" if os.path.exists(file_path) else "文件已删除，但索引清理失败，请执行索引修复"
+        raise HTTPException(status_code=500, detail=detail)
 
 
-# 保留路由名，以维持原有反向路由名称和 OpenAPI operationId。
-@app.post("/api/vector/build", name="build_vector")
-def build_knowledge_index(user: dict = Depends(require_admin)):
-    """为尚未入库、分块损坏或版本过期的知识库内容构建索引。"""
+@app.post("/api/projects/{project_id}/vector/build")
+def build_knowledge_index(project: dict = Depends(require_project)):
+    user_id, project_id = project["user_id"], project["id"]
     try:
-        with _index_write_section():
-            failures = vector_store.index_pending_files()
-    except TimeoutError as e:
-        logger.error(f"[知识库] 构建失败：等待索引写锁超时（{e}）")
+        with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
+            _ensure_project(current)
+            failures = get_vector_store(user_id, project_id).index_pending_files()
+            _invalidate_health(user_id, project_id)
+        # API只暴露用户可理解的文件名，绝对存储路径保留在后端。
+        failures = [{**item, "file": os.path.basename(item["file"])} for item in failures]
+        return {"message": f"构建完成，但有 {len(failures)} 个文件失败" if failures else "构建完成", "failures": failures}
+    except HTTPException:
+        raise
+    except TimeoutError:
         raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
-    except Exception as e:
-        logger.error(f"[知识库] 构建失败：{e}")
+    except Exception:
+        logger.exception("[知识库] 构建失败 project_id=%s", project_id)
         raise HTTPException(status_code=500, detail="构建失败，请稍后重试")
-    if failures:
-        logger.error(f"[知识库] 构建完成：{len(failures)} 个文件入库失败")
-        return {
-            "message": f"构建完成，但有 {len(failures)} 个文件失败",
-            "failures": failures,
-        }
-    logger.info("[知识库] 构建完成，所有文件均已成功入库")
-    return {"message": "构建完成"}
 
 
-@app.get("/api/index/health")
-def get_index_health(refresh: bool = False, user: dict = Depends(require_admin)):
-    """返回最近一次健康检查报告；refresh=1 时立即执行一次检查。"""
-    def check():
-        with shared_section(PG_CONN, _PG_LOCK_KEY_INDEX_WRITE, INDEX_READ_LOCK_TIMEOUT_SECONDS):
-            return index_health.check()
+@app.get("/api/projects/{project_id}/index/health")
+async def get_index_health(request: Request, refresh: bool = False, project: dict = Depends(require_project)):
+    user_id, project_id = project["user_id"], project["id"]
+    snapshot = await _request_health_snapshot(request, user_id, project_id, refresh)
+    return snapshot["report"]
 
+
+@app.post("/api/projects/{project_id}/index/health/repair")
+def repair_index_health(project: dict = Depends(require_project)):
+    user_id, project_id = project["user_id"], project["id"]
     try:
-        return _health_reports.get(check, refresh=refresh)
-    except TimeoutError as e:
-        logger.error(f"[索引健康检查] 检查失败：等待索引写锁超时（{e}）")
+        with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
+            _ensure_project(current)
+            report = IndexHealth(user_id, project_id).repair()
+            _invalidate_health(user_id, project_id)
+        return report
+    except HTTPException:
+        raise
+    except TimeoutError:
         raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
-    except Exception as e:
-        logger.error(f"[索引健康检查] 检查失败：{e}")
-        raise HTTPException(status_code=500, detail="健康检查失败，请稍后重试")
-
-
-@app.post("/api/index/health/repair")
-def repair_index_health(user: dict = Depends(require_admin)):
-    """清理残留索引，并从源文件重建缺失、损坏或陈旧的分块与清单。"""
-    try:
-        with _index_write_section():
-            report = index_health.repair()
-            _set_health_report(report)
-    except TimeoutError as e:
-        logger.error(f"[索引健康检查] 修复失败：等待索引写锁超时（{e}）")
-        raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
-    except Exception as e:
-        logger.error(f"[索引健康检查] 修复失败：{e}")
+    except Exception:
+        logger.exception("[索引健康检查] 修复失败 project_id=%s", project_id)
         raise HTTPException(status_code=500, detail="修复失败，请稍后重试")
-    logger.info(f"[索引健康检查] 修复完成：{_format_repair_summary(report.get('repair') or {})}")
-    return report
 
 
 if __name__ == "__main__":
