@@ -16,11 +16,10 @@ summary_trigger_messages: 30
 summary_trigger_tokens: 20000
 summary_keep_messages: 10
 
-# 检索子代理（rag/retrieval_agent.py）；保留 rag_summary_* 配置键兼容现有部署。
-rag_summary_model: "deepseek-v4.1-flash-1017"
-rag_summary_model_provider: "openai"
+# 检索子代理（rag/retrieval_agent.py）。
+# 模型采用 provider:model 合并格式，由 init_chat_model 解析。
+rag_summary_model: "openai:deepseek-v4.1-flash-1017"
 rag_summary_model_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
-main_agent_model:  "deepseek-v4.1-flash-1017"
-main_agent_model_provider: "openai"
+main_agent_model: "openai:deepseek-v4.1-flash-1017"
 main_agent_model_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"

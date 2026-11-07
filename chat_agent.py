@@ -31,7 +31,7 @@ from utils.project_paths import knowledge_scope
 from langchain_tavily import TavilySearch
 from langchain_core.tools import tool
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 logger = get_logger(__name__)
 
@@ -135,9 +135,8 @@ class ChatAgent:
 
     def __init__(self):
         self.model=init_chat_model(
-            model=agent_config["main_agent_model"],
-            model_provider=agent_config["main_agent_model_provider"],
-            base_url=agent_config["main_agent_model_base_url"],
+            model=os.getenv("MAIN_AGENT_MODEL") or agent_config["main_agent_model"],
+            base_url=os.getenv("MAIN_AGENT_MODEL_BASE_URL") or agent_config["main_agent_model_base_url"],
             timeout=float(agent_config.get("llm_request_timeout_seconds", 120)),
             max_retries=int(agent_config.get("llm_max_retries", 1)),
         )
