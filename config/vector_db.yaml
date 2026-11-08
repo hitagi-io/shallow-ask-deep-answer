@@ -1,6 +1,7 @@
 # 每个账号下的项目使用独立集合：前缀 + 账号 ID + 项目 UUID。
 collection_prefix: private_knowledge
 embedding_model: qwen3.7-text-embedding-flash
+embedding_endpoint: https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding
 # 索引管线修订号：解析规则或服务端模型行为变化时递增，触发完整重建。
 # 分块参数、嵌入模型与解析依赖版本也会自动计入索引版本指纹。
 index_version: 1
@@ -16,11 +17,18 @@ chunk_size: 500
 chunk_overlap: 50
 separators: ["\n\n", "\n", "? ", "! ", "。", "？", "！", "; ", "；", ": ", "：", " ", ""]
 
-# 单次 embedding 请求最多提交的块数。DashScope 库内的 BATCH_SIZE 表在升级/重装依赖后会还原，
-# 这里配置的取值会在进程启动时覆盖到当前 embedding_model 对应的表项。
+# 单次 embedding 请求最多提交的块数，每批独立重试。
 embedding_batch_size: 20
+embedding_connect_timeout_seconds: 5
+embedding_timeout_seconds: 20
+# 包括首次请求，避免上游网络故障时使用 SDK 的长时间等待。
+embedding_max_attempts: 3
 
-k: 3
+# BM25 在 Milvus 内生成稀疏向量，与稠密向量共用分块主键和索引事务。
+# 分词配置属于集合结构，修改后需要重新创建集合。
+bm25_analyzer:
+  tokenizer: jieba
+  filter: [lowercase, cnalphanumonly]
 
 # 源文件位于项目外，默认仓库同级 shallow-ask-deep-answer-data/账号 ID/项目 UUID。
 # 使用环境变量 KNOWLEDGE_STORAGE_ROOT 指定其他绝对路径。

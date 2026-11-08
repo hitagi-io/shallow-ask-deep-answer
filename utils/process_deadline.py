@@ -35,7 +35,8 @@ async def run_isolated_json(module: str, payload: dict, timeout_seconds: float) 
             # subprocess transports. Only the admitted scan uses a communication
             # thread; killing and reaping its process also joins that thread.
             startup = loop.run_in_executor(executor, partial(subprocess.Popen,
-                [sys.executable, "-m", module],
+                # 继承 -s / -I / -X 等参数，防止检查进程加载另一套解析依赖。
+                [sys.executable, *subprocess._args_from_interpreter_flags(), "-m", module],
                 cwd=str(Path(__file__).resolve().parent.parent),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

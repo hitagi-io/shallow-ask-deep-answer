@@ -5,6 +5,7 @@
 - **双模式问答**：知识库模式检索内部资料并校验检索报告与引用文件；通用模式使用模型知识，可通过 Tavily 联网搜索。
 - **流式会话**：保存历史、停止生成、断线重连，支持多个会话同时生成。
 - **私有项目管理**：所有用户均可创建、重命名、删除自己的项目，上传、覆盖、删除 TXT、PDF、DOCX 文件，并检查、修复索引；资料、索引与对话按账号隔离。
+- **混合检索与精排**：向量召回和 BM25 关键词召回各取 20 个片段，按分块去重并进行 RRF 融合，再用 rerank 返回最相关的 5 个片段。
 
 知识库模式围绕所选项目的资料回答，并校验检索报告与引用来源；通用模式适合一般问答、写作和公开信息查询。联网搜索结果保留各来源对应的片段，供回答引用。
 
@@ -57,7 +58,7 @@ if (!(Test-Path .env)) { Copy-Item .env.example .env }
 | `PG_CONNECTION_STRING` | PostgreSQL 连接地址，数据库名与上一步一致 |
 | `JWT_SECRET` | 必填，登录令牌签名密钥 |
 | `OPENAI_API_KEY` | 聊天模型密钥，当前使用 DashScope 兼容接口 |
-| `DASHSCOPE_API_KEY` | DashScope 文本嵌入密钥 |
+| `DASHSCOPE_API_KEY` | DashScope 原生文本嵌入与 rerank 精排密钥 |
 | `TAVILY_API_KEY` | 可选，仅联网搜索需要 |
 
 同一个具有相应权限的 DashScope 密钥可填入两项模型密钥。生成 `JWT_SECRET`：
@@ -66,14 +67,14 @@ if (!(Test-Path .env)) { Copy-Item .env.example .env }
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-启动前核对 `config/agent.yaml` 中的聊天模型和接口地址，以及 `config/vector_db.yaml` 中的嵌入模型和 Milvus 连接，确保所填密钥有对应模型的调用权限。`.env` 已被 Git 忽略，真实凭证只保存在本地。
+启动前核对 `config/agent.yaml` 中的聊天模型和接口地址、`config/vector_db.yaml` 中的嵌入模型和 Milvus 连接，以及 `config/retrieval.yaml` 中的精排模型，确保所填密钥有对应模型的调用权限。`.env` 已被 Git 忽略，真实凭证只保存在本地。
 
 ### 3. 启动服务
 
 启动后端：
 
 ```powershell
-python api_server.py
+python -s api_server.py
 ```
 
 在另一个终端，从项目根目录安装前端依赖并启动：
@@ -110,11 +111,26 @@ Invoke-RestMethod http://localhost:8000/api/health/ready
 | --- | --- |
 | [.env.example](./.env.example) | 环境变量模板：连接、密钥、端口、并发、限流和超时 |
 | [config/agent.yaml](./config/agent.yaml) | 聊天模型、接口地址、请求超时与重试、检索上限、搜索裁剪与会话压缩参数 |
-| [config/vector_db.yaml](./config/vector_db.yaml) | Milvus、嵌入模型、文档切块、检索与健康检查 |
+| [config/vector_db.yaml](./config/vector_db.yaml) | Milvus、嵌入模型及请求限制、文档切块、BM25 分词与健康检查 |
+| [config/retrieval.yaml](./config/retrieval.yaml) | 每路候选数、RRF 融合、rerank 模型与最终返回片段数 |
 | [prompts/](./prompts/) | 知识库、检索、通用问答和会话压缩提示词 |
 | [deploy/milvus/compose.yaml](./deploy/milvus/compose.yaml) | 本地 Milvus、etcd 与 MinIO 部署 |
 
 修改配置或提示词后重启后端。需要查看接口文档时，在 `.env` 设置 `ENABLE_API_DOCS=true`，重启后访问 [http://localhost:8000/docs](http://localhost:8000/docs)。
+
+知识库统一使用混合检索与精排，主要参数如下：
+
+| 参数 | 默认值 | 中文说明 |
+| --- | --- | --- |
+| `top_k` | `5` | 精排后交给检索子代理的最大片段数 |
+| `candidate_k` | `20` | 向量和 BM25 各自的候选数，须不小于 `top_k` |
+| `rrf_k` | `60` | 倒数排名融合的平滑常数 |
+| `rerank.model` | `qwen3.7-text-rerank` | 对融合后的完整候选并集进行相关性精排 |
+| `embedding_model` | `qwen3.7-text-embedding-flash` | 文档和查询使用的稠密嵌入模型 |
+
+同一分块在两路召回中只进入精排一次；最多 40 个候选全部送入精排，不先截取 Top5。一个文件的不同分块保留各自身份，引用继续使用原文件名。BM25 采用 Milvus 内置稀疏索引和 Jieba 分词，与稠密向量共用分块主键，上传、覆盖、删除沿用项目索引事务。
+
+嵌入与精排使用原生 DashScope HTTP 接口：连接超时均为 5 秒，单次读写超时分别为 20 秒和 30 秒，最多尝试 3 次（含首次请求）。仅连接故障、超时及 408/429/部分 5xx 响应会重试；鉴权、参数和响应格式错误直接报错。嵌入按每批 20 个片段独立重试，Milvus 写入重试复用已生成向量。精排失败会走现有服务故障协议，停止该次知识库查询。
 
 `config/agent.yaml` 中的主要检索与会话参数如下，表中为仓库当前配置值：
 
@@ -154,6 +170,8 @@ Invoke-RestMethod http://localhost:8000/api/health/ready
 启动时会为现有 `users` 表补充 `auth_version` 列，用于跨 worker 校验凭证版本；这项更新不代表支持旧版共享知识库的数据迁移。更新代码、配置或提示词后需重启后端。
 
 修改分块参数、嵌入模型或相关解析依赖后需重建索引；修改解析逻辑或模型服务行为时，还需递增 `config/vector_db.yaml` 的 `index_version`。重启后点击「补建索引」，按需重建异常或过期内容。集合名由 `collection_prefix`、账号 ID 与项目 UUID 生成，每个项目独立存储。
+
+本版本集合包含 `vector` 和 `sparse` 两个字段及 BM25 函数，集合结构与旧纯向量索引不同。部署到已有纯向量数据的环境前须迁移或重新创建集合；单纯补建分块无法改变旧集合结构。BM25 分词配置也属于集合结构，修改后须重新创建集合。索引版本指纹包含嵌入接口、双向量结构和 BM25 分词参数，查询的候选数与精排参数变化不需要重新 embedding。
 
 ### 健康检查与超时
 

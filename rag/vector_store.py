@@ -8,13 +8,14 @@ import threading
 import uuid
 from collections import OrderedDict
 
-from langchain_community.embeddings import DashScopeEmbeddings
-import langchain_community.embeddings.dashscope as _dashscope_embeddings
+from langchain_core.runnables import RunnableLambda
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_milvus import Milvus
+from langchain_milvus import BM25BuiltInFunction, Milvus
 from dotenv import load_dotenv
 
+from rag.embeddings import DashScopeEmbeddings
 from rag.index_manifest import IndexManifest, ManifestStore, chunks_match, current_index_version, text_sha256
+from rag.retrieval import HybridRetriever
 from utils.config_loader import vector_db_config
 from utils.knowledge_files import list_supported_files, compute_file_sha256, get_document_loader
 from utils.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
@@ -22,10 +23,6 @@ from utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 load_dotenv()
-
-_embedding_batch_size = vector_db_config.get("embedding_batch_size")
-if _embedding_batch_size:
-    _dashscope_embeddings.BATCH_SIZE[vector_db_config["embedding_model"]] = int(_embedding_batch_size)
 
 _vector_stores: OrderedDict[tuple[int, str], VectorStore] = OrderedDict()
 _lock = threading.Lock()
@@ -60,7 +57,13 @@ class VectorStore:
         self.index_version = current_index_version(vector_db_config)
         self.vector_store = Milvus(
             collection_name=collection_name,
-            embedding_function=DashScopeEmbeddings(model=vector_db_config["embedding_model"]),
+            embedding_function=DashScopeEmbeddings(vector_db_config),
+            vector_field=["vector", "sparse"],
+            builtin_function=BM25BuiltInFunction(
+                input_field_names="text", output_field_names="sparse",
+                analyzer_params=vector_db_config["bm25_analyzer"],
+                function_name="knowledge_bm25",
+            ),
             connection_args={
                 "uri": vector_db_config["milvus_uri"],
                 "pool_size": vector_db_config.get("pool_size", 50),
@@ -76,16 +79,18 @@ class VectorStore:
             separators=vector_db_config["separators"],
             length_function=len,
         )
-        self._retriever = self.vector_store.as_retriever(search_kwargs={"k": vector_db_config["k"]})
+        self._retriever = RunnableLambda(HybridRetriever(self).search)
         self._store_lock = threading.RLock()
 
     def get_retriever(self):
+        return self._retriever
+
+    def ensure_search_ready(self):
         with self._store_lock:
             vs = self.vector_store
             # 另一个 worker 可能刚为之前的空项目创建集合，补齐客户端字段与检索配置。
             if vs.client.has_collection(collection_name=vs.collection_name) and not vs.fields:
                 vs._init()
-        return self._retriever
 
     def drop_project_index(self) -> None:
         """调用方持有项目排他锁并禁止新生成后，清除此项目的向量及清单。"""
@@ -182,6 +187,16 @@ class VectorStore:
             if compute_file_sha256(file_path) != sha256:
                 return {**result, "error": "解析期间文件发生变化，请重试"}
             hashes = tuple(text_sha256(doc.page_content) for doc in documents)
+            if old is None or old.state != "ready":
+                self.manifests.put(IndexManifest(sha256, file_path, self.index_version,
+                                                uuid.uuid4().hex, len(documents), hashes, "building"))
+            texts = [doc.page_content for doc in documents]
+            try:
+                # 每批请求由嵌入适配器有限重试。写库重试复用这些向量，避免再次计费。
+                embeddings = self.vector_store.embedding_func.embed_documents(texts)
+            except Exception:
+                logger.exception("[向量库] 嵌入失败，停止本次入库 file=%s", os.path.basename(file_path))
+                return result
             for attempt in range(1, _INDEX_MAX_ATTEMPTS + 1):
                 manifest = IndexManifest(sha256, file_path, self.index_version,
                                          uuid.uuid4().hex, len(documents), hashes, "building")
@@ -199,7 +214,10 @@ class VectorStore:
                         # 集合被外部删除后，LangChain 的 collection view 仍可能缓存旧对象。
                         self.vector_store.col = None
                         self.vector_store.fields = []
-                    self.vector_store.add_documents(documents, ids=ids)
+                    self.vector_store.add_embeddings(
+                        texts=texts, embeddings=embeddings,
+                        metadatas=[doc.metadata for doc in documents], ids=ids,
+                    )
                     rows = self.chunk_rows(f"index_id == {json.dumps(manifest.index_id)}")
                     if not chunks_match(manifest, rows):
                         raise RuntimeError("写入后的分块数、序号或内容哈希校验失败")

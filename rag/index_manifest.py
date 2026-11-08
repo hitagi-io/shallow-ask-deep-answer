@@ -21,15 +21,18 @@ def text_sha256(text: str) -> str:
 def current_index_version(config: dict) -> str:
     """解析、分块、嵌入配置或依赖变化均使旧清单失效。修改管线代码时递增 pipeline。"""
     recipe = {
-        "pipeline": 1,
+        "pipeline": 2,
         "revision": config["index_version"],
         "embedding_model": config["embedding_model"],
+        "embedding_endpoint": config["embedding_endpoint"],
+        "vector_fields": ["vector", "sparse"],
+        "bm25_analyzer": config["bm25_analyzer"],
         "chunk_size": config["chunk_size"],
         "chunk_overlap": config["chunk_overlap"],
         "separators": config["separators"],
         "dependencies": {name: version(name) for name in (
             "langchain-community", "langchain-text-splitters", "langchain-milvus",
-            "dashscope", "pypdf", "docx2txt",
+            "httpx", "pypdf", "docx2txt",
         )},
     }
     return text_sha256(json.dumps(recipe, sort_keys=True, ensure_ascii=False))

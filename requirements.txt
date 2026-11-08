@@ -17,7 +17,6 @@ langgraph-checkpoint-postgres==3.2.0
 # 检索 / 解析
 langchain-milvus==0.4.0
 pymilvus==3.0.2
-dashscope==2.0.3
 pypdf==6.21.4
 docx2txt==0.9
 
@@ -25,6 +24,7 @@ docx2txt==0.9
 fastapi==0.162.0
 uvicorn[standard]==0.54.0
 python-multipart==0.0.33
+httpx==0.28.1
 pydantic==2.14.2
 psycopg[binary,pool]==3.3.7
 psycopg-pool==3.3.3

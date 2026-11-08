@@ -1,0 +1,15 @@
+# 正式检索流程：向量 + BM25 → 按分块去重 / RRF 融合 → rerank → Top5。
+top_k: 5
+# 每路召回 20；融合后的完整候选并集（最多 40）全部交给 rerank。
+candidate_k: 20
+# RRF（倒数排名融合）的平滑常数；同分使用稳定分块 ID 排序。
+rrf_k: 60
+search_timeout_seconds: 30
+
+rerank:
+  model: qwen3.7-text-rerank
+  endpoint: https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+  # 单次连接与读写超时；max_attempts 包括首次请求。
+  connect_timeout_seconds: 5
+  timeout_seconds: 30
+  max_attempts: 3
