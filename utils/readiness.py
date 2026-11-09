@@ -9,6 +9,10 @@ import math
 import sys
 import time
 
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
 
 def _remaining(deadline: float) -> float:
     seconds = deadline - time.monotonic()
@@ -48,6 +52,7 @@ def _probe_postgres(conninfo: str, deadline: float) -> dict:
     except TimeoutError:
         return _result(started, "数据库检查超时")
     except Exception:
+        logger.exception("[就绪检查] PostgreSQL 探测失败")
         return _result(started, "数据库不可用")
     finally:
         if conn is not None:
@@ -68,6 +73,7 @@ def _probe_milvus(uri: str, deadline: float) -> dict:
     except TimeoutError:
         return _result(started, "向量库检查超时")
     except Exception:
+        logger.exception("[就绪检查] Milvus 探测失败")
         return _result(started, "向量库不可用")
     finally:
         if client is not None:
@@ -99,6 +105,7 @@ async def check_readiness(pg_conn: str, milvus_uri: str, timeout_seconds: float)
     except TimeoutError:
         return {name: _result(started, "就绪检查超时，暂未就绪") for name in ("postgres", "milvus")}
     except Exception:
+        logger.exception("[就绪检查] 检查进程失败")
         return {name: _result(started, "就绪检查失败，暂未就绪") for name in ("postgres", "milvus")}
 
 

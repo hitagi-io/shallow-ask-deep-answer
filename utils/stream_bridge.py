@@ -59,14 +59,14 @@ class StreamBridge:
                     self._emit("cancelled")
                     return
                 if isinstance(item, dict):
-                    event_type = item.get("type")
+                    event_type = item["type"]
                     if event_type == "phase":
-                        self._emit("phase", str(item.get("phase") or ""))
+                        self._emit("phase", item["phase"])
                         continue
                     if event_type == "replace":
-                        self._emit("replace", str(item.get("content") or ""))
+                        self._emit("replace", item["content"])
                         continue
-                    item = str(item)
+                    raise ValueError(f"未知的对话流事件: {event_type}")
                 self._emit("chunk", item)
             if self._stopped.is_set():
                 self._emit("cancelled")

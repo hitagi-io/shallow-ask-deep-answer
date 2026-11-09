@@ -16,6 +16,7 @@ import re
 from collections.abc import Sequence
 from typing import Any
 
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from pydantic import BaseModel
 
 PROTOCOL_VERSION = 1
@@ -56,12 +57,8 @@ EVIDENCE_EXCERPT_CHARS = 120
 _CITATION_LINE_RE = re.compile(
     r"^[ \t\u3000>#\-*+_]*"
     r"(?:参考来源（内部知识库）|参考来源|来源)"
-    r"[ \t\u3000*_]*[：:][ \t\u3000]*(.+?)[ \t\u3000]*$"
+    r"[ \t\u3000*_]*[：:](.+?)[ \t\u3000]*$"
 )
-_SOURCE_SEP_RE = re.compile(r"[、,，;；]|\s{2,}")
-_SOURCE_WRAPPERS = "`*_\"'“”‘’「」『』《》"
-_SOURCE_TRAILING_PUNCT = "。.,，;；"
-_SOURCE_LEADING_JUNK_RE = re.compile(r"^[-–—·•\s]+")
 
 
 
@@ -107,17 +104,15 @@ def build_retrieval_artifact(
     """构造 do_retrieval 的结构化 artifact（不进入模型上下文，只随 ToolMessage 流转）。"""
     if status not in (STATUS_OK, STATUS_EMPTY, STATUS_ERROR):
         raise ValueError(f"非法检索状态: {status}")
-    normalized = []
-    if status == STATUS_OK:
-        for source, content in chunks:
-            if isinstance(source, str) and source.strip() and isinstance(content, str) and content.strip():
-                normalized.append({"source": source.strip(), "excerpt": _excerpt(content)})
     return {
         "protocol": RETRIEVAL_PROTOCOL,
         "version": PROTOCOL_VERSION,
         "status": status,
-        "query": query if isinstance(query, str) else str(query or ""),
-        "chunks": normalized,
+        "query": query,
+        "chunks": [
+            {"source": source, "excerpt": _excerpt(content)}
+            for source, content in chunks
+        ] if status == STATUS_OK else [],
     }
 
 
@@ -135,10 +130,9 @@ def build_clarification_content(question: str) -> str:
     )
 
 
-def build_report_from_messages(messages: Sequence[Any]) -> dict:
+def build_report_from_messages(messages: Sequence[BaseMessage]) -> dict:
     """在子代理出口汇总结构化报告：status 由检索 artifact 决定，不由模型文本决定。"""
     records = _collect_retrieval_records(messages)
-    answer_body, cited_sources = split_answer_and_citations(_final_ai_text(messages))
 
     calls = []
     ok_records = []
@@ -148,9 +142,8 @@ def build_report_from_messages(messages: Sequence[Any]) -> dict:
         status = artifact.get("status")
         if status not in (STATUS_OK, STATUS_EMPTY, STATUS_ERROR):
             status = STATUS_INVALID
-        query = artifact.get("query")
-        query = query if isinstance(query, str) else ""
-        chunks = _artifact_chunks(artifact)
+        query = artifact["query"]
+        chunks = artifact["chunks"]
         calls.append(
             {
                 "tool_call_id": call_id,
@@ -162,8 +155,6 @@ def build_report_from_messages(messages: Sequence[Any]) -> dict:
         if status == STATUS_OK:
             if chunks:
                 ok_records.append((call_id, chunks))
-            else:
-                empty_seen = True
         elif status == STATUS_EMPTY:
             empty_seen = True
         elif status == STATUS_ERROR:
@@ -184,6 +175,7 @@ def build_report_from_messages(messages: Sequence[Any]) -> dict:
                 }
             )
 
+    answer_body, cited_sources = split_answer_and_citations(_final_ai_text(messages), sources)
     if not records:
         status, reason = STATUS_NO_RETRIEVAL, "no_retrieval"
     elif ok_records:
@@ -326,14 +318,15 @@ def looks_like_report(text: Any) -> bool:
     return isinstance(text, str) and REPORT_PROTOCOL in text
 
 
-def split_answer_and_citations(text: str) -> tuple[str, list[str]]:
+def split_answer_and_citations(text: str, sources: Sequence[str] = ()) -> tuple[str, list[str]]:
     """把回答正文与末尾的“来源：…”引用块分开，并按首次出现顺序去重。
 
     只把回答末尾连续的非空来源行当作引用块：用户在正文里提供的、或检索片段中
     逐字引用的“来源：”行不是引用标注，不能据此判定越界；同时 Markdown 修饰过的
-    末尾来源行也必须被识别，否则会绕过来源校验。
+    末尾来源行也必须被识别，否则会绕过来源校验。每行只标注一个完整文件名，
+    文件名中的标点不具有分隔或 Markdown 修饰含义。
     """
-    if not isinstance(text, str) or not text:
+    if not text:
         return "", []
     lines = text.replace("\r\n", "\n").split("\n")
     end = len(lines)
@@ -345,79 +338,46 @@ def split_answer_and_citations(text: str) -> tuple[str, list[str]]:
         match = _CITATION_LINE_RE.match(lines[start - 1])
         if not match:
             break
-        blocks.append(_split_source_names(match.group(1)))
+        name = match.group(1)
+        blocks.append(name if name in sources else name.strip())
         start -= 1
     cited = []
-    for names in reversed(blocks):
-        for name in names:
-            if name and name not in cited:
-                cited.append(name)
+    for name in reversed(blocks):
+        if name not in cited:
+            cited.append(name)
     body = re.sub(r"\n{3,}", "\n\n", "\n".join(lines[:start])).strip()
     return body, cited
 
 
 
-def _collect_retrieval_records(messages: Sequence[Any]) -> list[tuple[str, dict]]:
+def _collect_retrieval_records(messages: Sequence[BaseMessage]) -> list[tuple[str, dict]]:
     records = []
-    for message in messages or []:
-        if getattr(message, "type", "") != "tool":
+    for message in messages:
+        if not isinstance(message, ToolMessage):
             continue
-        artifact = getattr(message, "artifact", None)
+        artifact = message.artifact
         if not isinstance(artifact, dict):
             continue
         if artifact.get("protocol") != RETRIEVAL_PROTOCOL:
             continue
         if artifact.get("version") != PROTOCOL_VERSION:
             continue
-        call_id = getattr(message, "tool_call_id", "") or ""
-        records.append((str(call_id), artifact))
+        records.append((message.tool_call_id, artifact))
     return records
 
 
-def _artifact_chunks(artifact: dict) -> list[dict]:
-    raw = artifact.get("chunks")
-    if not isinstance(raw, list):
-        return []
-    chunks = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        source = item.get("source")
-        excerpt = item.get("excerpt")
-        if isinstance(source, str) and source.strip() and isinstance(excerpt, str) and excerpt.strip():
-            chunks.append({"source": source.strip(), "excerpt": excerpt})
-    return chunks
-
-
-def _final_ai_text(messages: Sequence[Any]) -> str:
+def _final_ai_text(messages: Sequence[BaseMessage]) -> str:
     """只取最后一条 AI 消息的文本。
 
     若最后一条是工具消息或没有正文的 AI 消息，说明子代理没有给出最终回答；
     此时不能回退到检索前的中间叙述（那可能只是"我来查一下"之类的过程话术）。
     """
-    for message in reversed(messages or []):
-        message_type = getattr(message, "type", "")
-        if message_type == "ai":
-            return message_text(message).strip()
-        if message_type == "tool":
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            return message.text.strip()
+        if isinstance(message, ToolMessage):
             return ""
     return ""
-
-
-def message_text(message: Any) -> str:
-    """提取消息文本，兼容 str 与内容块列表两种 content 形态。"""
-    content = getattr(message, "content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("text"):
-                parts.append(str(block["text"]))
-        return "".join(parts)
-    return "" if content is None else str(content)
 
 
 def _json_object(text: Any) -> dict | None:
@@ -425,36 +385,13 @@ def _json_object(text: Any) -> dict | None:
         return None
     try:
         data = json.loads(text)
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
 
 
 def _is_str_list(value: Any) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
-
-
-def _split_source_names(value: str) -> list[str]:
-    names = []
-    for raw in _SOURCE_SEP_RE.split(value):
-        name = _normalize_source_name(raw)
-        if name:
-            names.append(name)
-    return names
-
-
-def _normalize_source_name(raw: str) -> str:
-    name = raw.strip()
-    # 包裹符与尾随标点会互相遮挡（如“《b.pdf》。”右端先遇到句号），
-    # 必须交替剥离到稳定，否则会得到"b.pdf》"这类不等于证据文件名的结果。
-    for _ in range(4):
-        before = name
-        name = _SOURCE_LEADING_JUNK_RE.sub("", name)
-        name = name.strip(_SOURCE_WRAPPERS)
-        name = name.rstrip(_SOURCE_TRAILING_PUNCT).strip()
-        if name == before:
-            break
-    return name
 
 
 def _excerpt(content: str) -> str:

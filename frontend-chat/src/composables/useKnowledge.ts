@@ -7,7 +7,7 @@ import type { ConfirmAction } from './useConfirmation'
 type Operation = '' | 'loading' | 'uploading' | 'building' | 'checking' | 'repairing' | 'deleting'
 interface UploadResult { name: string; status: 'waiting' | 'uploading' | 'indexing' | 'success' | 'error'; detail: string }
 
-export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Readonly<Ref<boolean>>, confirmAction: ConfirmAction = async () => false) {
+export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Readonly<Ref<boolean>>, confirmAction: ConfirmAction) {
   let disposed = false
   const uploadAbort = new AbortController()
   let readAbort = new AbortController()
@@ -16,13 +16,13 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   let pollTimer: ReturnType<typeof setTimeout> | undefined
   const files = ref<FileItem[]>([])
   const healthState = useHealthReport()
-  const { health, healthError, healthExpired, healthNotice, documentStatus, indexStatus } = healthState
+  const { health, healthNotice, indexStatus } = healthState
   const operation = ref<Operation>('')
   const deletingName = ref('')
   const dragOver = ref(false)
   const fileInput = ref<HTMLInputElement | null>(null)
   const search = ref('')
-  const statusFilter = ref<'all' | 'indexed' | 'pending'>('all')
+  const statusFilter = ref<'all' | 'indexed' | 'pending' | 'unknown'>('all')
   const uploadResults = ref<UploadResult[]>([])
   const uploadProgress = computed(() => uploadResults.value.filter(result =>
     result.status === 'waiting' || result.status === 'uploading' || result.status === 'indexing'))
@@ -36,9 +36,19 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   const healthChecking = computed(() => operation.value === 'checking')
   const healthRepairing = computed(() => operation.value === 'repairing')
   const healthIssueCount = computed(() => health.value?.issues.length || 0)
+  const documentStatus = computed(() => {
+    if (loadError.value) return { label: '状态未知', tone: 'warning' }
+    if (knowledgeLoading.value) return { label: '加载中', tone: 'neutral' }
+    if (!files.value.length) return { label: '暂无资料', tone: 'neutral' }
+    if (files.value.some(file => file.indexed === null)) return { label: '部分待确认', tone: 'warning' }
+    const indexed = files.value.filter(file => file.indexed).length
+    if (!indexed) return { label: '待入库', tone: 'warning' }
+    return indexed === files.value.length
+      ? { label: '已入库', tone: 'success' } : { label: '部分入库', tone: 'warning' }
+  })
   const filteredFiles = computed(() => files.value.filter(file =>
     file.name.toLocaleLowerCase().includes(search.value.trim().toLocaleLowerCase()) &&
-    (statusFilter.value === 'all' || file.indexed === (statusFilter.value === 'indexed'))))
+    (statusFilter.value === 'all' || file.indexed === (statusFilter.value === 'unknown' ? null : statusFilter.value === 'indexed'))))
   const errorText = (error: unknown) => error instanceof Error ? error.message : '操作失败，请稍后重试'
 
   function cancelReads() {
@@ -48,7 +58,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   }
 
   // All entry points share one synchronous lock, including drag/drop and keyboard input.
-  async function run(kind: Operation, action: (id: string) => Promise<void>, notify = true) {
+  async function run(kind: Operation, action: (id: string) => Promise<void>) {
     if (disposed || !projectId.value || knowledgeBusy.value) return
     const id = projectId.value
     const view = viewVersion
@@ -56,9 +66,9 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     healthState.beginRequest()
     cancelReads()
     operation.value = kind
-    if (notify) clearNotice()
+    clearNotice()
     try { await action(id) }
-    catch (error) { if (!isRequestCancelled(error) && notify && !disposed && viewVersion === view) show(errorText(error), 'error') }
+    catch (error) { if (!isRequestCancelled(error) && !disposed && viewVersion === view) show(errorText(error), 'error') }
     finally {
       operation.value = ''; deletingName.value = ''
       if (!disposed && active.value && viewVersion !== view) void loadKnowledgeState()
@@ -80,15 +90,15 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     if (disposed || projectId.value !== id) return false
     const request = healthState.beginRequest()
     try {
-      const report = await fetchIndexHealth(id, refresh || !!healthError.value || healthExpired.value, { signal: readAbort.signal })
+      const report = await fetchIndexHealth(id, refresh, { signal: readAbort.signal })
       return !disposed && projectId.value === id && healthState.acceptReport(request, report)
     } catch (error) {
       if (!isRequestCancelled(error) && !disposed && projectId.value === id) healthState.rejectReport(request, errorText(error))
       throw error
     }
   }
-  async function refreshAll(id: string, force = false) {
-    const results = await Promise.allSettled([refreshFiles(id), refreshHealth(id, force)])
+  async function refreshAll(id: string) {
+    const results = await Promise.allSettled([refreshFiles(id), refreshHealth(id)])
     const failed = results.find(result => result.status === 'rejected')
     if (failed?.status === 'rejected') throw failed.reason
   }
@@ -121,8 +131,9 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
           : `已上传并入库 ${succeeded} 个文件`
         const details = failures.map(result => `${result.name}：${result.detail}`)
         uploadResults.value = []
+        if (projectId.value === id) healthState.reset()
         // 刷新异常与上传结果合并，避免覆盖具体文件的失败原因。
-        try { await refreshAll(id, true) }
+        try { await refreshAll(id) }
         catch (error) { if (!isRequestCancelled(error)) details.push(`刷新状态失败：${errorText(error)}`) }
         if (projectId.value === id) show([summary, ...details].join('\n'), details.length ? 'error' : 'success')
       }
@@ -142,14 +153,16 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     await run('deleting', async id => {
       deletingName.value = name
       await deleteFile(id, name)
-      await refreshAll(id, true)
+      if (projectId.value === id) healthState.reset()
+      await refreshAll(id)
       show(`已删除：${name}`, 'success')
     })
   }
   function handleBuild() {
     return run('building', async id => {
       const result = await buildKnowledgeIndex(id)
-      await refreshAll(id, true)
+      if (projectId.value === id) healthState.reset()
+      await refreshAll(id)
       const errors = result.failures.map(f => `${f.file.split(/[\\/]/).pop()}：${f.error}`)
       show([result.message, ...errors].join('；'), errors.length ? 'error' : 'success')
     })
@@ -171,22 +184,17 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
       if (!healthState.acceptReport(request, report)) return
       await refreshFiles(id)
       const repair = report.repair
-      const errors = [...(repair?.ghost_errors || []), ...(repair?.re_index_failures || []).map(f => `${f.file}：${f.error}`)]
+      const errors = [...repair.ghost_errors, ...repair.re_index_failures.map(f => `${f.file}：${f.error}`)]
       show(errors.length ? `修复部分失败：${errors.join('；')}` : report.healthy ? '修复完成，索引状态良好' : '修复已执行，仍有异常，请查看检查结果', errors.length || !report.healthy ? 'error' : 'success')
     })
   }
-  // Poll only the visible project's report; never apply a previous project's response.
+  // 可见项目只轮询文件元数据和缓存报告，不启动完整性扫描。
   async function poll() {
     if (disposed) return
     try {
       const id = projectId.value
       if (active.value && id && !knowledgeBusy.value) {
-        const snapshot = health.value
-        if (await refreshHealth(id)) {
-          const report = health.value!
-          const changed = JSON.stringify(report.issues) !== JSON.stringify(snapshot?.issues) || JSON.stringify(report.stats) !== JSON.stringify(snapshot?.stats)
-          if (changed) await run('loading', refreshFiles, false)
-        }
+        await refreshAll(id)
       }
     } catch { /* The persistent health notice marks failures; intentional cancellation stays silent. */ }
     finally {

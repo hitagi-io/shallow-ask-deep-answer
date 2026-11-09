@@ -1,11 +1,11 @@
 import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted, type Ref } from 'vue'
-import { fetchConversations, fetchMessages, createConversationApi, updateConversationTitle, deleteConversationApi, streamChat, cancelGeneration, getStoredUser, newRequestId, withEmptyHistory, type Conversation, type Message, type Project } from '../api'
+import { fetchConversations, fetchMessages, createConversationApi, updateConversationTitle, deleteConversationApi, streamChat, cancelGeneration, newRequestId, withEmptyHistory, type Conversation, type Message, type Project } from '../api'
 import { useNotice } from './useNotice'
 import type { ConfirmAction } from './useConfirmation'
 
 const PROJECT_REQUIRED_NOTICE = '请先选择一个可用项目，再发送知识库问题'
 
-export function useChat(projects: Ref<Project[]>, confirmAction: ConfirmAction = async () => false) {
+export function useChat(userId: number, projects: Ref<Project[]>, confirmAction: ConfirmAction) {
   let disposed = false
   // 输入框随内容自适应高度；清空内容时需手动复位（程序化清空不会触发 input 事件）
   const inputEl = ref<HTMLTextAreaElement | null>(null)
@@ -24,7 +24,7 @@ export function useChat(projects: Ref<Project[]>, confirmAction: ConfirmAction =
   }
   const conversations = ref<Record<string, Conversation>>({})
   const currentId = ref('')
-  const selectionKey = `shallow_ask_deep_answer_conversation_${getStoredUser()?.id ?? ''}`
+  const selectionKey = `shallow_ask_deep_answer_conversation_${userId}`
   const drafts = ref<Record<string, string>>({})
   const input = computed({ get: () => drafts.value[currentId.value] || '', set: value => { drafts.value[currentId.value] = value } })
   const loading = ref(false)
@@ -151,7 +151,7 @@ export function useChat(projects: Ref<Project[]>, confirmAction: ConfirmAction =
   })
 
   const current = computed(() => conversations.value[currentId.value])
-  const convList = computed(() => Object.values(conversations.value).sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime()))
+  const convList = computed(() => Object.values(conversations.value).sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()))
   const hasEmptyConv = computed(() => convList.value.some(isEmptyConversation))
   const messageOffset = computed(() => Math.max(0, (current.value?.messages.length || 0) - visibleCount.value))
   const visibleMessages = computed(() => current.value?.messages.slice(messageOffset.value) || [])
@@ -328,6 +328,7 @@ export function useChat(projects: Ref<Project[]>, confirmAction: ConfirmAction =
     const run = runs.value[id]
     const ac = new AbortController()
     controllers.set(id, ac)
+    let lastAssistant = submission?.assistant
     try {
       const outcome = await streamChat(id, requestId, snapshot => {
         if (disposed) return
@@ -350,6 +351,7 @@ export function useChat(projects: Ref<Project[]>, confirmAction: ConfirmAction =
         conv.project_id = snapshot.project_id
         conv.project_name = snapshot.project_name
         assistant.status = snapshot.status === 'running' ? 'streaming' : snapshot.status === 'failed' ? 'error' : snapshot.status
+        lastAssistant = assistant
         if (submission) {
           const savedUser = conv.messages.find(m => m.id === snapshot.user_message_id)
           if (savedUser && savedUser !== submission.user) conv.messages = conv.messages.filter(m => m !== submission.user)
@@ -369,6 +371,7 @@ export function useChat(projects: Ref<Project[]>, confirmAction: ConfirmAction =
       } else {
         delete failedAttempts.value[id]
         if (outcome.status === 'error' && outcome.error) {
+          if (lastAssistant?.status === 'streaming') lastAssistant.status = 'error'
           console.error('[回答失败]', outcome.error)
           showNotice(outcome.error, 'error')
         }

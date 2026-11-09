@@ -4,6 +4,8 @@ import asyncio
 import threading
 import time
 
+from psycopg import OperationalError
+
 from utils.logging_config import get_logger
 from utils.stream_bridge import StreamBridge
 
@@ -65,7 +67,8 @@ async def run_generation(stream_factory, save_progress, finish, *, deadline, on_
             try:
                 await asyncio.to_thread(finish, status, message_status, "".join(parts), error)
                 break
-            except Exception:
+            except OperationalError:
                 logger.exception("[对话生成] 保存终态失败（第 %s 次）", attempt + 1)
-                if attempt < 2:
-                    await asyncio.sleep(0.5)
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(0.5)

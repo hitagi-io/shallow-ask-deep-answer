@@ -57,6 +57,11 @@ async function toggleSearch() {
 const renameId = ref('')
 const title = ref('')
 const sidebar = ref<HTMLElement | null>(null)
+watch(conversationMenuId, async id => {
+  if (!id) return
+  await nextTick()
+  sidebar.value?.querySelector<HTMLElement>('.conversation-menu')?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+})
 let previousFocus: HTMLElement | null = null
 const groups = computed(() => {
   const today = new Date(); today.setHours(0, 0, 0, 0)
@@ -180,11 +185,11 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
             <span v-if="healthIssueCount > 0" class="badge">{{ healthIssueCount }}</span>
           </button>
           <div v-if="showGearMenu" id="account-menu" class="gear-menu" role="group" aria-label="账号操作">
-            <button @click="navigateTo('account')">编辑信息</button>
             <button @click="navigateToKnowledge">
               管理知识库
               <span v-if="healthIssueCount > 0" class="badge menu-badge">{{ healthIssueCount }}</span>
             </button>
+            <button @click="navigateTo('account')">编辑信息</button>
             <button @click="navigateTo('about')">关于</button>
             <button class="logout-item" @click="showGearMenu = false; emit('logout')">退出登录</button>
           </div>
@@ -252,6 +257,7 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
 .badge { background: var(--danger); color: var(--on-accent); border-radius: 20px; font-size: 10px; padding: 1px 4px; position: absolute; top: -3px; right: -3px; }
 .menu-badge { position: static; margin-left: 8px; }
 .gear-menu { position: absolute; bottom: 46px; right: 0; width: 200px; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-card); padding: 6px; box-shadow: var(--shadow-md); z-index: 30; }
+.gear-menu { max-height: calc(100dvh - 128px - env(safe-area-inset-bottom, 0px)); overflow-y: auto; overscroll-behavior: contain; }
 .gear-menu button { display: block; padding: 10px 12px; font-size: 13px; width: 100%; text-align: left; border-radius: var(--radius-control); }
 .gear-menu button:hover { background: var(--surface); }
 .logout-item { color: var(--danger); }

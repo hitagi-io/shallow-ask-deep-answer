@@ -43,15 +43,21 @@ def chunk_id(document) -> str:
 
 def fuse_rrf(rankings, constant: int):
     scores, documents = {}, {}
+    duplicates = 0
     for ranking in rankings:
         seen = set()
-        for rank, document in enumerate(ranking, 1):
+        rank = 0
+        for document in ranking:
             identifier = chunk_id(document)
             if identifier in seen:
-                raise ValueError("召回结果出现重复分块，请检查索引")
+                duplicates += 1
+                continue
             seen.add(identifier)
-            documents[identifier] = document
+            rank += 1
+            documents.setdefault(identifier, document)
             scores[identifier] = scores.get(identifier, 0.0) + 1.0 / (constant + rank)
+    if duplicates:
+        logger.warning("[混合检索] 已忽略 %s 个重复分块，可通过索引维护清理残留", duplicates)
     # 两路相同分块只送精排一次；RRF 同分使用稳定 ID，避免随机主键影响顺序。
     return [documents[key] for key in sorted(scores, key=lambda key: (-scores[key], key))]
 

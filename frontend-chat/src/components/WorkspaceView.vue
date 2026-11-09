@@ -28,7 +28,7 @@ const sidebarToggle = ref<HTMLButtonElement | null>(null)
 const confirmation = useConfirmation()
 const { message: confirmationMessage } = confirmation
 const projects = useProjects(confirmation.ask)
-const chat = useChat(projects.projects, confirmation.ask)
+const chat = useChat(props.user.id, projects.projects, confirmation.ask)
 const { currentId, convList, processingIds } = chat
 const knowledge = useKnowledge(projects.selectedId, computed(() => mode.value === 'knowledge'), confirmation.ask)
 const { healthIssueCount } = knowledge

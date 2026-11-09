@@ -183,9 +183,10 @@ async function clearInput() {
 .input-options { order: 1; display: flex; align-items: center; gap: 12px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
 .knowledge-toggle { display: inline-flex; gap: 6px; align-items: center; min-height: 32px; padding: 5px 9px; border: 1px solid var(--line); border-radius: var(--radius-control); color: var(--muted); font-size: 12px; white-space: nowrap; }
 .knowledge-toggle:hover:not(:disabled) { background: var(--surface); }
-.knowledge-toggle.active { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent); }
-.project-selector { display: flex; align-items: center; gap: 7px; flex: 1; color: var(--muted); min-width: 0; }
-.project-selector select { width: 100%; max-width: 260px; min-width: 0; border: 0; border-radius: 6px; background: transparent; font-size: 12px; color: var(--text); padding: 6px 18px 6px 0; cursor: pointer; text-overflow: ellipsis; }
+.knowledge-toggle.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; box-shadow: var(--shadow-sm); }
+.knowledge-toggle.active:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.project-selector { display: flex; align-items: center; gap: 7px; flex: 0 1 180px; color: var(--muted); min-width: 0; }
+.project-selector select { width: 100%; min-width: 0; border: 0; border-radius: 6px; background: transparent; font-size: 12px; color: var(--text); padding: 6px 18px 6px 0; cursor: pointer; text-overflow: ellipsis; }
 .project-selector select:focus-visible { background-color: var(--surface); }
 .project-selector.disabled { opacity: .65; }
 .project-selector select:disabled { cursor: not-allowed; }
@@ -213,8 +214,7 @@ async function clearInput() {
   .persist-notice { width: calc(100% - 24px); }
   .input-inner { padding: 10px 12px; }
   .input-options { gap: 8px; flex-wrap: wrap; margin-top: 8px; }
-  .project-selector { flex: 1 1 100px; }
-  .project-selector select { max-width: 190px; }
+  .project-selector { flex-basis: 160px; max-width: calc(100% - 96px); }
   .keyboard-hint { display: none; }
   .composer-footer { justify-content: center; font-size: 10px; margin-top: 10px; }
   .chat-navigation { right: 14px; bottom: 8px; }

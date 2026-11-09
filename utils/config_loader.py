@@ -1,4 +1,5 @@
 import os
+import math
 import yaml
 from utils.project_paths import resolve_project_path
 
@@ -28,6 +29,12 @@ def validate_agent_config(config: dict) -> None:
     """在启动时检查检索与摘要参数，避免无效配置进入工具或中间件。"""
     if not isinstance(config, dict):
         raise ValueError("config/agent.yaml 必须为键值映射")
+    timeout = config.get("llm_request_timeout_seconds")
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("config/agent.yaml 的 llm_request_timeout_seconds 必须为有限正数")
+    retries = config.get("llm_max_retries")
+    if type(retries) is not int or retries < 0:
+        raise ValueError("config/agent.yaml 的 llm_max_retries 必须为非负整数")
     for key in (
         "kb_subagent_max_retrieval_calls",
         "search_result_limit",
@@ -46,6 +53,19 @@ def validate_agent_config(config: dict) -> None:
         )
 
 
+def validate_health_config(config: dict) -> None:
+    """维护任务的间隔和次数错误必须在启动时暴露，不能被调度器钳制。"""
+    if not isinstance(config, dict):
+        raise ValueError("config/vector_db.yaml 必须为键值映射")
+    interval = config.get("health_check_interval_hours")
+    if type(interval) not in (int, float) or not math.isfinite(interval) or interval <= 0:
+        raise ValueError("config/vector_db.yaml 的 health_check_interval_hours 必须为有限正数")
+    rounds = config.get("health_auto_repair_max_rounds")
+    if type(rounds) is not int or rounds <= 0:
+        raise ValueError("config/vector_db.yaml 的 health_auto_repair_max_rounds 必须为正整数")
+
+
 agent_config=load_config('agent.yaml')
 validate_agent_config(agent_config)
 vector_db_config=load_config('vector_db.yaml')
+validate_health_config(vector_db_config)

@@ -7,6 +7,7 @@ import asyncio
 import threading
 import shutil
 import re
+import math
 from pathlib import Path
 from uuid import UUID
 from functools import partial
@@ -22,6 +23,8 @@ from pydantic import BaseModel, Field, field_validator
 from chat_agent import ChatAgent, PG_CHECKPOINT_POOL_MAX
 from rag.vector_store import get_vector_store
 from rag.index_health import IndexHealth
+from rag.index_manifest import ManifestStore, current_index_version, project_collection_name
+from utils.knowledge_files import list_supported_files
 from utils.config_loader import vector_db_config
 from utils.project_paths import get_knowledge_dir, get_knowledge_storage_root, scoped_knowledge_file
 from utils.pg_lock import SingleInstanceGuard, exclusive_section, project_index_lock_key
@@ -88,16 +91,19 @@ CHAT_STREAM_DEADLINE_SECONDS = int(os.getenv("CHAT_STREAM_DEADLINE_SECONDS", "30
 # 生成任务存活检测：保存进度时同时更新 generations.heartbeat_at；超过
 # CHAT_GENERATION_STALE_SECONDS 未更新的运行中任务，视为所属进程已异常退出，
 # 由下一次请求在同一事务内置为 failed 并补写中断提示。
-CHAT_GENERATION_SAVE_SECONDS = max(float(os.getenv("CHAT_GENERATION_SAVE_SECONDS", "0.5")), 0.1)
-CHAT_GENERATION_STALE_SECONDS = max(
-    int(os.getenv("CHAT_GENERATION_STALE_SECONDS", "120")),
-    CHAT_GENERATION_SAVE_SECONDS * 3,
-)
+CHAT_GENERATION_SAVE_SECONDS = float(os.getenv("CHAT_GENERATION_SAVE_SECONDS", "0.5"))
+CHAT_GENERATION_STALE_SECONDS = int(os.getenv("CHAT_GENERATION_STALE_SECONDS", "120"))
+if not math.isfinite(CHAT_GENERATION_SAVE_SECONDS) or CHAT_GENERATION_SAVE_SECONDS < 0.1:
+    raise ValueError("CHAT_GENERATION_SAVE_SECONDS 必须为不小于 0.1 的有限数值")
+if CHAT_GENERATION_STALE_SECONDS < CHAT_GENERATION_SAVE_SECONDS * 3:
+    raise ValueError("CHAT_GENERATION_STALE_SECONDS 必须不小于保存间隔的 3 倍")
 
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 # 就绪检查的总时限（秒），覆盖进程启动、建连、查询及 RPC。
-READINESS_TIMEOUT_SECONDS = max(float(os.getenv("READINESS_TIMEOUT_SECONDS", "3")), 0.5)
+READINESS_TIMEOUT_SECONDS = float(os.getenv("READINESS_TIMEOUT_SECONDS", "3"))
+if not math.isfinite(READINESS_TIMEOUT_SECONDS) or READINESS_TIMEOUT_SECONDS < 0.5:
+    raise ValueError("READINESS_TIMEOUT_SECONDS 必须为不小于 0.5 的有限数值")
 
 
 
@@ -127,7 +133,8 @@ async def lifespan(_app: FastAPI):
     anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_SIZE
     logger.info(f"[启动] AnyIO 默认线程池并发额度为 {THREADPOOL_SIZE}，工作进程数为 {UVICORN_WORKERS}")
     _warn_connection_budget()
-    task = asyncio.create_task(_scheduled_health_loop())
+    task = asyncio.create_task(_scheduled_health_loop(), name="scheduled-health")
+    task.add_done_callback(_background_task_done)
     try:
         yield
     finally:
@@ -153,8 +160,12 @@ allowed_types = vector_db_config["allowed_types"]
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
 
 HEALTH_REPORT_TTL_SECONDS = int(os.getenv("HEALTH_REPORT_TTL_SECONDS", "120"))
-HEALTH_CHECK_TIMEOUT_SECONDS = max(float(os.getenv("HEALTH_CHECK_TIMEOUT_SECONDS", "60")), 0.5)
-HEALTH_CHECK_MAX_CONCURRENT = max(int(os.getenv("HEALTH_CHECK_MAX_CONCURRENT", "4")), 1)
+HEALTH_CHECK_TIMEOUT_SECONDS = float(os.getenv("HEALTH_CHECK_TIMEOUT_SECONDS", "60"))
+HEALTH_CHECK_MAX_CONCURRENT = int(os.getenv("HEALTH_CHECK_MAX_CONCURRENT", "4"))
+if not math.isfinite(HEALTH_CHECK_TIMEOUT_SECONDS) or HEALTH_CHECK_TIMEOUT_SECONDS < 0.5:
+    raise ValueError("HEALTH_CHECK_TIMEOUT_SECONDS 必须为不小于 0.5 的有限数值")
+if HEALTH_CHECK_MAX_CONCURRENT < 1:
+    raise ValueError("HEALTH_CHECK_MAX_CONCURRENT 必须为正整数")
 _health_reports: dict[tuple[int, str], HealthReportCache] = {}
 _health_reports_lock = threading.Lock()
 _health_scanner = HealthScanRunner(HEALTH_CHECK_TIMEOUT_SECONDS, HEALTH_CHECK_MAX_CONCURRENT)
@@ -211,12 +222,12 @@ def _index_write_section(user_id: int, project_id: str):
 
 def _format_repair_summary(repair: dict) -> str:
     """格式化修复摘要，供定时自动修复和手动修复共用同一套表述。"""
-    record_state = "已更新" if repair.get("manifest_rebuilt") else "未变更"
+    record_state = "已更新" if repair["manifest_rebuilt"] else "未变更"
     return (
-        f"清理残留向量 {len(repair.get('ghost_deleted', []))} 个"
-        f"（失败 {len(repair.get('ghost_errors', []))} 个），"
-        f"索引记录{record_state}，重索引 {len(repair.get('re_indexed', []))} 个"
-        f"（失败 {len(repair.get('re_index_failures', []))} 个）"
+        f"清理残留向量 {len(repair['ghost_deleted'])} 个"
+        f"（失败 {len(repair['ghost_errors'])} 个），"
+        f"索引记录{record_state}，重索引 {len(repair['re_indexed'])} 个"
+        f"（失败 {len(repair['re_index_failures'])} 个）"
     )
 
 
@@ -230,22 +241,22 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
         if project is None:
             return None
         index_health = IndexHealth(user_id, project_id)
-        max_rounds = int(vector_db_config.get("health_auto_repair_max_rounds", 3))
-        report = index_health.check()
+        max_rounds = vector_db_config["health_auto_repair_max_rounds"]
+        report = index_health.check(record_files=True)
         for _ in range(max_rounds):
-            if report.get("healthy"):
+            if report["healthy"]:
                 break
-            if report.get("milvus_error") or report.get("manifest_error"):
+            if report["milvus_error"] or report["manifest_error"]:
                 logger.warning("[索引自动修复] 存储不可用，本轮暂不执行修复")
                 break
             try:
                 report = index_health.repair()
-                repair = report.get("repair") or {}
+                repair = report["repair"]
                 logger.info(f"[索引自动修复] 本轮修复完成：{_format_repair_summary(repair)}")
             except Exception as e:
                 logger.error(f"[索引自动修复] 执行失败：{e}")
                 break
-        _invalidate_health(user_id, project_id)
+        _health_cache(user_id, project_id).set({"report": report})
         return report
 
 
@@ -255,7 +266,7 @@ async def _scheduled_health_loop():
     多 worker/多实例下必须只由一个进程执行，否则会重复修复、重复触发嵌入调用；
     使用 PostgreSQL 会话级咨询锁（advisory lock）选出唯一执行进程；持有者退出后，其他进程自动接管。
     """
-    interval = max(int(vector_db_config.get("health_check_interval_hours", 6) * 3600), 600)
+    interval = vector_db_config["health_check_interval_hours"] * 3600
     guard = SingleInstanceGuard(PG_CONN, _PG_LOCK_KEY_HEALTH)
     next_run = 0.0
     was_leader = False
@@ -512,16 +523,16 @@ def api_update_title(conv_id: str, req: UpdateTitleRequest, user: dict = Depends
 
 
 def _purge_thread_checkpoints(thread_id: str) -> None:
-    """删除会话对应的 LangGraph 检查点，最多重试 3 次；失败抛异常触发事务回滚。"""
+    """删除会话对应的 LangGraph 检查点；仅数据库运行故障最多尝试 3 次。"""
     for attempt in range(3):
         try:
             agent.checkpointer.delete_thread(thread_id)
             return
-        except Exception as e:
-            logger.error(f"[会话] 清理检查点失败 thread_id={thread_id}（第 {attempt + 1} 次尝试）：{e}")
-            if attempt < 2:
-                time.sleep(0.5)
-    raise RuntimeError("清理会话上下文失败")
+        except psycopg.OperationalError:
+            logger.exception("[会话] 清理检查点失败 thread_id=%s（第 %s 次尝试）", thread_id, attempt + 1)
+            if attempt == 2:
+                raise
+            time.sleep(0.5)
 
 
 @app.delete("/api/conversations/{conv_id}")
@@ -602,6 +613,14 @@ def _sse(payload: dict) -> str:
 
 # 强引用后台任务，生命周期只由生成结果、显式停止、超时或服务关闭决定。
 _generation_tasks: set[asyncio.Task] = set()
+
+
+def _background_task_done(task: asyncio.Task) -> None:
+    _generation_tasks.discard(task)
+    if not task.cancelled():
+        error = task.exception()
+        if error is not None:
+            logger.error("[后台任务] %s 异常结束", task.get_name(), exc_info=error)
 
 
 async def _run_generation(req: ChatRequest, user_id: int, generation_id: int, slot: str):
@@ -743,9 +762,12 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         await _release_chat_slot(user["user_id"], slot)
     else:
         # 在返回响应前启动独立任务；断开 SSE 只结束订阅。
-        generation_task = asyncio.create_task(_run_generation(req, user["user_id"], begun["generation_id"], slot))
+        generation_task = asyncio.create_task(
+            _run_generation(req, user["user_id"], begun["generation_id"], slot),
+            name=f"generation-{begun['generation_id']}",
+        )
         _generation_tasks.add(generation_task)
-        generation_task.add_done_callback(_generation_tasks.discard)
+        generation_task.add_done_callback(_background_task_done)
         try:
             await asyncio.to_thread(bind_chat_slot_generation, user["user_id"], slot, begun["generation_id"])
         except Exception:
@@ -832,14 +854,15 @@ def _safe_filename(filename: str) -> str:
 
 
 @app.get("/api/projects/{project_id}/files")
-async def list_files(request: Request, project: dict = Depends(require_project)):
+def list_files(project: dict = Depends(require_project)):
     user_id, project_id = project["user_id"], project["id"]
-    # Preserve the file endpoint's fresh-read semantics, while joining a health
-    # scan already running for this project instead of acquiring more connections.
-    snapshot = await _request_health_snapshot(request, user_id, project_id, refresh=True)
-    if snapshot["report"]["milvus_error"] or snapshot["report"]["manifest_error"]:
-        raise HTTPException(status_code=503, detail="无法确认索引状态，请稍后重试")
-    return {"files": snapshot["files"]}
+    with project_access(user_id, project_id) as current:
+        _ensure_project(current)
+        directory = get_knowledge_dir(user_id, project_id)
+        paths = list_supported_files(directory, allowed_types)
+        manifests = ManifestStore({**vector_db_config, "collection_name":
+                                   project_collection_name(vector_db_config, user_id, project_id)})
+        return {"files": manifests.file_statuses(paths, current_index_version(vector_db_config))}
 
 
 def _write_upload_to(file: UploadFile, tmp_path: str) -> None:
@@ -943,6 +966,9 @@ def build_knowledge_index(project: dict = Depends(require_project)):
 @app.get("/api/projects/{project_id}/index/health")
 async def get_index_health(request: Request, refresh: bool = False, project: dict = Depends(require_project)):
     user_id, project_id = project["user_id"], project["id"]
+    if not refresh:
+        snapshot = _health_cache(user_id, project_id).peek()
+        return snapshot["report"] if snapshot is not None else None
     snapshot = await _request_health_snapshot(request, user_id, project_id, refresh)
     return snapshot["report"]
 
@@ -954,7 +980,7 @@ def repair_index_health(project: dict = Depends(require_project)):
         with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
             _ensure_project(current)
             report = IndexHealth(user_id, project_id).repair()
-            _invalidate_health(user_id, project_id)
+            _health_cache(user_id, project_id).set({"report": report})
         return report
     except HTTPException:
         raise

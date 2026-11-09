@@ -37,18 +37,23 @@ def format_search_response(response: object) -> str:
         return SEARCH_ERROR_MARKER
     if "results" not in response and "answer" not in response:
         return SEARCH_ERROR_MARKER
-    raw_results = response.get("results")
-    if raw_results is not None and not isinstance(raw_results, list):
+    raw_results = response.get("results", [])
+    if not isinstance(raw_results, list):
         return SEARCH_ERROR_MARKER
 
-    summary = _text(response.get("answer"))
+    answer = response.get("answer")
+    if answer is not None and not isinstance(answer, str):
+        return SEARCH_ERROR_MARKER
+    summary = _text(answer)
     results = []
-    for item in raw_results or []:
+    for item in raw_results:
         if not isinstance(item, dict):
-            continue
+            return SEARCH_ERROR_MARKER
         url = _source_url(item.get("url"))
         if not url:
-            continue
+            return SEARCH_ERROR_MARKER
+        if any(item.get(key) is not None and not isinstance(item[key], str) for key in ("title", "content")):
+            return SEARCH_ERROR_MARKER
         content = _text(item.get("content"))
         results.append({
             "title": _text(item.get("title"))[:300] or url,

@@ -13,6 +13,10 @@ import hashlib
 
 import psycopg
 
+from utils.logging_config import get_logger
+
+logger = get_logger(__name__)
+
 PG_LOCK_KEY_SETUP = 0x64656571
 
 
@@ -89,11 +93,9 @@ class SingleInstanceGuard:
                 with self._conn.cursor() as cur:
                     cur.execute("SELECT 1")
                 return True
-            except Exception:
-                try:
-                    self._conn.close()
-                except Exception:
-                    pass
+            except psycopg.OperationalError:
+                logger.warning("[定时任务] 单例锁连接失效，尝试重新获取", exc_info=True)
+                self._conn.close()
                 self._conn = None
         self._held = False
         try:
@@ -102,12 +104,10 @@ class SingleInstanceGuard:
             with self._conn.cursor() as cur:
                 cur.execute("SELECT pg_try_advisory_lock(%s)", (self._lock_key,))
                 self._held = bool(cur.fetchone()[0])
-        except Exception:
+        except psycopg.OperationalError:
+            logger.warning("[定时任务] 无法获取单例锁，等待下一轮重试", exc_info=True)
             self._held = False
             if self._conn is not None:
-                try:
-                    self._conn.close()
-                except Exception:
-                    pass
+                self._conn.close()
                 self._conn = None
         return self._held

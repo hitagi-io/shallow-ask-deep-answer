@@ -32,7 +32,10 @@ async function validateSession() {
   try {
     const latest = await apiMe()
     if (user.value === current) user.value = latest
-  } catch { /* 401 is handled centrally; transient network failures do not log users out. */ }
+  } catch (error) {
+    // 401 由统一回调处理；其他复核失败保留会话，并留下诊断信息。
+    if (user.value === current) console.warn('[登录状态] 复核失败', error)
+  }
   finally { validatingSession = false }
 }
 function syncLogout(event: StorageEvent) {
@@ -47,7 +50,9 @@ onMounted(async () => {
   sessionTimer = setInterval(validateSession, 15000)
   if (!checkingAuth.value) return
   try { user.value = await apiMe() }
-  catch { clearAuth() }
+  catch (error) {
+    if (!authError.value) authError.value = error instanceof Error ? error.message : '验证登录状态失败，请刷新页面重试'
+  }
   finally { checkingAuth.value = false }
 })
 onUnmounted(() => {

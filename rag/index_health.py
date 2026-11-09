@@ -105,21 +105,16 @@ class IndexHealth:
         report["issues"] = list(issues.values())
         return report, state
 
-    def check(self) -> dict:
-        """只读检查；从未入库、也没有残留分块的文件仍视为待构建。"""
+    def check(self, *, record_files: bool = False) -> dict:
+        """默认只读检查；定时维护可同时更新已知的文件摘要记录。"""
         with self._lock, self.vector_store._store_lock:
-            return self._scan()[0]
-
-    def file_statuses(self) -> list[dict]:
-        """文件列表与健康检查共用完整性判定，不把清单存在当成已正确入库。"""
-        snapshot = self.snapshot()
-        report = snapshot["report"]
-        if report["milvus_error"] or report["manifest_error"]:
-            raise RuntimeError("无法确认索引状态")
-        return snapshot["files"]
+            report, state = self._scan()
+            if record_files and not report["manifest_error"]:
+                self.vector_store.manifests.record_files(state["disk"])
+            return report
 
     def snapshot(self) -> dict:
-        """一次只读扫描同时供健康报告和文件列表请求共享。"""
+        """完整扫描的只读快照，供显式检查使用。"""
         with self._lock, self.vector_store._store_lock:
             report, state = self._scan()
             return {"report": report, "files": [
@@ -203,6 +198,6 @@ class IndexHealth:
                 except Exception:
                     logger.exception("[索引健康检查] 清理残留块失败 source=%s", source)
                     summary["ghost_errors"].append(f"{source}: 清理失败，详情见服务端日志")
-            report = self.check()
+            report = self.check(record_files=True)
             report["repair"] = summary
             return report

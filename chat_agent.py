@@ -8,6 +8,7 @@ from string import Template
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware, dynamic_prompt
+from langchain.agents.middleware.types import ModelRequest
 from langchain.chat_models import init_chat_model
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
@@ -62,10 +63,9 @@ def build_date_prompt_middleware(static_prompt: str):
     又保证进程跨天运行时日期不过期。static_prompt 仅作为备用提示词。
     """
 
-    def _prompt(request) -> str:
-        system_message = getattr(request, "system_message", None)
-        content = getattr(system_message, "content", "") if system_message is not None else ""
-        base = content if isinstance(content, str) and content else static_prompt
+    def _prompt(request: ModelRequest) -> str:
+        system_message = request.system_message
+        base = system_message.text if system_message is not None else static_prompt
         return _inject_current_date(base)
 
     return dynamic_prompt(_prompt)
@@ -137,8 +137,8 @@ class ChatAgent:
         self.model=init_chat_model(
             model=os.getenv("MAIN_AGENT_MODEL") or agent_config["main_agent_model"],
             base_url=os.getenv("MAIN_AGENT_MODEL_BASE_URL") or agent_config["main_agent_model_base_url"],
-            timeout=float(agent_config.get("llm_request_timeout_seconds", 120)),
-            max_retries=int(agent_config.get("llm_max_retries", 1)),
+            timeout=agent_config["llm_request_timeout_seconds"],
+            max_retries=agent_config["llm_max_retries"],
         )
         self._pg_pool = ConnectionPool(
             conninfo=_PG_CONNECTION_STRING,

@@ -14,11 +14,13 @@ export function useHealthReport() {
   let expiryTimer: ReturnType<typeof setTimeout> | undefined
 
   function beginRequest() { return ++requestVersion }
-  function acceptReport(request: number, report: HealthReport) {
+  function acceptReport(request: number, report: HealthReport | null) {
     if (request !== requestVersion) return false
+    healthError.value = ''
+    // 其他 worker 可能尚无缓存；保留本页已取得的报告，并按原检查时间判断过期。
+    if (!report) return true
     clearTimeout(expiryTimer)
     health.value = report
-    healthError.value = ''
     const checkedAt = report.checked_at ? Date.parse(report.checked_at) : NaN
     const remaining = checkedAt + HEALTH_REPORT_MAX_AGE_MS - Date.now()
     healthExpired.value = !Number.isFinite(remaining) || remaining <= 0
@@ -38,20 +40,9 @@ export function useHealthReport() {
   onScopeDispose(() => { beginRequest(); clearTimeout(expiryTimer) })
 
   const healthNotice = computed(() => {
-    if (healthError.value) return `检查失败：${healthError.value}。${health.value ? '上次报告已失效，仅供参考；' : ''}当前状态未知，将自动重试，也可点击“检查索引”。`
+    if (healthError.value) return `报告读取失败：${healthError.value}。${health.value ? '上次报告仅供参考；' : ''}可稍后重试或点击“检查索引”。`
     if (healthExpired.value) return '报告已过期：最近 5 分钟没有有效的检查结果，当前状态未知。历史报告仅供参考，请重新检查。'
     return ''
-  })
-  const unknown = computed(() => !!healthError.value || healthExpired.value)
-  const documentStatus = computed<DisplayStatus>(() => {
-    const report = health.value
-    if (unknown.value) return { label: '状态未知', tone: 'warning' }
-    if (!report) return { label: '待检查', tone: 'neutral' }
-    if (!report.healthy || report.milvus_error || report.manifest_error) return { label: '需要处理', tone: 'error' }
-    if (!report.stats.files) return { label: '暂无资料', tone: 'neutral' }
-    if (!report.stats.indexed_files) return { label: '待入库', tone: 'warning' }
-    if (report.stats.indexed_files < report.stats.files) return { label: '部分入库', tone: 'warning' }
-    return { label: '已入库', tone: 'success' }
   })
   const indexStatus = computed<DisplayStatus>(() => {
     const report = health.value
@@ -63,6 +54,6 @@ export function useHealthReport() {
     return { label: '现有索引完整', tone: 'success' }
   })
 
-  return { health, healthError, healthExpired, healthNotice, documentStatus, indexStatus,
+  return { health, healthError, healthExpired, healthNotice, indexStatus,
     beginRequest, acceptReport, rejectReport, reset }
 }

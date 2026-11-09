@@ -43,6 +43,11 @@ class HealthReportCache:
             self._updated_at = 0.0
             self._revision += 1
 
+    def peek(self) -> dict | None:
+        """只读取有效缓存；过期或缺失时返回 None，不触发扫描。"""
+        with self._lock:
+            return self._report if time.monotonic() - self._updated_at < self._ttl else None
+
     async def _refresh(self, check: Callable[[], Awaitable[dict]], revision: int) -> dict:
         report = await check()
         # 即使下层在取消后返回，也不能发布已经放弃的检查结果。

@@ -21,7 +21,7 @@ export interface MessageHistory {
 export interface ConversationSummary {
   id: string
   title: string
-  updatedAt?: string
+  updatedAt: string
   /** 是否已有消息，用于识别唯一的空白会话。 */
   hasMessages: boolean
   /** 首次发送后固定的会话模式；空白会话可在本地切换。 */
@@ -51,8 +51,8 @@ export interface Project {
 export interface FileItem {
   name: string
   path: string
-  /** 是否已入库（已构建进向量库） */
-  indexed: boolean
+  /** 根据入库记录判断；null 表示文件尚无记录，完整性另见检查报告。 */
+  indexed: boolean | null
 }
 
 // ---------- auth helpers ----------
@@ -157,7 +157,7 @@ export async function apiLogin(username: string, password: string): Promise<User
 export async function apiMe(): Promise<UserInfo> {
   const token = getToken()
   const res = await apiFetch('/api/auth/me', { headers: authHeaders() })
-  if (!res.ok) throw new Error('未登录')
+  if (!res.ok) throw new Error(await errorMessage(res, '验证登录状态失败，请稍后重试'))
   const data = await res.json()
   if (!token || token !== getToken()) throw new Error('登录状态已变更')
   localStorage.setItem(USER_KEY, JSON.stringify(data.user))
@@ -299,6 +299,11 @@ function reconnectDelay(signal: AbortSignal): Promise<void> {
   })
 }
 
+class StreamConnectionError extends Error {
+  readonly cause?: unknown
+  constructor(message: string, cause?: unknown) { super(message); this.cause = cause }
+}
+
 /** POST 只创建一次任务；断线后使用 GET 重新订阅数据库快照，不重复提交问题。 */
 export async function streamChat(
   conversationId: string,
@@ -311,6 +316,7 @@ export async function streamChat(
   let started = !submission
   let submit = submission
   let missingAttempts = 0
+  let reconnectAttempts = 0
   while (!signal.aborted) {
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
     try {
@@ -321,11 +327,11 @@ export async function streamChat(
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: initial ? JSON.stringify({ message: initial.message, thread_id: conversationId, request_id: requestId, kb_only: initial.kbOnly, project_id: initial.projectId }) : undefined,
         signal,
-      })
+      }).catch(error => { throw new StreamConnectionError('连接回答服务失败', error) })
       if (!res.ok) {
         // 首次 POST 回执丢失时，给登记事务留出完成时间，再确认任务是否存在。
-        if (!initial && res.status === 404 && !started && ++missingAttempts < 3) throw new Error('等待任务登记')
-        if (res.status >= 500) throw new Error('服务暂时不可用')
+        if (!initial && res.status === 404 && !started && ++missingAttempts < 3) throw new StreamConnectionError('等待任务登记')
+        if (res.status >= 500) throw new StreamConnectionError('服务暂时不可用')
         return { status: 'error', started, error: await errorMessage(res, `请求失败: ${res.status}`) }
       }
       started = true
@@ -340,11 +346,14 @@ export async function streamChat(
         if (data.type !== 'snapshot') return null
         onConnection(false)
         onSnapshot(data as GenerationSnapshot)
+        reconnectAttempts = 0
         if (data.status === 'running') return null
         return { status: data.status === 'completed' ? 'completed' : data.status === 'cancelled' ? 'cancelled' : 'error', started, error: data.error }
       }
       while (!signal.aborted) {
-        const { done, value } = await reader.read()
+        const { done, value } = await reader.read().catch(error => {
+          throw new StreamConnectionError('读取回答连接失败', error)
+        })
         buffer += done ? decoder.decode() : decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
@@ -355,12 +364,19 @@ export async function streamChat(
         }
         if (done) break
       }
-    } catch {
-      // 网络断线与停止生成是不同操作；保持会话运行态并重新订阅。
+    } catch (error) {
+      if (signal.aborted) break
+      if (!(error instanceof StreamConnectionError)) {
+        console.error('[回答流] 响应处理失败', error)
+        return { status: 'error', started, error: '回答数据处理失败，请刷新页面后重试。' }
+      }
     } finally {
       await reader?.cancel().catch(() => {})
     }
     if (!signal.aborted) {
+      if (++reconnectAttempts >= 5) {
+        return { status: 'error', started, error: '多次连接回答服务失败，请检查网络后刷新页面重试。' }
+      }
       onConnection(true)
       await reconnectDelay(signal)
     }
@@ -372,13 +388,16 @@ export async function streamChat(
 
 function projectPath(id: string) { return `/api/projects/${encodeURIComponent(id)}` }
 
-function knowledgeTimeout(value: unknown): number {
+function knowledgeTimeout(value: string | number | undefined): number {
+  if (value === undefined) return 65_000
   const milliseconds = Number(value)
-  return Number.isFinite(milliseconds) && milliseconds > 0 && milliseconds <= 2_147_483_647
-    ? milliseconds : 65_000
+  if (!Number.isInteger(milliseconds) || milliseconds <= 0 || milliseconds > 2_147_483_647) {
+    throw new Error('知识库请求超时必须是 1～2147483647 之间的整数毫秒')
+  }
+  return milliseconds
 }
 
-export const KNOWLEDGE_REQUEST_TIMEOUT_MS = knowledgeTimeout(import.meta.env?.VITE_KNOWLEDGE_REQUEST_TIMEOUT_MS)
+export const KNOWLEDGE_REQUEST_TIMEOUT_MS = knowledgeTimeout(import.meta.env.VITE_KNOWLEDGE_REQUEST_TIMEOUT_MS)
 export interface KnowledgeRequestOptions { signal?: AbortSignal; timeoutMs?: number }
 export function isRequestCancelled(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError'
@@ -494,20 +513,24 @@ export interface HealthReport {
   manifest_error?: string | null
   stats: { files: number; indexed_files: number; chunks: number }
   issues: HealthIssue[]
-  repair?: {
-    ghost_deleted: string[]
-    ghost_errors: string[]
-    manifest_rebuilt: boolean
-    re_indexed: string[]
-    re_index_failures: { file: string; error: string }[]
-  }
+  repair?: IndexRepairSummary
 }
 
-export async function fetchIndexHealth(projectId: string, refresh = false, options: KnowledgeRequestOptions = {}): Promise<HealthReport> {
-  return fetchKnowledgeJson<HealthReport>(`${projectPath(projectId)}/index/health${refresh ? '?refresh=1' : ''}`, '获取索引健康状态失败', options)
+interface IndexRepairSummary {
+  ghost_deleted: string[]
+  ghost_errors: string[]
+  manifest_rebuilt: boolean
+  re_indexed: string[]
+  re_index_failures: { file: string; error: string }[]
 }
 
-export async function repairIndexHealth(projectId: string): Promise<HealthReport> {
+export interface IndexRepairReport extends HealthReport { repair: IndexRepairSummary }
+
+export async function fetchIndexHealth(projectId: string, refresh = false, options: KnowledgeRequestOptions = {}): Promise<HealthReport | null> {
+  return fetchKnowledgeJson<HealthReport | null>(`${projectPath(projectId)}/index/health${refresh ? '?refresh=1' : ''}`, '获取索引健康状态失败', options)
+}
+
+export async function repairIndexHealth(projectId: string): Promise<IndexRepairReport> {
   const res = await apiFetch(`${projectPath(projectId)}/index/health/repair`, { method: 'POST', headers: authHeaders() })
   if (!res.ok) throw new Error(await errorMessage(res, '修复失败'))
   return res.json()

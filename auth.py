@@ -14,11 +14,12 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 import jwt
 from argon2 import PasswordHasher
-from argon2.exceptions import VerificationError
+from argon2.exceptions import VerifyMismatchError
 from dotenv import load_dotenv
 
 from utils.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
 from utils.logging_config import get_logger
+from rag.index_manifest import ManifestStore
 
 logger = get_logger(__name__)
 
@@ -215,6 +216,7 @@ def init_db():
                     "CREATE INDEX IF NOT EXISTS idx_chat_slots_user "
                     "ON chat_slots (user_id)"
                 )
+                ManifestStore.setup(cur)
             conn.commit()
 
 
@@ -231,7 +233,7 @@ def _verify_password(password: str, stored: str) -> bool:
     try:
         _ph.verify(stored, password)
         return True
-    except VerificationError:
+    except VerifyMismatchError:
         return False
 
 
@@ -563,7 +565,6 @@ def delete_project(user_id: int, project_id: str, stale_seconds: float = 120, cl
 
 def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None) -> dict:
     """按更新时间和 ID 翻页，只返回会话摘要。游标保存原始数据库时间精度。"""
-    limit = max(1, min(limit, 100))
     params: list = [user_id]
     boundary = ""
     if cursor:
@@ -613,7 +614,6 @@ def list_messages(
     stale_seconds: float = 120,
 ) -> dict | None:
     """验证归属后读取会话消息及固定模式，按 ID 向前翻页，页内正序返回。"""
-    limit = max(1, min(limit, 100))
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("SELECT c.id, c.kb_only, c.project_id, p.name AS project_name FROM conversations c "

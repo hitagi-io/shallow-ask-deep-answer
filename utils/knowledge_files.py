@@ -40,12 +40,11 @@ def list_supported_files(dir_path,allowed_types:tuple[str]):
     """仅列出项目目录中的普通文件；空项目无需提前创建磁盘目录。"""
     abs_dir_path = resolve_project_path(dir_path)
     files = []
-    if not os.path.exists(abs_dir_path):
-        return files
-    if not os.path.isdir(abs_dir_path):
-        logger.warning("[文件] 目标路径不是目录 directory=%s", os.path.basename(abs_dir_path))
-        return files
-    for f in listdir(abs_dir_path):
+    try:
+        names = listdir(abs_dir_path)
+    except FileNotFoundError:
+        return ()
+    for f in names:
         ext = os.path.splitext(f)[1].lower()
         path = os.path.join(abs_dir_path, f)
         if ext in allowed_types and os.path.isfile(path) and not os.path.islink(path):

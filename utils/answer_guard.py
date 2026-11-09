@@ -11,6 +11,8 @@
 固定文案以本模块为唯一来源，提示词模板经 utils.prompt_loader 注入。
 """
 
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
+
 from utils.retrieval_protocol import (
     CITATION_SOURCE_LIMIT,
     STATUS_EMPTY,
@@ -97,7 +99,6 @@ class AnswerGuard:
         """
         if self.terminated:
             return
-        text = text or ""
         if tool_name:
             self._seen_tools.append(tool_name)
         if tool_name == "task":
@@ -193,13 +194,13 @@ class AnswerGuard:
         if text.strip() in _FIXED_COPY_TEXTS:
             return self._terminate("unverified", "检索成功但模型输出了降级文案")
 
-        body, cited = split_answer_and_citations(text)
+        sources = _merge_sources(ok_reports)
+        body, cited = split_answer_and_citations(text, sources)
         if not body.strip():
             return self._terminate("unverified", "回答只有来源标注，没有正文")
         if body.strip() in _FIXED_COPY_TEXTS:
             return self._terminate("unverified", "检索成功但模型输出了降级文案")
 
-        sources = _merge_sources(ok_reports)
         invalid = [name for name in cited if name not in sources]
         if invalid:
             return self._terminate(
@@ -214,9 +215,9 @@ class AnswerGuard:
         if any(not report["cited_sources"] for report in ok_reports):
             return self._terminate("unverified", "回答未标注来源，且部分成功报告缺少引用归属")
         cited_sources = _merge_sources(ok_reports, field="cited_sources")
-        suffix = (
-            "\n\n参考来源（内部知识库）："
-            f"{'、'.join(cited_sources[:CITATION_SOURCE_LIMIT])}"
+        suffix = "\n\n" + "\n".join(
+            f"参考来源（内部知识库）：{source}"
+            for source in cited_sources[:CITATION_SOURCE_LIMIT]
         )
         self._buffer.clear()
         # 后续依赖任务可能重置正文；最终替换也会移除早先已流出的中间答案。
@@ -234,43 +235,13 @@ class AnswerGuard:
 
 
 
-def _chunk_text(chunk) -> str:
-    """提取消息块文本，兼容 str 与内容块列表两种 content 形态。"""
-    content = getattr(chunk, "content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("text"):
-                parts.append(str(block["text"]))
-        return "".join(parts)
-    return "" if content is None else str(content)
-
-
-def _tool_calls(chunk) -> list[tuple[str | None, str | None]]:
+def _tool_calls(chunk: BaseMessage) -> list[tuple[str | None, str | None]]:
     """从流式 AI 消息中提取（工具名, tool_call_id），用于关联具体工具调用。"""
-    calls = []
-    for item in getattr(chunk, "tool_call_chunks", None) or []:
-        if isinstance(item, dict):
-            calls.append((item.get("name"), item.get("id")))
-        else:
-            calls.append((getattr(item, "name", None), getattr(item, "id", None)))
-    try:
-        tool_calls = getattr(chunk, "tool_calls", None) or []
-    except Exception:
-        tool_calls = []
-    for item in tool_calls:
-        if isinstance(item, dict):
-            calls.append((item.get("name"), item.get("id")))
-        else:
-            calls.append((getattr(item, "name", None), getattr(item, "id", None)))
-    return [
-        (str(name) if name else None, str(call_id) if call_id else None)
-        for name, call_id in calls
-    ]
+    if isinstance(chunk, AIMessageChunk):
+        return [(call["name"], call["id"]) for call in chunk.tool_call_chunks]
+    if isinstance(chunk, AIMessage):
+        return [(call["name"], call["id"]) for call in chunk.tool_calls]
+    return []
 
 
 def _general_stream(raw_stream, should_stop=None):
@@ -288,23 +259,22 @@ def _general_stream(raw_stream, should_stop=None):
     if event:
         yield event
 
-    for item in raw_stream:
+    for chunk, _metadata in raw_stream:
         if should_stop is not None and should_stop():
             return
-        chunk = item[0] if isinstance(item, (tuple, list)) and len(item) == 2 else item
 
         next_phase = None
         for name, _ in _tool_calls(chunk):
             if name:
                 next_phase = "searching" if name == "tavily_search" else "working"
 
-        if getattr(chunk, "type", "") == "tool":
+        if isinstance(chunk, ToolMessage):
             event = phase_event("generating")
             if event:
                 yield event
             continue
 
-        text = _chunk_text(chunk)
+        text = chunk.text
         if text:
             yield text
         if next_phase:
@@ -354,10 +324,9 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
         if event:
             yield event
 
-        for item in raw_stream:
+        for chunk, _metadata in raw_stream:
             if should_stop is not None and should_stop():
                 return
-            chunk = item[0] if isinstance(item, (tuple, list)) and len(item) == 2 else item
 
             next_phase = None
             for name, call_id in _tool_calls(chunk):
@@ -365,11 +334,11 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
                 if name == "task":
                     next_phase = "retrieving"
 
-            if getattr(chunk, "type", "") == "tool":
+            if isinstance(chunk, ToolMessage):
                 hint = guard.feed_tool(
-                    _chunk_text(chunk),
-                    getattr(chunk, "name", None),
-                    getattr(chunk, "tool_call_id", None),
+                    chunk.text,
+                    chunk.name,
+                    chunk.tool_call_id,
                 )
                 if hint:
                     next_phase = "generating"
@@ -380,7 +349,7 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
                         guard.begin_release()
                 continue
 
-            delta = guard.feed_text(_chunk_text(chunk))
+            delta = guard.feed_text(chunk.text)
             if delta:
                 emitted.append(delta)
                 yield delta
@@ -402,12 +371,10 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
             # 已下发内容与最终校验结果不一致（引用越界、降级文案等），整段替换
             yield {"type": "replace", "content": text}
     finally:
-        close = getattr(raw_stream, "close", None)
-        if close is not None:
-            try:
-                close()
-            except Exception as e:
-                logger.error(f"[输出校验] 关闭上游消息流失败，继续结束请求：{e}")
+        try:
+            raw_stream.close()
+        except Exception as e:
+            logger.error(f"[输出校验] 关闭上游消息流失败，继续结束请求：{e}")
 
 
 def _merge_sources(reports: list[dict], field: str = "sources") -> list[str]:

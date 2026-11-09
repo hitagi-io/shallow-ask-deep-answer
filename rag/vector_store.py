@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import time
 import threading
 import uuid
 from collections import OrderedDict
@@ -14,7 +12,7 @@ from langchain_milvus import BM25BuiltInFunction, Milvus
 from dotenv import load_dotenv
 
 from rag.embeddings import DashScopeEmbeddings
-from rag.index_manifest import IndexManifest, ManifestStore, chunks_match, current_index_version, text_sha256
+from rag.index_manifest import IndexManifest, ManifestStore, chunks_match, current_index_version, project_collection_name, text_sha256
 from rag.retrieval import HybridRetriever
 from utils.config_loader import vector_db_config
 from utils.knowledge_files import list_supported_files, compute_file_sha256, get_document_loader
@@ -27,8 +25,6 @@ load_dotenv()
 _vector_stores: OrderedDict[tuple[int, str], VectorStore] = OrderedDict()
 _lock = threading.Lock()
 _MAX_CACHED_PROJECTS = 128
-_INDEX_MAX_ATTEMPTS = 3
-_INDEX_RETRY_SLEEP = 1.0
 _INDEX_FAIL_GENERIC = "入库失败，详见服务端日志"
 
 
@@ -49,10 +45,7 @@ class VectorStore:
     def __init__(self, user_id: int, project_id: str):
         self.user_id, self.project_id = knowledge_scope(user_id, project_id)
         self.knowledge_dir = get_knowledge_dir(self.user_id, self.project_id)
-        prefix = vector_db_config["collection_prefix"]
-        if not isinstance(prefix, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", prefix):
-            raise ValueError("collection_prefix 必须是以字母开头的字母、数字或下划线，最多 80 字符")
-        collection_name = f"{prefix}_u{self.user_id}_p{uuid.UUID(self.project_id).hex}"
+        collection_name = project_collection_name(vector_db_config, self.user_id, self.project_id)
         self.manifests = ManifestStore({**vector_db_config, "collection_name": collection_name})
         self.index_version = current_index_version(vector_db_config)
         self.vector_store = Milvus(
@@ -151,6 +144,8 @@ class VectorStore:
                     if result["ok"]:
                         self._retire_source_versions(path, result["content_sha256"])
                     else:
+                        if result.get("content_sha256"):
+                            self.manifests.record_files({path: result["content_sha256"]})
                         failures.append({"file": path, "error": result["error"]})
                 except Exception:
                     logger.exception("[向量库] 入库失败 file=%s", os.path.basename(path))
@@ -173,6 +168,7 @@ class VectorStore:
             result["content_sha256"] = sha256
             old = self.manifests.all().get(sha256)
             if not force and old and self.manifest_is_current(old):
+                self.manifests.record_files({file_path: sha256})
                 return {**result, "chunks": old.expected_chunks, "ok": True, "error": None}
             loader = get_document_loader(file_path)
             if loader is None:
@@ -187,65 +183,57 @@ class VectorStore:
             if compute_file_sha256(file_path) != sha256:
                 return {**result, "error": "解析期间文件发生变化，请重试"}
             hashes = tuple(text_sha256(doc.page_content) for doc in documents)
+            manifest = IndexManifest(sha256, file_path, self.index_version,
+                                     uuid.uuid4().hex, len(documents), hashes, "building")
             if old is None or old.state != "ready":
-                self.manifests.put(IndexManifest(sha256, file_path, self.index_version,
-                                                uuid.uuid4().hex, len(documents), hashes, "building"))
+                self.manifests.put(manifest)
             texts = [doc.page_content for doc in documents]
             try:
-                # 每批请求由嵌入适配器有限重试。写库重试复用这些向量，避免再次计费。
+                # 每批请求由嵌入适配器有限重试。
                 embeddings = self.vector_store.embedding_func.embed_documents(texts)
             except Exception:
                 logger.exception("[向量库] 嵌入失败，停止本次入库 file=%s", os.path.basename(file_path))
                 return result
-            for attempt in range(1, _INDEX_MAX_ATTEMPTS + 1):
-                manifest = IndexManifest(sha256, file_path, self.index_version,
-                                         uuid.uuid4().hex, len(documents), hashes, "building")
-                ids = [uuid.uuid4().hex for _ in documents]
-                for ordinal, doc in enumerate(documents):
-                    doc.metadata.update({
-                        "source": file_path, "content_sha256": sha256,
-                        "index_version": manifest.index_version, "index_id": manifest.index_id,
-                        "chunk_index": ordinal, "chunk_sha256": hashes[ordinal],
-                    })
+            ids = [uuid.uuid4().hex for _ in documents]
+            for ordinal, doc in enumerate(documents):
+                doc.metadata.update({
+                    "source": file_path, "content_sha256": sha256,
+                    "index_version": manifest.index_version, "index_id": manifest.index_id,
+                    "chunk_index": ordinal, "chunk_sha256": hashes[ordinal],
+                })
+            try:
+                if not self.vector_store.client.has_collection(collection_name=self.vector_store.collection_name):
+                    # 集合被外部删除后，LangChain 的 collection view 仍可能缓存旧对象。
+                    self.vector_store.col = None
+                    self.vector_store.fields = []
+                # Milvus SDK 负责请求级重试；不要因参数或完整性错误重跑整次写入。
+                self.vector_store.add_embeddings(
+                    texts=texts, embeddings=embeddings,
+                    metadatas=[doc.metadata for doc in documents], ids=ids,
+                )
+                rows = self.chunk_rows(f"index_id == {json.dumps(manifest.index_id)}")
+                if not chunks_match(manifest, rows):
+                    raise RuntimeError("写入后的分块数、序号或内容哈希校验失败")
+                if compute_file_sha256(file_path) != sha256:
+                    raise RuntimeError("入库期间源文件发生变化")
+                self.manifests.put(manifest.ready())
+            except Exception:
+                logger.exception("[向量库] 入库失败 file=%s", file_path)
                 try:
-                    if old is None or old.state != "ready":
-                        self.manifests.put(manifest)
-                    if not self.vector_store.client.has_collection(collection_name=self.vector_store.collection_name):
-                        # 集合被外部删除后，LangChain 的 collection view 仍可能缓存旧对象。
-                        self.vector_store.col = None
-                        self.vector_store.fields = []
-                    self.vector_store.add_embeddings(
-                        texts=texts, embeddings=embeddings,
-                        metadatas=[doc.metadata for doc in documents], ids=ids,
-                    )
-                    rows = self.chunk_rows(f"index_id == {json.dumps(manifest.index_id)}")
-                    if not chunks_match(manifest, rows):
-                        raise RuntimeError("写入后的分块数、序号或内容哈希校验失败")
-                    if compute_file_sha256(file_path) != sha256:
-                        raise RuntimeError("入库期间源文件发生变化")
-                    self.manifests.put(manifest.ready())
+                    self._delete_pks(ids)
                 except Exception:
-                    logger.exception("[向量库] 入库失败 file=%s 第 %s/%s 次尝试",
-                                     file_path, attempt, _INDEX_MAX_ATTEMPTS)
-                    try:
-                        self._delete_pks(ids)
-                    except Exception:
-                        logger.exception("[向量库] 清理本次写入失败，保留清单供健康检查修复")
-                        return result
-                    if attempt < _INDEX_MAX_ATTEMPTS:
-                        time.sleep(_INDEX_RETRY_SLEEP)
-                    continue
-
-                # 清单已提交，此后清理失败不能回滚磁盘到旧内容。
-                result = {**result, "chunks": len(documents), "ok": True,
-                          "error": None, "committed": True}
-                try:
-                    self._delete_pks([row["pk"] for row in self._content_rows(sha256)
-                                      if row.get("index_id") != manifest.index_id])
-                except Exception:
-                    logger.exception("[向量库] 新清单已提交，旧分块清理失败 file=%s", file_path)
-                    return {**result, "ok": False, "error": "新版本已入库，但旧分块清理失败，请执行索引修复"}
+                    logger.exception("[向量库] 清理本次写入失败，保留清单供健康检查修复")
                 return result
+
+            # 清单已提交，此后清理失败不能回滚磁盘到旧内容。
+            result = {**result, "chunks": len(documents), "ok": True,
+                      "error": None, "committed": True}
+            try:
+                self._delete_pks([row["pk"] for row in self._content_rows(sha256)
+                                  if row.get("index_id") != manifest.index_id])
+            except Exception:
+                logger.exception("[向量库] 新清单已提交，旧分块清理失败 file=%s", file_path)
+                return {**result, "ok": False, "error": "新版本已入库，但旧分块清理失败，请执行索引修复"}
             return result
 
     def pks_by_source(self, file_path: str) -> list:
@@ -296,6 +284,7 @@ class VectorStore:
     def delete_file_index(self, file_path: str) -> None:
         """调用方先删除磁盘文件；清单中的原始 SHA-256 不依赖文件仍存在。"""
         with self._store_lock:
+            self.manifests.forget_file(file_path)
             self._retire_source_versions(file_path)
 
     def replace_and_index_file(self, file_path: str, tmp_path: str) -> dict:
@@ -321,6 +310,8 @@ class VectorStore:
             if not result["ok"] and not result.get("committed"):
                 if existed:
                     os.replace(backup, file_path)
+                elif result.get("content_sha256"):
+                    self.manifests.record_files({file_path: result["content_sha256"]})
                 return {**result, "overwritten": existed}
             try:
                 self._retire_source_versions(file_path, result["content_sha256"])

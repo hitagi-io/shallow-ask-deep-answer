@@ -54,7 +54,7 @@ def request_json(client: httpx.Client, config: dict, payload: dict, operation: s
         try:
             response = client.post(config["endpoint"], json=payload,
                                    headers={"Authorization": "Bearer " + api_key})
-        except httpx.TransportError as exc:
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
             reason = type(exc).__name__
             if attempt == attempts:
                 raise DashScopeRequestError(f"{operation} 连接失败（{reason}），已尝试 {attempt} 次") from exc

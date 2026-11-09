@@ -29,14 +29,15 @@ def configure_logging() -> None:
     if _CONFIGURED:
         return
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
+    if level_name not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        raise ValueError(f"无效的 LOG_LEVEL: {level_name}")
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(
         "%(asctime)s %(levelname)s %(name)s — %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     ))
     root = logging.getLogger(LOGGER_NAME)
-    root.setLevel(level)
+    root.setLevel(level_name)
     root.handlers.clear()
     root.addHandler(handler)
     root.propagate = False

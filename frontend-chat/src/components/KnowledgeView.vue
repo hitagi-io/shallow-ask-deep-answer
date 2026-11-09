@@ -95,14 +95,14 @@ async function removeProject() {
             <button class="btn btn-secondary btn-small" :disabled="busy" @click="loadKnowledgeState">{{ knowledgeLoading ? '刷新中…' : '刷新' }}</button>
             <button class="btn btn-secondary btn-small" :disabled="busy" @click="handleBuild">{{ knowledgeBuilding ? '补建中…' : '补建索引' }}</button>
           </div></div>
-          <div class="file-filters"><input v-model="search" class="filter-input" placeholder="搜索文档名称" aria-label="搜索文档名称" type="search" /><select v-model="statusFilter" class="filter-input" aria-label="入库状态"><option value="all">全部状态</option><option value="indexed">已入库</option><option value="pending">未入库</option></select></div>
+          <div class="file-filters"><input v-model="search" class="filter-input" placeholder="搜索文档名称" aria-label="搜索文档名称" type="search" /><select v-model="statusFilter" class="filter-input" aria-label="入库状态"><option value="all">全部状态</option><option value="indexed">已入库</option><option value="pending">未入库</option><option value="unknown">待确认</option></select></div>
           <div v-if="loadError" class="document-empty" role="alert">{{ loadError }} <button class="text-action" :disabled="busy" @click="loadKnowledgeState">重新加载</button></div>
           <div v-else-if="knowledgeLoading && !files.length" class="document-empty" role="status"><span class="loading-indicator" aria-hidden="true"></span>正在加载资料…</div>
           <div v-else-if="!filteredFiles.length" class="document-empty"><span class="empty-file-icon"><AppIcon name="file" :size="24" /></span><strong>{{ files.length ? '没有匹配的文档' : '这里将存放你的项目资料' }}</strong><p>{{ files.length ? '试试其他关键词，或调整入库状态筛选。' : '上传第一份文档，让知识问答从这里开始。' }}</p></div>
           <ul v-else class="file-list">
             <li v-for="file in filteredFiles" :key="file.name">
               <span class="file-icon"><AppIcon name="file" :size="20" /></span><div class="file-info"><span class="file-name">{{ file.name }}</span><small>{{ file.name.split('.').pop()?.toUpperCase() }} 文档</small></div>
-              <span class="file-status" :class="file.indexed ? 'indexed' : 'pending'">{{ file.indexed ? '已入库' : '待入库' }}</span>
+              <span class="file-status" :class="file.indexed ? 'indexed' : 'pending'">{{ file.indexed === null ? '待确认' : file.indexed ? '已入库' : '待入库' }}</span>
               <button class="btn btn-danger btn-small" :disabled="busy" :aria-label="`删除文档：${file.name}`" @click="handleDeleteFile(file.name)">{{ deletingName === file.name ? '删除中…' : '删除' }}</button>
             </li>
           </ul>
@@ -121,8 +121,8 @@ async function removeProject() {
     </div>
   </div>
   <AppDialog v-if="dialog" :title="dialog === 'create' ? '新建项目' : '重命名项目'" compact @close="!saving && (dialog = null)">
-    <form @submit.prevent="submitProject" class="project-form">
-      <label for="project-name">项目名称</label><input id="project-name" v-model="projectName" class="filter-input" autofocus maxlength="80" required placeholder="例如：产品研发、客户资料" :disabled="saving" aria-describedby="project-name-hint" /><p id="project-name-hint" class="form-hint">用一个清晰的名称，为相关资料建立共同的主题。</p>
+    <form @submit.prevent="submitProject" class="project-form" autocomplete="off">
+      <label for="project-name">项目名称</label><input id="project-name" v-model="projectName" class="filter-input" autocomplete="off" autofocus maxlength="80" required placeholder="例如：产品研发、客户资料" :disabled="saving" aria-describedby="project-name-hint" /><p id="project-name-hint" class="form-hint">用一个清晰的名称，为相关资料建立共同的主题。</p>
       <AppNotice v-if="error" tone="error">{{ error }}</AppNotice>
       <div class="dialog-actions"><button type="button" class="btn btn-secondary" :disabled="saving" @click="dialog = null">取消</button><button class="btn btn-primary" type="submit" :disabled="saving || !projectName.trim()">{{ saving ? '保存中…' : dialog === 'create' ? '创建项目' : '保存' }}</button></div>
     </form>
