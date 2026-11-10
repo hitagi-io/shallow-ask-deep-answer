@@ -173,6 +173,18 @@ Invoke-RestMethod http://localhost:8000/api/health/ready
 
 修改分块参数、嵌入模型或相关解析依赖后需重建索引；修改解析逻辑或模型服务行为时，还需递增 `config/vector_db.yaml` 的 `index_version`。重启后点击「补建索引」，按需重建异常或过期内容。集合名由 `collection_prefix`、账号 ID 与项目 UUID 生成，每个项目独立存储。
 
+上传接口先将文件保存为项目目录内的独立暂存文件，再登记 PostgreSQL 任务并返回 HTTP 202。后台按项目排队索引；不同账号或同一账号的不同项目可并行。上传不会等待前一个文件的 embedding 调用，页面在保存完成后可继续上传、切换项目或关闭，重新进入时会读取服务端任务状态。覆盖上传在后台执行时才替换正式文件，并沿用原有的索引失败回滚逻辑。
+
+- `POST /api/projects/{project_id}/files/upload` 返回 `{task_id, errors}`；`task_id` 为 `null` 表示没有文件被接受，`errors` 是校验或保存失败的逐文件错误。202 仅代表已保存并排队，入库结果须查询任务。
+- `GET /api/projects/{project_id}/upload-tasks/{task_id}` 返回任务状态、完成/成功/失败数量和逐文件结果。
+- `GET /api/projects/{project_id}/upload-tasks` 返回全部未结束任务及最近 20 个任务。页面处理中每 2 秒、空闲时每 5 秒刷新任务，文件元数据在任务进展变化或每 60 秒刷新。
+
+启动时自动创建 `upload_tasks` 和 `upload_task_items` 表，无需额外队列服务。默认每个 API worker 使用 4 个后台线程，可用 `UPLOAD_WORKERS` 调整；多实例必须连接同一个 PostgreSQL，并共享相同的 `KNOWLEDGE_STORAGE_ROOT` 路径及文件。运行任务持有项目队列会话锁，不会仅因任务耗时较长而被重复领取。正常关闭会等待当前任务；进程异常退出后，排队任务继续执行，已开始但未完成的任务会标记为中断失败，用户可检查文档状态或重新上传。任务历史由 PostgreSQL 保存，删除项目或账号时级联清理。上传待处理期间，文件删除、补建和手动修复返回 409，避免已删除文件被排队上传重新创建。
+
+检索使用 PostgreSQL `published_source_files` 保存文件已发布的内容版本，并关联 `index_manifests` 中的 `ready` 批次。完整写入、校验分块后，就绪清单和发布指针在同一事务提交；覆盖失败不会切换指针。同内容重建提交新的 `index_id` 后，旧批次立即退出召回。向量与 BM25 使用同一份已发布批次白名单，在 Milvus 召回前过滤，避免旧批次挤占 TopK。没有已发布索引时返回空结果；读取清单失败时报告检索故障，不退回无过滤搜索。配置指纹已过期的批次也不参与检索，需补建索引。
+
+首次升级启动会创建发布表，并从已有文件记录中迁移对应 `ready` 清单的版本；之后健康检查更新文件观察记录不会改变发布版本。健康检查会报告“就绪索引尚未发布”，修复可为校验通过的文件重新发布。项目读写锁仍保留，索引期间检索可能等待写锁。
+
 本版本集合包含 `vector` 和 `sparse` 两个字段及 BM25 函数，集合结构与旧纯向量索引不同。部署到已有纯向量数据的环境前须迁移或重新创建集合；单纯补建分块无法改变旧集合结构。BM25 分词配置也属于集合结构，修改后须重新创建集合。索引版本指纹包含嵌入接口、双向量结构、BM25 分词参数和解析依赖版本；查询的候选数、精排参数，以及 `httpx`、`langchain-milvus` 客户端版本变化不触发重新 embedding。指纹保留当前锁定依赖的兼容种子值，本次调整不会使按现有依赖生成的索引失效。
 
 ### 健康检查与超时
@@ -219,14 +231,13 @@ npm --prefix frontend-chat run build
 
 ```powershell
 python -m compileall -q api_server.py auth.py accounts.py chat_agent.py rag utils
-python -s -m unittest discover -s tests -v
 git diff --check
 npm --prefix frontend-chat run build
 ```
 
 Python 编译检查仅验证语法，前端构建包含 TypeScript 类型检查。业务改动还需联调注册登录、改密与注销、项目管理、跨账号访问隔离、上传、双模式问答、停止生成和索引修复；提示词改动需核对模板变量、工具及协议契约，检查引用、无结果和检索失败场景。
 
-离线回归通过模拟外部服务检查错误传递、重试范围、消息与检索协议，不连接真实数据库或模型。错误处理遵循明确边界：外部输入、权限、来源及索引完整性仍须校验；内部必需字段直接按契约读取；异常须向调用方或日志暴露，不能用空结果、默认成功或无依据的兼容分支掩盖。临时故障恢复、取消清理和上传回滚保留各自明确的触发条件。
+回归验证应覆盖错误传递、重试范围、消息与检索协议；存储联测使用独立的临时数据库 schema 和 Milvus 集合，验证后清理测试数据与脚本。错误处理遵循明确边界：外部输入、权限、来源及索引完整性仍须校验；内部必需字段直接按契约读取；异常须向调用方或日志暴露，不能用空结果、默认成功或无依据的兼容分支掩盖。临时故障恢复、取消清理和上传回滚保留各自明确的触发条件。
 
 这一约定参考了 [OpenAI Codex Prompting Guide 的错误处理建议](https://developers.openai.com/cookbook/examples/gpt-5/codex_prompting_guide)，以及[社区对 Codex 过度防御与复杂化的直接讨论](https://www.reddit.com/r/codex/comments/1qa3s7y/any_advice_for_codex_52_thinking_medium_to_calm/)。社区反馈用于识别排查线索，具体修复以本项目调用链与回归结果为依据。
 

@@ -13,6 +13,7 @@ from uuid import UUID
 from functools import partial
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, Request, Query
 
 import anyio
@@ -34,6 +35,7 @@ from utils.health_scan import HealthScanRunner, ProjectGoneError
 from utils.readiness import check_readiness
 from utils.request_wait import wait_for_client
 from utils.logging_config import configure_logging, get_logger
+from utils.upload_tasks import UploadTaskStore
 from auth import (
     PASSWORD_MAX_LENGTH,
     PG_CONN,
@@ -135,13 +137,21 @@ async def lifespan(_app: FastAPI):
     _warn_connection_budget()
     task = asyncio.create_task(_scheduled_health_loop(), name="scheduled-health")
     task.add_done_callback(_background_task_done)
+    upload_stop = asyncio.Event()
+    upload_executor = ThreadPoolExecutor(max_workers=UPLOAD_WORKERS, thread_name_prefix="upload-index")
+    upload_workers = [asyncio.create_task(_upload_worker_loop(i, upload_stop, upload_executor),
+                                         name=f"upload-index-{i}") for i in range(UPLOAD_WORKERS)]
     try:
         yield
     finally:
+        upload_stop.set()
         task.cancel()
         for generation_task in list(_generation_tasks):
             generation_task.cancel()
         await asyncio.gather(task, *_generation_tasks, return_exceptions=True)
+        # Drain in-flight work; cancellation of to_thread cannot stop an index write.
+        await asyncio.gather(*upload_workers, return_exceptions=True)
+        upload_executor.shutdown(wait=True)
 
 
 app = FastAPI(
@@ -158,6 +168,13 @@ agent = ChatAgent()
 allowed_types = vector_db_config["allowed_types"]
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
+UPLOAD_WORKERS = int(os.getenv("UPLOAD_WORKERS", "4"))
+UPLOAD_TASK_POLL_SECONDS = float(os.getenv("UPLOAD_TASK_POLL_SECONDS", "0.5"))
+if UPLOAD_WORKERS < 1:
+    raise ValueError("UPLOAD_WORKERS 必须为正整数")
+if not math.isfinite(UPLOAD_TASK_POLL_SECONDS) or UPLOAD_TASK_POLL_SECONDS <= 0:
+    raise ValueError("UPLOAD_TASK_POLL_SECONDS 必须为正数")
+_upload_task_store = UploadTaskStore(PG_CONN)
 
 HEALTH_REPORT_TTL_SECONDS = int(os.getenv("HEALTH_REPORT_TTL_SECONDS", "120"))
 HEALTH_CHECK_TIMEOUT_SECONDS = float(os.getenv("HEALTH_CHECK_TIMEOUT_SECONDS", "60"))
@@ -240,6 +257,8 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
     with _index_write_section(user_id, project_id), project_access(user_id, project_id) as project:
         if project is None:
             return None
+        if _upload_task_store.has_active(user_id, project_id):
+            return None
         index_health = IndexHealth(user_id, project_id)
         max_rounds = vector_db_config["health_auto_repair_max_rounds"]
         report = index_health.check(record_files=True)
@@ -258,6 +277,134 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
                 break
         _health_cache(user_id, project_id).set({"report": report})
         return report
+
+
+def _upload_task_payload(task: dict) -> dict:
+    """Return task state without exposing staged filesystem paths."""
+    return {
+        "task_id": task["id"],
+        "status": task["status"],
+        "total": task["total"],
+        "completed": task["completed"],
+        "succeeded": task["succeeded"],
+        "failed": task["failed"],
+        "error": task["error"],
+        "files": [
+            {
+                "name": item["name"],
+                "status": item["status"],
+                "overwritten": item["overwritten"],
+                "indexed": item["indexed"],
+                "error": item["error"],
+            }
+            for item in task["files"]
+        ],
+    }
+
+
+def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
+    """Index one task; the database queue guarantees project ordering."""
+    task_id = task["id"]
+    user_id, project_id = task["user_id"], task["project_id"]
+    try:
+        for item in _upload_task_store.items(task_id):
+            if item["status"] != "queued":
+                continue
+            _upload_task_store.mark_item_running(task_id, item["id"])
+            status = "error"
+            overwritten = None
+            indexed = False
+            error = None
+            staged_path = item["staged_path"]
+            try:
+                with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
+                    # Stop using a queue lease lost to a database disconnect.
+                    lease.execute("SELECT 1")
+                    _ensure_project(current)
+                    knowledge_dir = get_knowledge_dir(user_id, project_id)
+                    staged_path = scoped_knowledge_file(knowledge_dir, staged_path)
+                    destination = scoped_knowledge_file(
+                        knowledge_dir, os.path.join(knowledge_dir, item["name"])
+                    )
+                    result = get_vector_store(user_id, project_id).replace_and_index_file(
+                        destination, staged_path
+                    )
+                    overwritten = bool(result.get("overwritten"))
+                    indexed = bool(result.get("ok"))
+                    error = result.get("error")
+                    status = "success" if indexed and not error else "error"
+                _invalidate_health(user_id, project_id)
+            except TimeoutError:
+                error = "索引正被其他操作占用，请稍后重试"
+            except HTTPException as exc:
+                error = str(exc.detail)
+            except Exception:
+                logger.exception("[知识库] 后台上传任务失败 file=%s project_id=%s", item["name"], project_id)
+                error = "后台入库失败，请稍后重试"
+            finally:
+                try:
+                    _remove_staged_upload(user_id, project_id, staged_path)
+                except (OSError, ValueError):
+                    logger.exception("[知识库] 临时上传文件清理失败 file=%s", staged_path)
+            _upload_task_store.finish_item(
+                task_id, item["id"], status=status, overwritten=overwritten,
+                indexed=indexed, error=error,
+            )
+        _upload_task_store.finish(task_id)
+    except Exception:
+        logger.exception("[知识库] 后台上传任务异常 task_id=%s", task_id)
+        try:
+            _upload_task_store.fail(task_id, "后台任务异常中断，请重新上传")
+        except Exception:
+            logger.exception("[知识库] 后台上传任务状态写回失败 task_id=%s", task_id)
+
+
+def _run_next_upload() -> bool:
+    claimed = _upload_task_store.claim_next()
+    if claimed is None:
+        return False
+    task, lease = claimed
+    try:
+        if task["status"] == "running":
+            # Only a worker whose session lease disappeared can reach here.
+            # A crash may have moved the staged bytes already: do not replay a
+            # replacement blindly or report that it was successfully indexed.
+            with _index_write_section(task["user_id"], task["project_id"]):
+                _upload_task_store.fail(task["id"], "后台任务中断，请检查文档状态或重新上传")
+                for item in _upload_task_store.items(task["id"]):
+                    _remove_staged_upload(task["user_id"], task["project_id"], item["staged_path"])
+                _invalidate_health(task["user_id"], task["project_id"])
+        else:
+            _process_upload_task(task, lease)
+            for item in _upload_task_store.items(task["id"]):
+                _remove_staged_upload(task["user_id"], task["project_id"], item["staged_path"])
+        return True
+    finally:
+        lease.close()
+
+
+def _remove_staged_upload(user_id: int, project_id: str, path: str) -> None:
+    path = scoped_knowledge_file(get_knowledge_dir(user_id, project_id), path)
+    if not os.path.basename(path).startswith(".upload_"):
+        raise ValueError("无效的上传暂存文件")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+async def _upload_worker_loop(worker_id: int, stop: asyncio.Event, executor: ThreadPoolExecutor) -> None:
+    while not stop.is_set():
+        try:
+            worked = await asyncio.get_running_loop().run_in_executor(executor, _run_next_upload)
+            if worked:
+                continue
+        except Exception:
+            logger.exception("[知识库] 上传 worker=%s 轮询失败", worker_id)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=UPLOAD_TASK_POLL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def _scheduled_health_loop():
@@ -843,6 +990,11 @@ def _ensure_project(project):
         raise HTTPException(status_code=404, detail="项目不存在或已被删除")
 
 
+def _ensure_no_uploads(user_id: int, project_id: str) -> None:
+    if _upload_task_store.has_active(user_id, project_id):
+        raise HTTPException(status_code=409, detail="项目有上传任务等待或正在入库，请完成后重试")
+
+
 def _safe_filename(filename: str) -> str:
     # 跨平台拒绝目录、Windows设备名、流名称及会发生归一化冲突的名字。
     if (not filename or len(filename) > 220 or filename.startswith(".")
@@ -874,50 +1026,70 @@ def _write_upload_to(file: UploadFile, tmp_path: str) -> None:
             if size > max_bytes:
                 raise ValueError(f"文件超过大小上限 {MAX_UPLOAD_MB} MB")
             output.write(chunk)
+        output.flush()
+        os.fsync(output.fileno())
     if size == 0:
         raise ValueError("文件内容不能为空")
 
 
-@app.post("/api/projects/{project_id}/files/upload")
+@app.post("/api/projects/{project_id}/files/upload", status_code=202)
 def upload_files(files: list[UploadFile] = File(...), project: dict = Depends(require_project)):
     user_id, project_id = project["user_id"], project["id"]
-    uploaded, errors = [], []
-    try:
-        with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
-            _ensure_project(current)
-            knowledge_dir = get_knowledge_dir(user_id, project_id)
-            os.makedirs(knowledge_dir, exist_ok=True)
-            store = get_vector_store(user_id, project_id)
+    staged, errors = [], []
+    # Shared project access prevents deletion during staging; there is no
+    # index lock here, so even a slow embedding request cannot delay upload.
+    with project_access(user_id, project_id) as current:
+        _ensure_project(current)
+        knowledge_dir = get_knowledge_dir(user_id, project_id)
+        os.makedirs(knowledge_dir, exist_ok=True)
+        try:
             for file in files:
                 name = file.filename or ""
-                tmp_path = os.path.join(knowledge_dir, f".tmp_{uuid.uuid4().hex}")
+                staged_path = scoped_knowledge_file(knowledge_dir, os.path.join(knowledge_dir, f".upload_{uuid.uuid4().hex}"))
+                accepted = False
                 try:
                     name = _safe_filename(name)
-                    extension = os.path.splitext(name)[1].lower()
-                    if extension not in allowed_types:
-                        raise ValueError(f"不支持的文件类型: {extension}")
-                    _write_upload_to(file, tmp_path)
-                    destination = scoped_knowledge_file(knowledge_dir, os.path.join(knowledge_dir, name))
-                    result = store.replace_and_index_file(destination, tmp_path)
-                    uploaded.append({"name": name, "overwritten": result["overwritten"],
-                                     "indexed": result["ok"], "error": result.get("error")})
+                    if os.path.splitext(name)[1].lower() not in allowed_types:
+                        raise ValueError("仅支持 TXT、PDF、DOCX")
+                    _write_upload_to(file, staged_path)
+                    staged.append({"name": name, "staged_path": staged_path})
+                    accepted = True
                 except ValueError as exc:
                     errors.append({"name": name or "(无名文件)", "error": str(exc)})
                 except Exception:
-                    logger.exception("[知识库] 上传失败 file=%s project_id=%s", name, project_id)
+                    logger.exception("[知识库] 上传落盘失败 file=%s project_id=%s", name, project_id)
                     errors.append({"name": name, "error": "上传失败，请稍后重试"})
                 finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-            _invalidate_health(user_id, project_id)
-        return {"uploaded": uploaded, "errors": errors}
-    except TimeoutError:
-        raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
+                    if not accepted:
+                        _remove_staged_upload(user_id, project_id, staged_path)
+            if not staged:
+                return {"task_id": None, "errors": errors}
+            task_id = _upload_task_store.create(user_id, project_id, staged)
+        except BaseException:
+            for item in staged:
+                _remove_staged_upload(user_id, project_id, item["staged_path"])
+            raise
+    return {"task_id": task_id, "errors": errors}
+
+
+@app.get("/api/projects/{project_id}/upload-tasks")
+def list_upload_tasks(project: dict = Depends(require_project)):
+    return {"tasks": [_upload_task_payload(task) for task in
+                      _upload_task_store.list_tasks(project["user_id"], project["id"])]}
+
+
+@app.get("/api/projects/{project_id}/upload-tasks/{task_id}")
+def get_upload_task(task_id: UUID, project: dict = Depends(require_project)):
+    task = _upload_task_store.get(project["user_id"], project["id"], str(task_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="上传任务不存在")
+    return _upload_task_payload(task)
 
 
 @app.delete("/api/projects/{project_id}/files/{filename}")
 def delete_file(filename: str, project: dict = Depends(require_project)):
     user_id, project_id = project["user_id"], project["id"]
+    _ensure_no_uploads(user_id, project_id)
     try:
         filename = _safe_filename(filename)
     except ValueError as exc:
@@ -927,6 +1099,7 @@ def delete_file(filename: str, project: dict = Depends(require_project)):
     try:
         with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
             _ensure_project(current)
+            _ensure_no_uploads(user_id, project_id)
             if not os.path.isfile(file_path):
                 raise HTTPException(status_code=404, detail="文件不存在")
             os.remove(file_path)
@@ -946,9 +1119,11 @@ def delete_file(filename: str, project: dict = Depends(require_project)):
 @app.post("/api/projects/{project_id}/vector/build")
 def build_knowledge_index(project: dict = Depends(require_project)):
     user_id, project_id = project["user_id"], project["id"]
+    _ensure_no_uploads(user_id, project_id)
     try:
         with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
             _ensure_project(current)
+            _ensure_no_uploads(user_id, project_id)
             failures = get_vector_store(user_id, project_id).index_pending_files()
             _invalidate_health(user_id, project_id)
         # API只暴露用户可理解的文件名，绝对存储路径保留在后端。
@@ -976,9 +1151,11 @@ async def get_index_health(request: Request, refresh: bool = False, project: dic
 @app.post("/api/projects/{project_id}/index/health/repair")
 def repair_index_health(project: dict = Depends(require_project)):
     user_id, project_id = project["user_id"], project["id"]
+    _ensure_no_uploads(user_id, project_id)
     try:
         with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
             _ensure_project(current)
+            _ensure_no_uploads(user_id, project_id)
             report = IndexHealth(user_id, project_id).repair()
             _health_cache(user_id, project_id).set({"report": report})
         return report

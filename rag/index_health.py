@@ -51,9 +51,11 @@ class IndexHealth:
                 issue("file_unreadable", "源文件读取失败", "无法确认文件内容，修复不会删除其索引", path)
         report["stats"]["files"] = len(disk)
         state = {"disk": disk, "by_norm": by_norm, "by_hash": by_hash,
-                 "records": {}, "rows": [], "healthy_hashes": set()}
+                 "records": {}, "rows": [], "healthy_hashes": set(), "unpublished_files": {}}
         try:
             records = state["records"] = self.vector_store.manifests.all()
+            published = {os.path.normcase(path): digest for path, digest in
+                         self.vector_store.manifests.published_files().items()}
         except Exception:
             logger.exception("[索引健康检查] PostgreSQL 清单读取失败")
             report["manifest_error"] = "无法读取 PostgreSQL 索引清单，详情见服务端日志"
@@ -101,7 +103,13 @@ class IndexHealth:
                 issue("chunk_integrity_mismatch", "索引分块内容或身份不符", "分块序号、逐块 SHA-256、来源、版本或写入代次与清单不一致", record.source)
             if source_current and record.state == "ready" and record.index_version == self.vector_store.index_version and matched:
                 state["healthy_hashes"].add(digest)
-        report["stats"]["indexed_files"] = sum(digest in state["healthy_hashes"] for digest in disk.values())
+        for path, digest in disk.items():
+            if digest in state["healthy_hashes"] and published.get(os.path.normcase(path)) != digest:
+                state["unpublished_files"][path] = digest
+                issue("unpublished_index", "就绪索引尚未发布", "文件尚未指向已校验版本，修复后才可用于检索", path)
+        report["stats"]["indexed_files"] = sum(
+            digest in state["healthy_hashes"] and path not in state["unpublished_files"]
+            for path, digest in disk.items())
         report["issues"] = list(issues.values())
         return report, state
 
@@ -119,7 +127,7 @@ class IndexHealth:
             report, state = self._scan()
             return {"report": report, "files": [
                 {"name": os.path.basename(path), "path": path,
-                 "indexed": digest in state["healthy_hashes"]}
+                 "indexed": digest in state["healthy_hashes"] and path not in state["unpublished_files"]}
                 for path, digest in state["disk"].items()
             ]}
 
@@ -151,10 +159,11 @@ class IndexHealth:
                     copies = state["by_hash"].get(row.get("content_sha256"))
                     if copies:
                         targets[row["content_sha256"]] = copies[0]
-            if targets:
-                failures = self.vector_store.index_pending_files(list(targets.values()))
+            paths = list(dict.fromkeys([*targets.values(), *state["unpublished_files"]]))
+            if paths:
+                failures = self.vector_store.index_pending_files(paths)
                 failed = {item["file"] for item in failures}
-                summary["re_indexed"] = [path for path in targets.values() if path not in failed]
+                summary["re_indexed"] = [path for path in paths if path not in failed]
                 summary["re_index_failures"] = failures
                 summary["manifest_rebuilt"] = bool(summary["re_indexed"])
 

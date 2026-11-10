@@ -97,6 +97,13 @@ class HybridRetriever:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("检索 query 必须为非空字符串")
         started = time.perf_counter()
+        # The caller holds the project read lock through both searches. Read
+        # once so dense and sparse recall use the same publication snapshot.
+        # An empty allowlist never falls back to an unrestricted search.
+        index_ids = self.store.manifests.published_index_ids(self.store.index_version)
+        if not index_ids:
+            return []
+        expression = f"index_id in {json.dumps(index_ids)}"
         self.store.ensure_search_ready()
         vector_store = self.store.vector_store
         if not vector_store.fields:
@@ -109,6 +116,7 @@ class HybridRetriever:
         def search_field(field, value):
             raw = vector_store.client.search(
                 collection_name=vector_store.collection_name, data=[value], anns_field=field,
+                filter=expression,
                 search_params=params[field], limit=self.settings["candidate_k"],
                 output_fields=vector_store._get_output_fields(), consistency_level="Strong",
                 timeout=self.settings["search_timeout_seconds"],

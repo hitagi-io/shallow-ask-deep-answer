@@ -1,0 +1,322 @@
+"""Persistent upload task queue used by the knowledge index workers."""
+from __future__ import annotations
+
+import hashlib
+import os
+
+import psycopg
+from psycopg.rows import dict_row
+
+
+_TASK_PROJECT_LOCK_NAMESPACE = "knowledge-upload-queue"
+
+
+def _project_queue_lock_key(user_id: int, project_id: str) -> int:
+    scope = f"{_TASK_PROJECT_LOCK_NAMESPACE}:{int(user_id)}:{project_id}"
+    return int.from_bytes(hashlib.sha256(scope.encode()).digest()[:8], "big", signed=True)
+
+
+class UploadTaskStore:
+    """Small PostgreSQL-backed task store.
+
+    The queue is durable, while the actual indexing work remains in the API
+    worker process. A running task is claimed once and the existing project
+    advisory lock still protects the index mutation itself.
+    """
+
+    def __init__(self, conninfo: str | None = None):
+        self.conninfo = conninfo or os.getenv(
+            "PG_CONNECTION_STRING",
+            "postgresql://postgres:postgres@localhost:5432/shallow_ask_deep_answer",
+        )
+
+    @staticmethod
+    def setup(cur) -> None:
+        # Uploads are acknowledged after the source bytes are staged;
+        # indexing is performed by a durable, project-ordered worker.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS upload_tasks (
+                id          VARCHAR(36) PRIMARY KEY,
+                sequence    BIGSERIAL UNIQUE,
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                project_id  VARCHAR(36) NOT NULL,
+                status      VARCHAR(16) NOT NULL DEFAULT 'queued'
+                    CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+                total       INTEGER NOT NULL CHECK (total >= 0),
+                completed   INTEGER NOT NULL DEFAULT 0 CHECK (completed >= 0),
+                succeeded   INTEGER NOT NULL DEFAULT 0 CHECK (succeeded >= 0),
+                failed      INTEGER NOT NULL DEFAULT 0 CHECK (failed >= 0),
+                error       TEXT,
+                created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at  TIMESTAMP,
+                finished_at TIMESTAMP,
+                updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (user_id, id),
+                FOREIGN KEY (user_id, project_id) REFERENCES projects(user_id, id)
+                    ON DELETE CASCADE
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS upload_task_items (
+                id           BIGSERIAL PRIMARY KEY,
+                task_id      VARCHAR(36) NOT NULL REFERENCES upload_tasks(id)
+                                 ON DELETE CASCADE,
+                position     INTEGER NOT NULL CHECK (position >= 0),
+                name         VARCHAR(220) NOT NULL,
+                staged_path  TEXT NOT NULL,
+                status       VARCHAR(16) NOT NULL DEFAULT 'queued'
+                                 CHECK (status IN ('queued', 'running', 'success', 'error')),
+                overwritten  BOOLEAN,
+                indexed      BOOLEAN,
+                error        TEXT,
+                updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (task_id, position)
+            );
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_upload_tasks_queue "
+            "ON upload_tasks (sequence) WHERE status IN ('queued', 'running')"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_upload_tasks_project "
+            "ON upload_tasks (user_id, project_id, sequence DESC)"
+        )
+
+    def create(self, user_id: int, project_id: str, items: list[dict]) -> str:
+        import uuid
+
+        task_id = str(uuid.uuid4())
+        with psycopg.connect(self.conninfo) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO upload_tasks (id, user_id, project_id, total)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (task_id, user_id, project_id, len(items)),
+                )
+                cur.executemany(
+                    """
+                    INSERT INTO upload_task_items
+                        (task_id, position, name, staged_path)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    [(task_id, index, item["name"], item["staged_path"])
+                     for index, item in enumerate(items)],
+                )
+            conn.commit()
+        return task_id
+
+    def get(self, user_id: int, project_id: str, task_id: str) -> dict | None:
+        with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            task = conn.execute(
+                """
+                SELECT id, user_id, project_id, status, total, completed,
+                       succeeded, failed, error, created_at, started_at,
+                       finished_at, updated_at
+                FROM upload_tasks
+                WHERE id = %s AND user_id = %s AND project_id = %s
+                """,
+                (task_id, user_id, project_id),
+            ).fetchone()
+            if task is None:
+                return None
+            items = conn.execute(
+                """
+                SELECT position, name, status, overwritten, indexed, error
+                FROM upload_task_items
+                WHERE task_id = %s
+                ORDER BY position
+                """,
+                (task_id,),
+            ).fetchall()
+        return {**dict(task), "files": [dict(item) for item in items]}
+
+    def claim_next(self) -> tuple[dict, psycopg.Connection] | None:
+        """Hold a session lock until the caller finishes the task.
+
+        A running row with an available lock belongs to a dead worker. Return
+        it for explicit failure recovery, without racing a long live job.
+        The lease connection must be closed by the caller, even on failure.
+        """
+        lease = psycopg.connect(self.conninfo, autocommit=True, row_factory=dict_row)
+        try:
+            candidates = lease.execute("""
+                SELECT user_id, project_id, MIN(sequence) AS first_sequence
+                FROM upload_tasks WHERE status IN ('queued', 'running')
+                GROUP BY user_id, project_id ORDER BY first_sequence
+            """).fetchall()
+            for candidate in candidates:
+                key = _project_queue_lock_key(candidate["user_id"], candidate["project_id"])
+                if not lease.execute("SELECT pg_try_advisory_lock(%s) AS acquired", (key,)).fetchone()["acquired"]:
+                    continue
+                row = lease.execute("""
+                    SELECT id, user_id, project_id, status FROM upload_tasks
+                    WHERE user_id = %s AND project_id = %s
+                      AND status IN ('queued', 'running')
+                    ORDER BY sequence LIMIT 1
+                """, (candidate["user_id"], candidate["project_id"])).fetchone()
+                if row is None:
+                    lease.execute("SELECT pg_advisory_unlock(%s)", (key,))
+                    continue
+                if row["status"] == "queued":
+                    lease.execute("""
+                        UPDATE upload_tasks SET status = 'running', started_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP WHERE id = %s
+                    """, (row["id"],))
+                return dict(row), lease
+            lease.close()
+            return None
+        except BaseException:
+            lease.close()
+            raise
+
+    def list_tasks(self, user_id: int, project_id: str) -> list[dict]:
+        # Active tasks are never hidden by a history limit. Read all rows in
+        # one snapshot, with two queries regardless of the number of tasks.
+        with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            tasks = conn.execute("""
+                SELECT * FROM upload_tasks WHERE user_id = %s AND project_id = %s
+                  AND (status IN ('queued', 'running') OR id IN (
+                      SELECT id FROM upload_tasks WHERE user_id = %s AND project_id = %s
+                      ORDER BY sequence DESC LIMIT 20))
+                ORDER BY sequence
+            """, (user_id, project_id, user_id, project_id)).fetchall()
+            if not tasks:
+                return []
+            grouped = {task["id"]: [] for task in tasks}
+            for item in conn.execute("""
+                SELECT task_id, position, name, status, overwritten, indexed, error
+                FROM upload_task_items WHERE task_id = ANY(%s) ORDER BY position
+            """, (list(grouped),)).fetchall():
+                grouped[item.pop("task_id")].append(item)
+        return [{**task, "files": grouped[task["id"]]} for task in tasks]
+
+    def items(self, task_id: str) -> list[dict]:
+        with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, position, name, staged_path, status
+                FROM upload_task_items
+                WHERE task_id = %s
+                ORDER BY position
+                """,
+                (task_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def has_active(self, user_id: int, project_id: str) -> bool:
+        with psycopg.connect(self.conninfo) as conn:
+            return conn.execute("""
+                SELECT 1 FROM upload_tasks WHERE user_id = %s AND project_id = %s
+                  AND status IN ('queued', 'running') LIMIT 1
+            """, (user_id, project_id)).fetchone() is not None
+
+    def mark_item_running(self, task_id: str, item_id: int) -> None:
+        with psycopg.connect(self.conninfo) as conn:
+            conn.execute(
+                """
+                UPDATE upload_task_items
+                SET status = 'running', updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND task_id = %s AND status = 'queued'
+                """,
+                (item_id, task_id),
+            )
+            conn.execute(
+                "UPDATE upload_tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (task_id,),
+            )
+            conn.commit()
+
+    def finish_item(self, task_id: str, item_id: int, *, status: str,
+                    overwritten: bool | None, indexed: bool | None,
+                    error: str | None) -> None:
+        with psycopg.connect(self.conninfo) as conn:
+            conn.execute(
+                """
+                UPDATE upload_task_items
+                SET status = %s, overwritten = %s, indexed = %s,
+                    error = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND task_id = %s
+                """,
+                (status, overwritten, indexed, error, item_id, task_id),
+            )
+            conn.execute(
+                """
+                UPDATE upload_tasks t
+                SET completed = q.completed, succeeded = q.succeeded,
+                    failed = q.failed, updated_at = CURRENT_TIMESTAMP
+                FROM (
+                    SELECT task_id,
+                           COUNT(*) FILTER (WHERE status IN ('success', 'error')) AS completed,
+                           COUNT(*) FILTER (WHERE status = 'success') AS succeeded,
+                           COUNT(*) FILTER (WHERE status = 'error') AS failed
+                    FROM upload_task_items
+                    WHERE task_id = %s
+                    GROUP BY task_id
+                ) q
+                WHERE t.id = q.task_id
+                """,
+                (task_id,),
+            )
+            conn.commit()
+
+    def finish(self, task_id: str) -> None:
+        with psycopg.connect(self.conninfo) as conn:
+            conn.execute(
+                """
+                UPDATE upload_tasks t
+                SET status = 'completed',
+                    completed = q.completed, succeeded = q.succeeded,
+                    failed = q.failed, finished_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM (
+                    SELECT task_id,
+                           COUNT(*) FILTER (WHERE status IN ('success', 'error')) AS completed,
+                           COUNT(*) FILTER (WHERE status = 'success') AS succeeded,
+                           COUNT(*) FILTER (WHERE status = 'error') AS failed
+                    FROM upload_task_items
+                    WHERE task_id = %s
+                    GROUP BY task_id
+                ) q
+                WHERE t.id = q.task_id AND t.status = 'running'
+                """,
+                (task_id,),
+            )
+            conn.commit()
+
+    def fail(self, task_id: str, error: str) -> None:
+        with psycopg.connect(self.conninfo) as conn:
+            conn.execute(
+                """
+                UPDATE upload_task_items
+                SET status = 'error', error = COALESCE(error, %s),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE task_id = %s AND status IN ('queued', 'running')
+                """,
+                (error, task_id),
+            )
+            conn.execute(
+                """
+                UPDATE upload_tasks t
+                SET status = 'failed', error = %s,
+                    completed = q.completed, succeeded = q.succeeded,
+                    failed = q.failed, finished_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                FROM (
+                    SELECT task_id,
+                           COUNT(*) FILTER (WHERE status IN ('success', 'error')) AS completed,
+                           COUNT(*) FILTER (WHERE status = 'success') AS succeeded,
+                           COUNT(*) FILTER (WHERE status = 'error') AS failed
+                    FROM upload_task_items
+                    WHERE task_id = %s
+                    GROUP BY task_id
+                ) q
+                WHERE t.id = q.task_id AND t.status = 'running'
+                """,
+                (error, task_id),
+            )
+            conn.commit()
+

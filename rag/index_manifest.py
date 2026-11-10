@@ -130,6 +130,32 @@ class ManifestStore:
                 PRIMARY KEY (namespace, source)
             )
         """)
+        # File observations may be refreshed by health checks even after a
+        # failed build. Publication must have a separate, transactional pointer.
+        # setup is serialized by the caller's PostgreSQL setup advisory lock.
+        migrate_publications = conn.execute(
+            "SELECT to_regclass('published_source_files') IS NULL"
+        ).fetchone()[0]
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS published_source_files (
+                namespace TEXT NOT NULL,
+                source TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                PRIMARY KEY (namespace, source),
+                FOREIGN KEY (namespace, content_sha256)
+                    REFERENCES index_manifests(namespace, content_sha256) ON DELETE CASCADE
+            )
+        """)
+        if migrate_publications:
+            # Adopt only file mappings already backed by a ready manifest.
+            # Do not recreate pointers from observations on later startups.
+            conn.execute("""
+                INSERT INTO published_source_files (namespace, source, content_sha256)
+                SELECT f.namespace, f.source, f.content_sha256
+                FROM indexed_source_files f JOIN index_manifests m
+                  ON m.namespace = f.namespace AND m.content_sha256 = f.content_sha256
+                WHERE m.state = 'ready'
+            """)
 
     def _connect(self):
         return psycopg.connect(self.conninfo, connect_timeout=5, row_factory=dict_row)
@@ -162,6 +188,50 @@ class ManifestStore:
                   Jsonb(list(manifest.chunk_hashes)), manifest.state))
             if manifest.state == "ready":
                 self._record_files(conn, {manifest.source: manifest.content_sha256})
+                self._publish_file(conn, manifest.source, manifest.content_sha256)
+
+    def _publish_file(self, conn, source: str, digest: str) -> None:
+        conn.execute("""
+            INSERT INTO published_source_files (namespace, source, content_sha256)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (namespace, source) DO UPDATE SET
+                content_sha256 = EXCLUDED.content_sha256
+        """, (self.namespace, source, digest))
+
+    def publish_existing_file(self, source: str, digest: str) -> None:
+        """Publish another file reusing an already verified content index.
+
+        The caller holds the project write lock and has validated that the
+        manifest and its chunks are current before taking this shortcut.
+        """
+        with self._connect() as conn:
+            record = conn.execute("""
+                SELECT state FROM index_manifests
+                WHERE namespace = %s AND content_sha256 = %s FOR SHARE
+            """, (self.namespace, digest)).fetchone()
+            if record is None or record["state"] != "ready":
+                raise ValueError("只能发布已校验就绪的索引")
+            self._record_files(conn, {source: digest})
+            self._publish_file(conn, source, digest)
+
+    def published_index_ids(self, index_version: str) -> list[str]:
+        """Read the committed search allowlist; storage errors must propagate."""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT DISTINCT m.index_id
+                FROM published_source_files f JOIN index_manifests m
+                  ON m.namespace = f.namespace AND m.content_sha256 = f.content_sha256
+                WHERE f.namespace = %s AND m.state = 'ready' AND m.index_version = %s
+                ORDER BY m.index_id
+            """, (self.namespace, index_version)).fetchall()
+        return [row["index_id"] for row in rows]
+
+    def published_files(self) -> dict[str, str]:
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT source, content_sha256 FROM published_source_files WHERE namespace = %s
+            """, (self.namespace,)).fetchall()
+        return {row["source"]: row["content_sha256"] for row in rows}
 
     def _record_files(self, conn, files: dict[str, str | None]) -> None:
         for path, digest in files.items():
@@ -185,9 +255,12 @@ class ManifestStore:
         """返回已记录的入库状态；完整性由独立的深度检查报告表达。"""
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT f.source, f.size_bytes, f.mtime_ns, m.state, m.index_version
+                SELECT f.source, f.size_bytes, f.mtime_ns, m.state, m.index_version,
+                       p.source AS published_source
                 FROM indexed_source_files f LEFT JOIN index_manifests m
                   ON m.namespace = f.namespace AND m.content_sha256 = f.content_sha256
+                LEFT JOIN published_source_files p ON p.namespace = f.namespace
+                  AND p.source = f.source AND p.content_sha256 = f.content_sha256
                 WHERE f.namespace = %s
             """, (self.namespace,)).fetchall()
         records = {os.path.normcase(row["source"]): row for row in rows}
@@ -200,6 +273,7 @@ class ManifestStore:
             record = records.get(os.path.normcase(path))
             indexed = None if record is None else (
                 record["state"] == "ready" and record["index_version"] == index_version
+                and record["published_source"] is not None
                 and record["size_bytes"] == info.st_size and record["mtime_ns"] == info.st_mtime_ns
             )
             files.append({"name": os.path.basename(path), "path": path, "indexed": indexed})
@@ -207,6 +281,8 @@ class ManifestStore:
 
     def forget_file(self, path: str) -> None:
         with self._connect() as conn:
+            conn.execute("DELETE FROM published_source_files WHERE namespace = %s AND source = %s",
+                         (self.namespace, path))
             conn.execute("DELETE FROM indexed_source_files WHERE namespace = %s AND source = %s",
                          (self.namespace, path))
 

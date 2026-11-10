@@ -10,6 +10,7 @@ const emit = defineEmits<{ back: []; ask: [id: string]; deleted: [id: string] }>
 const { files, knowledgeLoading, knowledgeBuilding, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput, deletingName, health, healthChecking, healthRepairing, knowledgeBusy, loadKnowledgeState, onFileSelect, onDrop, handleDeleteFile, handleBuild, handleHealthCheck, handleHealthRepair, formatHealthTime } = props.knowledge
 const { filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, loadError, selectFiles, clearNotice } = props.knowledge
 const { healthNotice, documentStatus, indexStatus } = props.knowledge
+const { uploadTasks, indexing, taskLoadError, taskCompleted, taskTotal, taskFileDetail } = props.knowledge
 const { projects: projectList, selectedId, selected, loading, saving, error, load, save, remove } = props.projects
 const projectSearch = ref('')
 const filteredProjects = computed(() => projectList.value.filter(project => project.name.toLocaleLowerCase().includes(projectSearch.value.trim().toLocaleLowerCase())))
@@ -82,7 +83,7 @@ async function removeProject() {
         <div class="dropzone" role="button" :tabindex="busy ? -1 : 0" :aria-disabled="busy" :aria-busy="knowledgeUploading" aria-label="选择文件上传到当前项目" @keydown.enter.prevent="!busy && selectFiles()" @keydown.space.prevent="!busy && selectFiles()" :class="{ over: dragOver, busy }" @dragover.prevent="dragOver = !busy" @dragleave="dragOver = false" @drop.prevent="!busy && onDrop($event)" @click="!busy && selectFiles()">
           <input ref="fileInput" type="file" accept=".txt,.pdf,.docx" :disabled="busy" multiple hidden @change="onFileSelect" />
           <span class="upload-icon"><AppIcon name="upload" :size="22" /></span>
-          <div><strong>{{ knowledgeUploading ? '正在上传并整理资料…' : '拖拽文档至此，或点击上传' }}</strong><p>TXT、PDF、DOCX · 上传后自动入库</p></div>
+          <div><strong>{{ knowledgeUploading ? '正在上传资料…' : '拖拽文档至此，或点击上传' }}</strong><p>TXT、PDF、DOCX · 保存后在后台自动入库</p></div>
           <span class="upload-label"><AppIcon name="plus" :size="14" />选择文件</span>
         </div>
         <section v-if="uploadProgress.length" class="upload-progress" aria-label="上传进度" aria-live="polite">
@@ -90,10 +91,22 @@ async function removeProject() {
           <div v-for="(result, i) in uploadProgress" :key="i" class="progress-row"><span>{{ result.name }}</span><small>{{ result.detail }}</small></div>
         </section>
 
+        <section v-if="uploadTasks.length || taskLoadError" class="upload-progress" aria-label="后台入库任务">
+          <div class="section-heading"><h3>最近上传</h3><span class="hint" role="status">已处理 {{ taskCompleted }} / {{ taskTotal }} 个文件{{ indexing ? ' · 后台处理中' : '' }}</span></div>
+          <p v-if="taskLoadError" class="health-notice" role="alert">{{ taskLoadError }}</p>
+          <p v-if="indexing" class="hint">可以继续上传、切换项目或关闭页面；回到此处即可查看结果。</p>
+          <div v-for="task in uploadTasks" :key="task.task_id" class="upload-task">
+            <div v-for="(file, index) in task.files" :key="index" class="progress-row" :class="{ 'task-error': file.status === 'error' }">
+              <span>{{ file.name }}</span><small>{{ taskFileDetail(file) }}</small>
+            </div>
+            <p v-if="task.error" class="health-notice">{{ task.error }}</p>
+          </div>
+        </section>
+
         <section class="documents-section" aria-labelledby="documents-title" :aria-busy="knowledgeLoading">
           <div class="section-heading"><h3 id="documents-title">项目资料 <span>{{ files.length }}</span></h3><div class="section-actions">
             <button class="btn btn-secondary btn-small" :disabled="busy" @click="loadKnowledgeState">{{ knowledgeLoading ? '刷新中…' : '刷新' }}</button>
-            <button class="btn btn-secondary btn-small" :disabled="busy" @click="handleBuild">{{ knowledgeBuilding ? '补建中…' : '补建索引' }}</button>
+            <button class="btn btn-secondary btn-small" :disabled="busy || indexing" @click="handleBuild">{{ knowledgeBuilding ? '补建中…' : '补建索引' }}</button>
           </div></div>
           <div class="file-filters"><input v-model="search" class="filter-input" placeholder="搜索文档名称" aria-label="搜索文档名称" type="search" /><select v-model="statusFilter" class="filter-input" aria-label="入库状态"><option value="all">全部状态</option><option value="indexed">已入库</option><option value="pending">未入库</option><option value="unknown">待确认</option></select></div>
           <div v-if="loadError" class="document-empty" role="alert">{{ loadError }} <button class="text-action" :disabled="busy" @click="loadKnowledgeState">重新加载</button></div>
@@ -103,7 +116,7 @@ async function removeProject() {
             <li v-for="file in filteredFiles" :key="file.name">
               <span class="file-icon"><AppIcon name="file" :size="20" /></span><div class="file-info"><span class="file-name">{{ file.name }}</span><small>{{ file.name.split('.').pop()?.toUpperCase() }} 文档</small></div>
               <span class="file-status" :class="file.indexed ? 'indexed' : 'pending'">{{ file.indexed === null ? '待确认' : file.indexed ? '已入库' : '待入库' }}</span>
-              <button class="btn btn-danger btn-small" :disabled="busy" :aria-label="`删除文档：${file.name}`" @click="handleDeleteFile(file.name)">{{ deletingName === file.name ? '删除中…' : '删除' }}</button>
+              <button class="btn btn-danger btn-small" :disabled="busy || indexing" :aria-label="`删除文档：${file.name}`" @click="handleDeleteFile(file.name)">{{ deletingName === file.name ? '删除中…' : '删除' }}</button>
             </li>
           </ul>
         </section>
@@ -111,8 +124,8 @@ async function removeProject() {
           <summary><svg class="health-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg><span>索引维护</span><span class="health-indicator" :class="indexStatus.tone"><span class="status-dot"></span>{{ indexStatus.label }}</span></summary>
           <div class="health-content">
             <div class="section-heading"><p class="hint">最近检查：{{ formatHealthTime(health?.checked_at || null) }}<br />{{ health?.stats.chunks || 0 }} 个资料片段</p><div class="section-actions">
-              <button class="btn btn-secondary btn-small" :disabled="busy" @click="handleHealthCheck">{{ healthChecking ? '检查中…' : '检查索引' }}</button>
-              <button class="btn btn-secondary btn-small" :disabled="busy" @click="handleHealthRepair">{{ healthRepairing ? '修复中…' : '修复索引' }}</button>
+              <button class="btn btn-secondary btn-small" :disabled="busy || indexing" @click="handleHealthCheck">{{ healthChecking ? '检查中…' : '检查索引' }}</button>
+              <button class="btn btn-secondary btn-small" :disabled="busy || indexing" @click="handleHealthRepair">{{ healthRepairing ? '修复中…' : '修复索引' }}</button>
             </div></div>
             <ul v-if="health?.issues.length" class="health-issues"><li v-for="(issue, i) in health.issues" :key="i"><span class="issue-severity" :class="issue.severity">{{ issue.severity === 'error' ? '异常' : '提醒' }}</span><div>{{ issue.title }}（{{ issue.count }}）<p v-if="issue.detail">{{ issue.detail }}</p></div></li></ul>
           </div>
@@ -210,6 +223,8 @@ async function removeProject() {
 .progress-row { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; line-height: 1.7; padding: 8px 0; overflow-wrap: anywhere; }
 .progress-row > span { min-width: 0; }
 .progress-row small { color: var(--muted); text-align: right; }
+.progress-row.task-error small { color: var(--danger); }
+.upload-task + .upload-task { border-top: 1px solid var(--line); }
 .hint { font-size: 12px; line-height: 1.8; color: var(--muted); margin: 0; }
 .health-section { margin-top: 20px; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--canvas); }
 .health-section summary { display: flex; align-items: center; gap: 9px; list-style: none; cursor: pointer; padding: 18px 20px; font-size: 13px; border-radius: var(--radius-card); }

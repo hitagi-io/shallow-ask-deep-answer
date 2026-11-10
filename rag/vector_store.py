@@ -168,7 +168,7 @@ class VectorStore:
             result["content_sha256"] = sha256
             old = self.manifests.all().get(sha256)
             if not force and old and self.manifest_is_current(old):
-                self.manifests.record_files({file_path: sha256})
+                self.manifests.publish_existing_file(file_path, sha256)
                 return {**result, "chunks": old.expected_chunks, "ok": True, "error": None}
             loader = get_document_loader(file_path)
             if loader is None:

@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from utils.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
 from utils.logging_config import get_logger
 from rag.index_manifest import ManifestStore
+from utils.upload_tasks import UploadTaskStore
 
 logger = get_logger(__name__)
 
@@ -216,6 +217,7 @@ def init_db():
                     "CREATE INDEX IF NOT EXISTS idx_chat_slots_user "
                     "ON chat_slots (user_id)"
                 )
+                UploadTaskStore.setup(cur)
                 ManifestStore.setup(cur)
             conn.commit()
 

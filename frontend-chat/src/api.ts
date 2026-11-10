@@ -458,7 +458,7 @@ export async function fetchFiles(projectId: string, options: KnowledgeRequestOpt
 }
 
 export async function uploadFiles(projectId: string, files: File[], onUploaded?: () => void, signal?: AbortSignal): Promise<{
-  uploaded: { name: string; overwritten: boolean; indexed: boolean; error: string | null }[]
+  task_id: string | null
   errors: { name: string; error: string }[]
 }> {
   const form = new FormData()
@@ -483,6 +483,28 @@ export async function uploadFiles(projectId: string, files: File[], onUploaded?:
   })
   if (!res.ok) throw new Error(await errorMessage(res, '上传失败'))
   return res.json()
+}
+
+export interface UploadTask {
+  task_id: string
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  total: number
+  completed: number
+  succeeded: number
+  failed: number
+  error: string | null
+  files: {
+    name: string
+    status: 'queued' | 'running' | 'success' | 'error'
+    overwritten: boolean | null
+    indexed: boolean | null
+    error: string | null
+  }[]
+}
+
+export async function fetchUploadTasks(projectId: string, options: KnowledgeRequestOptions = {}): Promise<UploadTask[]> {
+  const result = await fetchKnowledgeJson<{ tasks: UploadTask[] }>(`${projectPath(projectId)}/upload-tasks`, '读取上传进度失败，将自动重试', options)
+  return result.tasks
 }
 
 export async function deleteFile(projectId: string, name: string): Promise<void> {
