@@ -148,6 +148,7 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
         <button class="conv-btn" :disabled="conversationBusy" :aria-current="c.id === currentId ? 'page' : undefined" @click="emit('selectConversation', c.id)">
 
           <span class="conv-title">{{ c.title }}</span>
+          <span v-if="c.project_deleted" class="deleted-project-badge">项目已删除</span>
           <span v-if="processingIds.includes(c.id)" class="conversation-progress" role="status" aria-label="正在生成回答"></span>
         </button>
         <button class="conv-more" :disabled="conversationBusy" :aria-expanded="conversationMenuId === c.id" :aria-controls="`conversation-actions-${c.id}`" :aria-label="`${c.title}的更多操作`" title="更多操作" @click="conversationMenuId = conversationMenuId === c.id ? '' : c.id">
@@ -232,6 +233,7 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
 .conversation-item.active { background: var(--bg); border-color: var(--line); box-shadow: var(--shadow-sm); color: var(--accent); }
 .conv-btn { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; min-height: 40px; padding: 9px 11px; text-align: left; font-size: 13px; }
 .conv-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.deleted-project-badge { flex-shrink: 0; color: var(--muted); font-size: 10px; }
 .conversation-progress { flex-shrink: 0; width: 6px; height: 6px; margin-left: auto; border-radius: 50%; background: var(--accent); animation: pulse 1.3s ease-in-out infinite; }
 .conv-more { width: 30px; height: 30px; margin-right: 4px; flex-shrink: 0; display: grid; place-items: center; opacity: 0; color: var(--muted); border-radius: 7px; }
 .conversation-item:hover .conv-more, .conversation-item:focus-within .conv-more, .conversation-item.active .conv-more, .conversation-item.menu-open .conv-more { opacity: 1; }

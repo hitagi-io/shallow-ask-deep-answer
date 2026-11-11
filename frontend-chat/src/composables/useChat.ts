@@ -4,6 +4,7 @@ import { useNotice } from './useNotice'
 import type { ConfirmAction } from './useConfirmation'
 
 const PROJECT_REQUIRED_NOTICE = '请先选择一个可用项目，再发送知识库问题'
+const PROJECT_DELETED_NOTICE = '项目已删除，历史对话仅供查看，无法继续提问'
 
 export function useChat(userId: number, projects: Ref<Project[]>, confirmAction: ConfirmAction) {
   let disposed = false
@@ -72,7 +73,8 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   const kbOnly = computed(() => conversations.value[currentId.value]?.kbOnly ?? true)
   const projectId = computed(() => conversations.value[currentId.value]?.project_id || null)
   const selectedProject = computed(() => projects.value.find(project => project.id === projectId.value))
-  const projectReady = computed(() => !kbOnly.value || !!selectedProject.value)
+  const projectDeleted = computed(() => !!conversations.value[currentId.value]?.project_deleted)
+  const projectReady = computed(() => !projectDeleted.value && (!kbOnly.value || !!selectedProject.value))
   watch(projectReady, ready => {
     if (ready && persistNotice.value === PROJECT_REQUIRED_NOTICE) clearNotice()
   })
@@ -134,7 +136,9 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
       if (page.kbOnly != null) {
         conv.project_id = page.project_id
         conv.project_name = page.project_name
+        conv.project_deleted = page.project_deleted
       }
+      if (page.project_deleted && page.project_id) markProjectDeleted(page.project_id)
       if (page.active_generation && !runs.value[id]) {
         void observeGeneration(id, page.active_generation.request_id)
       }
@@ -202,6 +206,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
       empty.kbOnly = mode
       empty.project_id = mode ? selectedProjectId : null
       empty.project_name = projects.value.find(project => project.id === empty.project_id)?.name || null
+      empty.project_deleted = false
       delete failedAttempts.value[empty.id]
       currentId.value = empty.id
       return
@@ -277,17 +282,17 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     } catch (e) { handlePersistError('重命名', e); return false }
     finally { conversationBusy.value = false }
   }
-  async function removeProjectConversations(id: string) {
+  function markProjectDeleted(id: string) {
+    projects.value = projects.value.filter(project => project.id !== id)
     for (const conv of Object.values(conversations.value)) {
       if (conv.project_id !== id) continue
-      controllers.get(conv.id)?.abort()
-      delete conversations.value[conv.id]
-      delete drafts.value[conv.id]
+      if (isEmptyConversation(conv)) {
+        conv.project_id = null
+        conv.project_name = null
+      } else {
+        conv.project_deleted = true
+      }
       delete failedAttempts.value[conv.id]
-    }
-    if (!conversations.value[currentId.value]) {
-      currentId.value = convList.value[0]?.id || ''
-      if (!currentId.value) await newConversation()
     }
   }
   function retryMessage(index: number) {
@@ -350,6 +355,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
         conv.kbOnly = snapshot.kb_only
         conv.project_id = snapshot.project_id
         conv.project_name = snapshot.project_name
+        conv.project_deleted = snapshot.project_deleted
         assistant.status = snapshot.status === 'running' ? 'streaming' : snapshot.status === 'failed' ? 'error' : snapshot.status
         lastAssistant = assistant
         if (submission) {
@@ -379,6 +385,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     } finally {
       if (runs.value[id] === run) delete runs.value[id]
       controllers.delete(id)
+      if (!disposed && submission && !run.confirmed) void loadMessages(id)
       if (currentId.value === id) scrollToBottom()
     }
   }
@@ -390,7 +397,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     const conv = conversations.value[convId]
     if (!conv || answerMode !== kbOnly.value || !conv.messagesLoaded || conv.messagesLoading) return
     if (!projectReady.value) {
-      showNotice(PROJECT_REQUIRED_NOTICE, 'error')
+      showNotice(projectDeleted.value ? PROJECT_DELETED_NOTICE : PROJECT_REQUIRED_NOTICE, 'error')
       return
     }
     const hadMessages = conv.hasMessages
@@ -430,5 +437,5 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   })
   return { input, inputEl, chatArea, current, currentId, convList, hasEmptyConv, isProcessing, processingIds, reconnecting, stopping, isThinking, thinkingSeconds, thinkingPhase, kbOnly, switchMode, newConversation, selectConversation, deleteConversation, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
     nextCursor, loadingMore, loadMoreConversations, loadMessages, hasEarlier, loading, loadError, initConversations, conversationBusy, renameConversation, following, onScroll, jumpToLatest, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend,
-    projectId, selectedProject, projectReady, selectProject, removeProjectConversations }
+    projectId, selectedProject, projectReady, projectDeleted, selectProject, markProjectDeleted }
 }

@@ -2,15 +2,18 @@
 import { computed, ref } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import type { Message } from '../api'
+import { isSourceUrl, type Message } from '../api'
 import { formatDuration } from '../utils/duration'
 import BrandMark from './BrandMark.vue'
 import { copyText } from '../utils/clipboard'
 import { useNotice } from '../composables/useNotice'
 import { useStreamingText } from '../composables/useStreamingText'
+import SourcePassageDialog from './SourcePassageDialog.vue'
+import { collapseSourceReferences } from '../utils/sourceReferences'
 
 const props = defineProps<{
   message: Message
+  projectDeleted: boolean
   thinking: boolean
   streaming: boolean
   thinkingSeconds: number
@@ -24,6 +27,7 @@ function toggleFeedback(value: 'like' | 'dislike') {
 }
 const { message: copyNotice, show } = useNotice(2500)
 const body = ref<HTMLElement | null>(null)
+const sourceUrl = ref('')
 async function copy(text: string) {
   try { await copyText(text); show('已复制', 'success') }
   catch { show('复制失败，请手动选择文本复制', 'error') }
@@ -31,6 +35,12 @@ async function copy(text: string) {
 function copyCode(event: MouseEvent) {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>('button[data-copy-code]')
   if (button && body.value?.contains(button)) copy(button.parentElement?.querySelector('code')?.textContent || '')
+  const link = (event.target as HTMLElement).closest<HTMLAnchorElement>('a[href]')
+  const href = link?.getAttribute('href') || ''
+  if (link && body.value?.contains(link) && isSourceUrl(href)) {
+    event.preventDefault()
+    sourceUrl.value = href
+  }
 }
 // 空内容时按终态给出占位文案：服务端只保存模型实际输出，不拼接展示标记
 function bubbleText(msg: Message) {
@@ -44,12 +54,33 @@ function bubbleText(msg: Message) {
 const renderedText = useStreamingText(() => bubbleText(props.message), () => props.message.status === 'streaming')
 // 历史消息复用 HTML；流式全文最多每 100ms 解析一次，仍保留 HTML 清洗。
 const html = computed(() => {
-  const clean = DOMPurify.sanitize(marked.parse(renderedText.value, { breaks: true, gfm: true }) as string, { FORBID_TAGS: ['button'], ALLOW_DATA_ATTR: false })
+  // 最终校验后服务端会替换为编号链接；生成中隐藏完整及尚未收齐的内部引用标记。
+  const text = props.message.kbOnly
+    ? renderedText.value.replace(/\[\[cite:[^\]]*(?:\]\]|$)/g, '')
+    : renderedText.value
+  let clean = DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }) as string, { FORBID_TAGS: ['button'], ALLOW_DATA_ATTR: false })
+  if (props.projectDeleted || (props.message.kbOnly && clean.includes('参考来源（点击查看原文）'))) {
+    const doc = new DOMParser().parseFromString(clean, 'text/html')
+    collapseSourceReferences(doc, props.projectDeleted)
+    if (props.projectDeleted) {
+      for (const link of doc.querySelectorAll('a[href]')) {
+        if (!isSourceUrl(link.getAttribute('href') || '')) continue
+        link.append('（已删除）')
+        link.setAttribute('title', '来源已删除，点击查看说明')
+        link.classList.add('source-deleted')
+      }
+      for (const paragraph of doc.querySelectorAll('p')) {
+        if (paragraph.textContent === '参考来源（点击查看原文）') paragraph.textContent = '参考来源（已删除，点击查看说明）'
+      }
+    }
+    clean = doc.body.innerHTML
+  }
   return clean.replace(/<pre>/g, '<pre><button type="button" class="icon-button" data-copy-code aria-label="复制代码" title="复制代码"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg></button>')
 })
 </script>
 
 <template>
+  <SourcePassageDialog v-if="sourceUrl" :url="sourceUrl" :project-deleted="projectDeleted" @close="sourceUrl = ''" />
   <div class="message" :class="message.role">
     <div v-if="message.role === 'assistant'" class="avatar">
       <BrandMark />
@@ -73,14 +104,14 @@ const html = computed(() => {
         <button v-if="message.content" type="button" class="icon-button feedback-button" :class="{ selected: feedback === 'dislike' }" :aria-pressed="feedback === 'dislike'" aria-label="点踩" :title="feedback === 'dislike' ? '取消点踩' : '点踩'" @click="toggleFeedback('dislike')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path transform="rotate(180 12 12)" d="M7 10v11H3V10h4Zm0 0 5-8a3 3 0 0 1 3 3l-1 5h5a2 2 0 0 1 2 2.4l-1.4 7A2 2 0 0 1 17.6 21H7"/></svg>
         </button>
-        <button v-if="message.status === 'error' || message.status === 'cancelled'" class="icon-button" :disabled="busy" aria-label="重新提问" title="重新提问" @click="emit('retry')">
+        <button v-if="!projectDeleted && (message.status === 'error' || message.status === 'cancelled')" class="icon-button" :disabled="busy" aria-label="重新提问" title="重新提问" @click="emit('retry')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 6.1A8 8 0 0 1 19.6 9M4.4 15a8 8 0 0 0 13.5 2.9"/></svg>
         </button>
         <span role="status" aria-live="polite">{{ copyNotice }}</span>
       </div>
       <div v-if="message.role === 'assistant' && message.thinkingTime != null && message.content" class="thinking-time">用时 {{ formatDuration(message.thinkingTime) }}</div>
       <div v-if="message.role === 'assistant' && (message.status === 'cancelled' || message.status === 'error') && message.content" class="message-note" :class="message.status">
-        {{ message.status === 'cancelled' ? '已停止回答' : '回答未完成，可重新提问' }}
+        {{ message.status === 'cancelled' ? '已停止回答' : projectDeleted ? '回答未完成' : '回答未完成，可重新提问' }}
       </div>
       <div v-if="message.role === 'user'" class="bubble">{{ message.content }}</div>
       <span v-if="streaming && message.role === 'assistant'" class="cursor">▌</span>
@@ -130,6 +161,18 @@ const html = computed(() => {
 .markdown-body :deep(a[href]) { color: var(--link); font-weight: 500; text-decoration: underline; text-decoration-color: currentColor; text-decoration-thickness: 1px; text-underline-offset: 3px; border-radius: 3px; transition: color var(--duration-fast), background-color var(--duration-fast); }
 .markdown-body :deep(a[href]:hover), .markdown-body :deep(a[href]:focus-visible) { color: var(--link-hover); background-color: var(--link-soft); text-decoration-thickness: 2px; }
 .markdown-body :deep(a[href]:focus-visible) { outline: 2px solid var(--link); outline-offset: 3px; }
+.markdown-body :deep(a.source-deleted) { color: var(--muted); }
+.markdown-body :deep(.source-references-heading) { margin-bottom: 6px; color: var(--muted); font-size: 13px; }
+.markdown-body :deep(.source-file) { margin: 2px 0; }
+.markdown-body :deep(.source-file summary) { display: flex; align-items: baseline; gap: 9px; width: fit-content; max-width: 100%; padding: 5px 6px; margin-left: -6px; border-radius: 4px; color: var(--link); font-size: 13px; font-weight: 500; cursor: pointer; list-style: none; }
+.markdown-body :deep(.source-file summary::-webkit-details-marker) { display: none; }
+.markdown-body :deep(.source-file summary::before) { content: ''; flex: 0 0 6px; width: 6px; height: 6px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-1px) rotate(-45deg); }
+.markdown-body :deep(.source-file[open] > summary::before) { transform: translateY(-3px) rotate(45deg); }
+.markdown-body :deep(.source-file summary span) { min-width: 0; text-decoration: underline; text-underline-offset: 3px; }
+.markdown-body :deep(.source-file summary:hover) { color: var(--link-hover); background: var(--link-soft); }
+.markdown-body :deep(.source-file summary:focus-visible) { outline: 2px solid var(--link); outline-offset: 2px; }
+.markdown-body :deep(.source-file > ul) { margin: 2px 0 10px 3px; padding-left: 24px; font-size: 13px; }
+.markdown-body :deep(.source-file > ul > li) { margin: 3px 0; }
 .markdown-body :deep(blockquote) { border-left: 3px solid var(--accent-border); border-radius: 0 10px 10px 0; background: var(--surface); padding: 12px 16px; margin: 18px 0; color: var(--muted); }
 .markdown-body :deep(code) { font-family: var(--font-mono); font-size: .86em; background: var(--surface); padding: 3px 6px; border-radius: 5px; }
 .markdown-body :deep(pre) { max-width: 100%; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-card); padding: 14px 16px; overflow-x: auto; line-height: 1.65; }

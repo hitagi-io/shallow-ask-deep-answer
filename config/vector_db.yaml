@@ -4,7 +4,7 @@ embedding_model: qwen3.7-text-embedding-flash
 embedding_endpoint: https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding
 # 索引管线修订号：解析规则或服务端模型行为变化时递增，触发完整重建。
 # 分块参数、嵌入模型与解析依赖版本也会自动计入索引版本指纹。
-index_version: 1
+index_version: 2
 
 # Milvus 配置（通过 Docker 部署 Milvus 服务）
 milvus_uri: "http://localhost:19530"

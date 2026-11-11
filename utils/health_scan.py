@@ -65,7 +65,7 @@ def _scan_project(request: dict) -> dict:
             project_index_lock_key(request["user_id"], request["project_id"]),
         ))
         project = conn.execute(
-            "SELECT id FROM projects WHERE id = %s AND user_id = %s FOR SHARE",
+            "SELECT id FROM projects WHERE id = %s AND user_id = %s AND deleted_at IS NULL FOR SHARE",
             (request["project_id"], request["user_id"]),
         ).fetchone()
         if project is None:

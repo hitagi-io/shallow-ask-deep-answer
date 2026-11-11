@@ -14,16 +14,15 @@
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 
 from utils.retrieval_protocol import (
-    CITATION_SOURCE_LIMIT,
     STATUS_EMPTY,
     STATUS_ERROR,
     STATUS_OK,
     looks_like_report,
     parse_clarification_content,
     parse_retrieval_report,
-    split_answer_and_citations,
 )
 from utils.logging_config import get_logger
+from utils.citations import cited_evidence_ids, render_citations
 
 logger = get_logger(__name__)
 
@@ -50,7 +49,7 @@ class AnswerGuard:
 
     调用方（guarded_stream）负责从流中取出消息并区分工具消息与文本消息；
     本类维护单回合状态：拿到 status=ok 报告后允许增量放行，finish() 返回最终
-    校验动作（补全来源后整段替换 / 无输出）。
+    校验动作（生成原文查看链接后整段替换 / 无输出）。
     """
 
     def __init__(self) -> None:
@@ -117,7 +116,7 @@ class AnswerGuard:
                 return None
             report["task_call_id"] = tool_call_id
             self._reports.append(report)
-            sources = "、".join(report["sources"][:CITATION_SOURCE_LIMIT]) or "-"
+            sources = "、".join(report["sources"][:5]) or "-"
             logger.info(
                 f"[输出校验] 结构化检索报告 status={report['status']} "
                 f"reason={report.get('reason') or '-'} sources={sources} "
@@ -194,34 +193,17 @@ class AnswerGuard:
         if text.strip() in _FIXED_COPY_TEXTS:
             return self._terminate("unverified", "检索成功但模型输出了降级文案")
 
-        sources = _merge_sources(ok_reports)
-        body, cited = split_answer_and_citations(text, sources)
-        if not body.strip():
-            return self._terminate("unverified", "回答只有来源标注，没有正文")
-        if body.strip() in _FIXED_COPY_TEXTS:
-            return self._terminate("unverified", "检索成功但模型输出了降级文案")
-
-        invalid = [name for name in cited if name not in sources]
-        if invalid:
-            return self._terminate(
-                "unverified", f"回答引用了本轮检索证据之外的文件：{'、'.join(invalid)}"
-            )
-
-        if cited:
-            self._buffer.clear()
-            return ("replace", text)
-        # 召回过的文件不一定支撑回答。只有每份成功报告都明确给出引用时，
-        # 才能为缺失来源行的整合回答补齐出处；部分报告缺引用也不能猜测。
-        if any(not report["cited_sources"] for report in ok_reports):
-            return self._terminate("unverified", "回答未标注来源，且部分成功报告缺少引用归属")
-        cited_sources = _merge_sources(ok_reports, field="cited_sources")
-        suffix = "\n\n" + "\n".join(
-            f"参考来源（内部知识库）：{source}"
-            for source in cited_sources[:CITATION_SOURCE_LIMIT]
-        )
+        evidence = []
+        for report in ok_reports:
+            # 主助手只能保留子代理结论已使用的证据，不能把未采用的召回块当作出处。
+            used = cited_evidence_ids(report["answer"], report["evidence"])
+            evidence.extend(item for item in report["evidence"] if item["citation_id"] in used)
+        try:
+            result = render_citations(text, evidence)
+        except ValueError as exc:
+            return self._terminate("unverified", str(exc))
         self._buffer.clear()
-        # 后续依赖任务可能重置正文；最终替换也会移除早先已流出的中间答案。
-        return ("replace", f"{body}{suffix}")
+        return ("replace", result)
 
     def _buffer_text(self) -> str:
         return "".join(self._buffer)
@@ -287,8 +269,8 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
     """把 Agent 的原始消息流包装为"用户可见文本流"。
 
     严格模式先缓冲模型文本；收齐任务报告且有 status=ok 时进入增量放行，
-    回合结束时校验来源引用：缺少引用时仅按各成功报告的明确引用补发来源行。
-    需要自动补引用但任一成功报告缺少引用归属时，或显式引用校验失败时，
+    回合结束时校验证据标记，并生成原文页段链接，证据正文按需查看。
+    缺少引用或显式引用校验失败时，
     下发 replace 事件，用固定文案整段替换已下发内容。澄清回合只输出工具返回的问句；
     其余没有有效证据的回合只输出固定文案。
 
@@ -375,12 +357,3 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
             raw_stream.close()
         except Exception as e:
             logger.error(f"[输出校验] 关闭上游消息流失败，继续结束请求：{e}")
-
-
-def _merge_sources(reports: list[dict], field: str = "sources") -> list[str]:
-    sources = []
-    for report in reports:
-        for source in report[field]:
-            if source not in sources:
-                sources.append(source)
-    return sources

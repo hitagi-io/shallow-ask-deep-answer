@@ -32,14 +32,9 @@ def current_index_version(config: dict) -> str:
         "chunk_size": config["chunk_size"],
         "chunk_overlap": config["chunk_overlap"],
         "separators": config["separators"],
-        "dependencies": {
-            **{name: version(name) for name in (
-                "langchain-community", "langchain-text-splitters", "pypdf", "docx2txt",
-            )},
-            # 保留现有指纹的种子值，避免本次修复本身触发全库重建。
-            # 这两项不再读取运行时版本；传输或存储客户端升级不改变索引内容。
-            "langchain-milvus": "0.4.0", "httpx": "0.28.1",
-        },
+        "dependencies": {name: version(name) for name in (
+            "langchain-community", "langchain-text-splitters", "pypdf", "docx2txt",
+        )},
     }
     return text_sha256(json.dumps(recipe, sort_keys=True, ensure_ascii=False))
 
@@ -133,9 +128,6 @@ class ManifestStore:
         # File observations may be refreshed by health checks even after a
         # failed build. Publication must have a separate, transactional pointer.
         # setup is serialized by the caller's PostgreSQL setup advisory lock.
-        migrate_publications = conn.execute(
-            "SELECT to_regclass('published_source_files') IS NULL"
-        ).fetchone()[0]
         conn.execute("""
             CREATE TABLE IF NOT EXISTS published_source_files (
                 namespace TEXT NOT NULL,
@@ -146,16 +138,6 @@ class ManifestStore:
                     REFERENCES index_manifests(namespace, content_sha256) ON DELETE CASCADE
             )
         """)
-        if migrate_publications:
-            # Adopt only file mappings already backed by a ready manifest.
-            # Do not recreate pointers from observations on later startups.
-            conn.execute("""
-                INSERT INTO published_source_files (namespace, source, content_sha256)
-                SELECT f.namespace, f.source, f.content_sha256
-                FROM indexed_source_files f JOIN index_manifests m
-                  ON m.namespace = f.namespace AND m.content_sha256 = f.content_sha256
-                WHERE m.state = 'ready'
-            """)
 
     def _connect(self):
         return psycopg.connect(self.conninfo, connect_timeout=5, row_factory=dict_row)

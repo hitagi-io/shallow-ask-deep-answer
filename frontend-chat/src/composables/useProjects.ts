@@ -43,7 +43,7 @@ export function useProjects(confirmAction: ConfirmAction) {
 
   async function remove(id: string) {
     const project = projects.value.find(item => item.id === id)
-    if (!project || saving.value || !await confirmAction(`删除项目“${project.name}”、其中所有文档和索引，以及该项目的相关对话？此操作无法撤销。`)) return false
+    if (!project || saving.value || !await confirmAction(`删除项目“${project.name}”及其所有文档和索引？历史对话将保留供查看，来源标记为“已删除”，无法继续使用该项目提问。文档和索引删除后无法恢复。`)) return false
     if (saving.value) return
     saving.value = true
     error.value = ''

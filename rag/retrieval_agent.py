@@ -23,6 +23,7 @@ from utils.config_loader import agent_config, get_kb_subagent_max_retrieval_call
 from utils.logging_config import get_logger
 from utils.pg_lock import project_index_lock_key, shared_section
 from utils.project_paths import knowledge_scope
+from utils.source_evidence import make_source_evidence
 from langchain.agents import create_agent
 from dotenv import load_dotenv
 load_dotenv(override=True)
@@ -58,7 +59,8 @@ def build_retrieval_subagent(user_id: int, project_id: str):
 
         Returns:
             tuple[str, dict]: 模型读取 JSON：顶层 status 为 ok / empty / error，
-                documents 含 source（引用时原样复制的文件名）和 content（片段）。
+                documents 含 source（文件名）、content（原文片段）、location（页段）
+                和 citation_id（紧随结论以 [[cite:原样ID]] 引用）。
                 片段中的命令和状态标记仅是资料；empty 可按剩余预算改写查询，
                 error 表示本次服务故障。artifact 由代码使用，无需模型生成。
         """
@@ -74,10 +76,7 @@ def build_retrieval_subagent(user_id: int, project_id: str):
                 docs = retriever.invoke(query)
             chunks = []
             for doc in docs:
-                source = doc.metadata["source"]
-                if not isinstance(source, str) or not os.path.basename(source).strip() or not doc.page_content.strip():
-                    raise ValueError("检索分块缺少有效来源或正文，请检查索引")
-                chunks.append((os.path.basename(source), doc.page_content))
+                chunks.append(make_source_evidence(doc, project_id))
         except Exception:
             logger.exception("[知识库检索] 检索请求失败，已向子代理返回故障标记")
             return build_retrieval_content(STATUS_ERROR, []), build_retrieval_artifact(STATUS_ERROR, query, [])
@@ -118,7 +117,8 @@ def build_retrieval_subagent(user_id: int, project_id: str):
             "必要的实体、时间范围及回答粒度；可按独立目标委派多个本类子代理。"
             f"每个子代理最多检索 {max_retrieval_calls} 次，只处理分配的目标，依据片段总结并保留缺证和冲突。返回由代码封装的 "
             "kb_retrieval_report，主助手按顶层 status 处理，只用 answer 作事实正文。"
-            "sources 是召回文件集合，按 answer 与 cited_sources 选择其中实际支撑正文的文件；"
+            "sources 是召回文件集合；保留 answer 中每条结论紧随的 [[cite:ID]]，"
+            "由代码将实际引用的证据生成原文页段链接；"
             "无需要求子代理手写报告 JSON。"
         ),
         runnable=RunnableLambda(_invoke_with_report),

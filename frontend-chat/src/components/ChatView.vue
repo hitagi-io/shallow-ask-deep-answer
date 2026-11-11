@@ -11,7 +11,7 @@ const props = defineProps<{ chat: ReturnType<typeof useChat>; projects: ReturnTy
 const emit = defineEmits<{ manage: [] }>()
 const { projects: projectList, loading: projectsLoading, error: projectsError, load: reloadProjects } = props.projects
 const { input, inputEl, chatArea, current, isProcessing, isThinking, thinkingSeconds, thinkingPhase, reconnecting, stopping,
-  kbOnly, switchMode, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice, projectId, selectedProject, projectReady, selectProject,
+  kbOnly, switchMode, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice, projectId, selectedProject, projectReady, projectDeleted, selectProject, newConversation,
   loading, loadError, initConversations, conversationBusy, following, onScroll, jumpToLatest,
   loadMessages, hasEarlier, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend } = props.chat
 const suggestions = computed(() => kbOnly.value ? [
@@ -82,7 +82,7 @@ async function clearInput() {
 
       <button v-if="hasEarlier" class="history-button text-action" :disabled="current.messagesLoading" @click="showEarlier">{{ current.messagesLoading ? '正在加载…' : '查看更早的消息' }}</button>
       <ChatMessage v-for="(msg, i) in visibleMessages" :key="`${current.id}:${kbOnly ? 'kb' : 'general'}:${msg.id ?? `local-${messageOffset + i}`}`"
-        :message="msg" :thinking="isThinking && i === visibleMessages.length - 1"
+        :message="msg" :project-deleted="projectDeleted" :thinking="isThinking && i === visibleMessages.length - 1"
         :streaming="isProcessing && !isThinking && i === visibleMessages.length - 1" :busy="isProcessing"
         :thinking-seconds="i === visibleMessages.length - 1 ? thinkingSeconds : 0" :thinking-phase="i === visibleMessages.length - 1 ? thinkingPhase : ''"
         @retry="retryMessage(messageOffset + i)" />
@@ -102,7 +102,11 @@ async function clearInput() {
   </transition>
 
   <div class="input-bar">
-    <div class="input-inner">
+    <div v-if="projectDeleted" class="deleted-project-notice" role="status">
+      <p><strong>{{ current?.project_name }}（已删除）</strong><br>历史对话仅供查看。文档和索引已删除，无法查看原文或继续提问。</p>
+      <button class="btn btn-secondary" @click="newConversation(true)" :disabled="conversationBusy || loading">新建对话</button>
+    </div>
+    <div v-else class="input-inner">
       <div class="input-options">
         <button class="knowledge-toggle" :class="{ active: kbOnly }" :aria-pressed="kbOnly" :disabled="conversationBusy || loading || !current || !!loadError" @click="switchMode(!kbOnly)" title="选中使用知识库，取消使用通用问答">
           <AppIcon name="book" :size="15" />知识库
@@ -132,11 +136,13 @@ async function clearInput() {
       </div>
     </div>
     <p v-if="kbOnly && projectsError" class="composer-hint project-error" role="alert">{{ projectsError }} <button class="text-action" @click="reloadProjects">重试</button></p>
-    <p class="composer-hint composer-footer"><span class="keyboard-hint">Enter 发送<span class="hint-divider">·</span>Shift + Enter 换行</span><span>重要信息请核对来源</span></p>
+    <p v-if="!projectDeleted" class="composer-hint composer-footer"><span class="keyboard-hint">Enter 发送<span class="hint-divider">·</span>Shift + Enter 换行</span><span>重要信息请核对来源</span></p>
   </div>
 </template>
 
 <style scoped>
+.deleted-project-notice { max-width: 768px; margin: auto; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-control); color: var(--muted); font-size: 13px; line-height: 1.8; }
+.deleted-project-notice p { margin: 0 0 12px; overflow-wrap: anywhere; }
 .chat-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 76px; padding: 14px 32px 14px 68px; border-bottom: 1px solid var(--line); background: var(--bg); }
 .chat-heading { min-width: 0; }
 .chat-eyebrow { display: block; margin-bottom: 3px; color: var(--muted); font-size: 11px; letter-spacing: .06em; }

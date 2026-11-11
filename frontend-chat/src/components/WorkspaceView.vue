@@ -88,7 +88,7 @@ async function logout() {
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m4-11 3 3-3 3"/></svg>
         </button>
       <ChatView v-if="mode === 'chat'" :chat="chat" :projects="projects" @manage="navigate('knowledge')" />
-      <KnowledgeView v-else-if="mode === 'knowledge'" :knowledge="knowledge" :projects="projects" @back="navigate('chat')" @ask="askProject" @deleted="chat.removeProjectConversations" />
+      <KnowledgeView v-else-if="mode === 'knowledge'" :knowledge="knowledge" :projects="projects" @back="navigate('chat')" @ask="askProject" @deleted="chat.markProjectDeleted" />
       <AccountView v-else-if="mode === 'account'" :user="user" @back="navigate('chat')" @updated="emit('userUpdated', $event)" @deleted="emit('accountDeleted')" @password-changed="emit('passwordChanged')" />
       <AboutView v-else @back="navigate('chat')" @knowledge="navigate('knowledge')" />
     </main>

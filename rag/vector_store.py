@@ -16,6 +16,7 @@ from rag.index_manifest import IndexManifest, ManifestStore, chunks_match, curre
 from rag.retrieval import HybridRetriever
 from utils.config_loader import vector_db_config
 from utils.knowledge_files import list_supported_files, compute_file_sha256, get_document_loader
+from utils.source_evidence import split_located_documents
 from utils.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
 from utils.logging_config import get_logger
 
@@ -71,6 +72,7 @@ class VectorStore:
             chunk_overlap=vector_db_config["chunk_overlap"],
             separators=vector_db_config["separators"],
             length_function=len,
+            add_start_index=True,
         )
         self._retriever = RunnableLambda(HybridRetriever(self).search)
         self._store_lock = threading.RLock()
@@ -174,7 +176,7 @@ class VectorStore:
             if loader is None:
                 return {**result, "error": "不支持的文件类型"}
             try:
-                documents = self.splitter.split_documents(loader(file_path))
+                documents = split_located_documents(loader(file_path), self.splitter)
             except Exception:
                 logger.exception("[向量库] 文件加载或分块失败 file=%s", file_path)
                 return result

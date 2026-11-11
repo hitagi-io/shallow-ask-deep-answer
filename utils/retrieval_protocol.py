@@ -7,19 +7,19 @@
   检索证据由工具写入 artifact，子代理报告由代码在其出口根据 artifact 汇总，
   主 Agent 侧只做结构校验，不再做任何失败短句子串匹配。
 
-边界：结构校验只能保证“本轮存在证据、引用属于证据”，不能保证模型每一句结论都被
+边界：结构校验保证“本轮存在证据、引用绑定片段与原文坐标”，不能保证模型每一句结论都被
 证据支持；结论级忠实度仍依赖提示词约束与人工/抽样评估。
 """
 
 import json
-import re
 from collections.abc import Sequence
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from pydantic import BaseModel
+from utils.citations import cited_evidence_ids, valid_evidence
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 # 协议名由工具、提示词和输出校验共同使用，修改时需同步三者。
 RETRIEVAL_PROTOCOL = "kb_retrieval"
@@ -48,17 +48,7 @@ SENTINEL_KB_DOWN = "检索服务暂时不可用"
 SENTINEL_KB_MISS = "未找到足够资料"
 _SENTINELS = (SENTINEL_KB_DOWN, SENTINEL_KB_MISS)
 
-CITATION_SOURCE_LIMIT = 5
 QUERY_LOG_LIMIT = 500
-EVIDENCE_EXCERPT_CHARS = 120
-
-# 行首允许 Markdown 修饰（加粗、标题、列表、引用块），否则模型把来源行写成
-# "**参考来源（内部知识库）**：x.pdf" 时会绕过来源校验。
-_CITATION_LINE_RE = re.compile(
-    r"^[ \t\u3000>#\-*+_]*"
-    r"(?:参考来源（内部知识库）|参考来源|来源)"
-    r"[ \t\u3000*_]*[：:](.+?)[ \t\u3000]*$"
-)
 
 
 
@@ -80,7 +70,7 @@ class RetrievalReport(BaseModel):
     retrieval_calls: list[dict]
 
 
-def build_retrieval_content(status: str, chunks: Sequence[tuple[str, str]]) -> str:
+def build_retrieval_content(status: str, chunks: Sequence[dict]) -> str:
     """模型可见的工具结果：代码状态与不可信资料分字段，转义嵌入的结构字符。"""
     if status not in (STATUS_OK, STATUS_EMPTY, STATUS_ERROR):
         raise ValueError(f"非法检索状态: {status}")
@@ -88,8 +78,9 @@ def build_retrieval_content(status: str, chunks: Sequence[tuple[str, str]]) -> s
         {
             "status": status,
             "documents": [
-                {"source": source, "content": content}
-                for source, content in chunks
+                {"source": chunk["source"], "content": chunk["excerpt"],
+                 "citation_id": chunk["citation_id"], "location": chunk["location"]}
+                for chunk in chunks
             ] if status == STATUS_OK else [],
         },
         ensure_ascii=False,
@@ -99,7 +90,7 @@ def build_retrieval_content(status: str, chunks: Sequence[tuple[str, str]]) -> s
 def build_retrieval_artifact(
     status: str,
     query: str,
-    chunks: Sequence[tuple[str, str]],
+    chunks: Sequence[dict],
 ) -> dict:
     """构造 do_retrieval 的结构化 artifact（不进入模型上下文，只随 ToolMessage 流转）。"""
     if status not in (STATUS_OK, STATUS_EMPTY, STATUS_ERROR):
@@ -110,8 +101,7 @@ def build_retrieval_artifact(
         "status": status,
         "query": query,
         "chunks": [
-            {"source": source, "excerpt": _excerpt(content)}
-            for source, content in chunks
+            dict(chunk) for chunk in chunks
         ] if status == STATUS_OK else [],
     }
 
@@ -169,13 +159,23 @@ def build_report_from_messages(messages: Sequence[BaseMessage]) -> dict:
                 sources.append(source)
             evidence.append(
                 {
+                    **chunk,
                     "chunk_id": f"{call_id}:{index}",
-                    "source": source,
-                    "excerpt": chunk["excerpt"],
                 }
             )
 
-    answer_body, cited_sources = split_answer_and_citations(_final_ai_text(messages), sources)
+    answer_body = _final_ai_text(messages)
+    cited_sources = []
+    citation_error = False
+    if ok_records:
+        try:
+            if any(not valid_evidence(item) for item in evidence):
+                raise ValueError("证据缺少可核验的原文位置")
+            cited_ids = cited_evidence_ids(answer_body, evidence)
+            by_id = {item["citation_id"]: item for item in evidence}
+            cited_sources = list(dict.fromkeys(by_id[identifier]["source"] for identifier in cited_ids))
+        except ValueError:
+            citation_error = True
     if not records:
         status, reason = STATUS_NO_RETRIEVAL, "no_retrieval"
     elif ok_records:
@@ -185,8 +185,8 @@ def build_report_from_messages(messages: Sequence[BaseMessage]) -> dict:
             status, reason = STATUS_INVALID, "missing_answer"
         elif answer_body.strip() in _SENTINELS:
             status, reason = STATUS_INVALID, "sentinel_with_evidence"
-        elif any(name not in sources for name in cited_sources):
-            status, reason = STATUS_INVALID, "citation_outside_evidence"
+        elif citation_error:
+            status, reason = STATUS_INVALID, "missing_or_invalid_citation"
         else:
             status, reason = STATUS_OK, ""
     elif error_seen:
@@ -276,7 +276,7 @@ def parse_retrieval_report(text: Any) -> dict | None:
             return None
         if not isinstance(chunk_id, str) or chunk_id in chunk_ids:
             return None
-        if not isinstance(item.get("excerpt"), str):
+        if not valid_evidence(item):
             return None
         chunk_ids.add(chunk_id)
         evidence_sources.append(source)
@@ -296,6 +296,13 @@ def parse_retrieval_report(text: Any) -> dict | None:
             prefix, _, index = item["chunk_id"].rpartition(":")
             if not index.isdigit() or prefix not in ok_call_ids:
                 return None
+        try:
+            cited_ids = cited_evidence_ids(answer, evidence)
+        except ValueError:
+            return None
+        by_id = {item["citation_id"]: item for item in evidence}
+        if set(citations) != {by_id[identifier]["source"] for identifier in cited_ids}:
+            return None
     elif answer.strip() or sources or citations or evidence:
         return None
 
@@ -316,38 +323,6 @@ def parse_clarification_content(text: Any) -> str | None:
 def looks_like_report(text: Any) -> bool:
     """仅用于日志：判断一段文本是否声称是检索报告但解析失败。"""
     return isinstance(text, str) and REPORT_PROTOCOL in text
-
-
-def split_answer_and_citations(text: str, sources: Sequence[str] = ()) -> tuple[str, list[str]]:
-    """把回答正文与末尾的“来源：…”引用块分开，并按首次出现顺序去重。
-
-    只把回答末尾连续的非空来源行当作引用块：用户在正文里提供的、或检索片段中
-    逐字引用的“来源：”行不是引用标注，不能据此判定越界；同时 Markdown 修饰过的
-    末尾来源行也必须被识别，否则会绕过来源校验。每行只标注一个完整文件名，
-    文件名中的标点不具有分隔或 Markdown 修饰含义。
-    """
-    if not text:
-        return "", []
-    lines = text.replace("\r\n", "\n").split("\n")
-    end = len(lines)
-    while end and not lines[end - 1].strip():
-        end -= 1
-    start = end
-    blocks = []
-    while start:
-        match = _CITATION_LINE_RE.match(lines[start - 1])
-        if not match:
-            break
-        name = match.group(1)
-        blocks.append(name if name in sources else name.strip())
-        start -= 1
-    cited = []
-    for name in reversed(blocks):
-        if name not in cited:
-            cited.append(name)
-    body = re.sub(r"\n{3,}", "\n\n", "\n".join(lines[:start])).strip()
-    return body, cited
-
 
 
 def _collect_retrieval_records(messages: Sequence[BaseMessage]) -> list[tuple[str, dict]]:
@@ -392,7 +367,3 @@ def _json_object(text: Any) -> dict | None:
 
 def _is_str_list(value: Any) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
-
-
-def _excerpt(content: str) -> str:
-    return re.sub(r"\s+", " ", content).strip()[:EVIDENCE_EXCERPT_CHARS]

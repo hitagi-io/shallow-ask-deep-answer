@@ -97,6 +97,7 @@ def init_db():
                         id          SERIAL PRIMARY KEY,
                         username    VARCHAR(50) UNIQUE NOT NULL,
                         password    VARCHAR(255) NOT NULL,
+                        auth_version INTEGER NOT NULL DEFAULT 0,
                         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
@@ -107,10 +108,10 @@ def init_db():
                         name        VARCHAR(80) NOT NULL CHECK (length(trim(name)) > 0),
                         created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        deleted_at  TIMESTAMP,
                         UNIQUE (user_id, id)
                     );
                 """)
-                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INTEGER NOT NULL DEFAULT 0")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_projects_user_updated "
                     "ON projects (user_id, updated_at DESC, id DESC)"
@@ -458,7 +459,7 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
 
 
 
-_PROJECT_FIELDS = "id, name, created_at, updated_at"
+_PROJECT_FIELDS = "id, name, created_at, updated_at, deleted_at"
 
 
 def _project_name(name: str) -> str:
@@ -471,7 +472,7 @@ def _project_name(name: str) -> str:
 def list_projects(user_id: int) -> list[dict]:
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(f"SELECT {_PROJECT_FIELDS} FROM projects WHERE user_id = %s "
+            cur.execute(f"SELECT {_PROJECT_FIELDS} FROM projects WHERE user_id = %s AND deleted_at IS NULL "
                         "ORDER BY updated_at DESC, id DESC", (user_id,))
             return cur.fetchall()
 
@@ -480,7 +481,7 @@ def list_project_scopes() -> list[dict]:
     """内部维护任务枚举存储范围；不作为用户接口返回。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT id, user_id FROM projects ORDER BY user_id, id")
+            cur.execute("SELECT id, user_id FROM projects WHERE deleted_at IS NULL ORDER BY user_id, id")
             return cur.fetchall()
 
 
@@ -497,7 +498,8 @@ def project_access(user_id: int, project_id: str):
     """文件及索引操作持有项目读锁，防止归属检查与外部操作之间发生项目删除。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(f"SELECT {_PROJECT_FIELDS} FROM projects WHERE id = %s AND user_id = %s FOR SHARE",
+            cur.execute(f"SELECT {_PROJECT_FIELDS} FROM projects WHERE id = %s AND user_id = %s "
+                        "AND deleted_at IS NULL FOR SHARE",
                         (project_id, user_id))
             project = cur.fetchone()
         yield project
@@ -528,7 +530,7 @@ def update_project(user_id: int, project_id: str, name: str) -> dict | None:
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("UPDATE projects SET name = %s, updated_at = CURRENT_TIMESTAMP "
-                        f"WHERE id = %s AND user_id = %s RETURNING {_PROJECT_FIELDS}",
+                        f"WHERE id = %s AND user_id = %s AND deleted_at IS NULL RETURNING {_PROJECT_FIELDS}",
                         (name, project_id, user_id))
             project = cur.fetchone()
         conn.commit()
@@ -536,11 +538,11 @@ def update_project(user_id: int, project_id: str, name: str) -> dict | None:
 
 
 def delete_project(user_id: int, project_id: str, stale_seconds: float = 120, cleanup=None) -> dict:
-    """删除私有项目及其会话；运行中拒绝删除。cleanup(ids) 在持锁事务内清理外部存储。"""
+    """清理项目资料并保留项目删除标记及历史会话；运行中拒绝删除。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             # 与登记生成保持相同顺序：项目行锁在先，会话咨询锁在后。
-            cur.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s FOR UPDATE",
+            cur.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s AND deleted_at IS NULL FOR UPDATE",
                         (project_id, user_id))
             if cur.fetchone() is None:
                 return {"status": "not_found", "conversation_ids": []}
@@ -560,7 +562,10 @@ def delete_project(user_id: int, project_id: str, stale_seconds: float = 120, cl
         if cleanup is not None:
             cleanup(conversation_ids)
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM projects WHERE id = %s AND user_id = %s", (project_id, user_id))
+            cur.execute("DELETE FROM upload_tasks WHERE project_id = %s AND user_id = %s", (project_id, user_id))
+            # 保留项目身份供历史引用识别；文档、索引及模型上下文由 cleanup 清理。
+            cur.execute("UPDATE projects SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = %s AND user_id = %s", (project_id, user_id))
         conn.commit()
         return {"status": "deleted", "conversation_ids": conversation_ids}
 
@@ -586,7 +591,7 @@ def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None)
                 "SELECT c.id, c.title, c.updated_at, "
                 "c.updated_at AT TIME ZONE current_setting('TIMEZONE') AS display_time, "
                 "EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id) AS has_messages, "
-                "c.kb_only, c.project_id, p.name AS project_name "
+                "c.kb_only, c.project_id, p.name AS project_name, p.deleted_at IS NOT NULL AS project_deleted "
                 "FROM conversations c LEFT JOIN projects p ON p.id = c.project_id AND p.user_id = c.user_id "
                 "WHERE c.user_id = %s" + boundary +
                 " ORDER BY c.updated_at DESC, c.id DESC LIMIT %s", params,
@@ -603,7 +608,8 @@ def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None)
         "conversations": [{"id": r["id"], "title": r["title"],
                            "updatedAt": r["display_time"].isoformat(),
                            "hasMessages": r["has_messages"], "kbOnly": r["kb_only"],
-                           "project_id": r["project_id"], "project_name": r["project_name"]} for r in page],
+                           "project_id": r["project_id"], "project_name": r["project_name"],
+                           "project_deleted": r["project_deleted"]} for r in page],
         "next_cursor": next_cursor,
     }
 
@@ -618,7 +624,8 @@ def list_messages(
     """验证归属后读取会话消息及固定模式，按 ID 向前翻页，页内正序返回。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT c.id, c.kb_only, c.project_id, p.name AS project_name FROM conversations c "
+            cur.execute("SELECT c.id, c.kb_only, c.project_id, p.name AS project_name, "
+                        "p.deleted_at IS NOT NULL AS project_deleted FROM conversations c "
                         "LEFT JOIN projects p ON p.id = c.project_id AND p.user_id = c.user_id "
                         "WHERE c.id = %s AND c.user_id = %s FOR SHARE OF c",
                         (conv_id, user_id))
@@ -645,6 +652,7 @@ def list_messages(
     return {"messages": list(reversed(page)),
             "kbOnly": conversation["kb_only"],
             "project_id": conversation["project_id"], "project_name": conversation["project_name"],
+            "project_deleted": conversation["project_deleted"],
             "active_generation": active_generation,
             "next_before": page[-1]["id"] if len(rows) > limit else None}
 
@@ -693,7 +701,7 @@ def create_conversation(user_id: int, conv_id: str, title: str) -> dict | None:
             return None
         return {"id": row["id"], "title": row["title"],
                 "updatedAt": row["display_time"].isoformat(), "hasMessages": False, "kbOnly": None,
-                "project_id": None, "project_name": None}
+                "project_id": None, "project_name": None, "project_deleted": False}
 
 
 def update_conversation_title(user_id: int, conv_id: str, title: str) -> bool:
@@ -720,7 +728,7 @@ def _conversation_lock_key(conv_id: str) -> int:
 _GENERATION_REPLAY_QUERY = """
     SELECT g.id, g.request_id, g.status, g.error, g.phase,
            g.user_message_id, g.assistant_message_id, g.kb_only, g.project_id,
-           p.name AS project_name,
+           p.name AS project_name, p.deleted_at IS NOT NULL AS project_deleted,
            EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - g.created_at)) AS elapsed_seconds,
            m.content AS assistant_content
     FROM generations g
@@ -782,6 +790,7 @@ def begin_generation(
     - {"status": "conversation_mode_conflict"}：会话已经固定为其他模式
     - {"status": "project_required"}：知识库模式未选择项目
     - {"status": "project_not_found"}：项目不存在或不属于当前用户
+    - {"status": "project_deleted"}：项目已删除，历史对话仅供查看
     - {"status": "project_conflict"}：通用模式携带项目，或重放使用了不同项目
     - {"status": "conversation_project_conflict"}：会话已经固定为其他项目
     - {"status": "not_found"}：会话不存在或不属于当前用户
@@ -794,10 +803,13 @@ def begin_generation(
         with conn.cursor(row_factory=dict_row) as cur:
             account_write_access(cur, user_id)
             if project_id is not None:
-                cur.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s FOR SHARE",
+                cur.execute("SELECT id, deleted_at FROM projects WHERE id = %s AND user_id = %s FOR SHARE",
                             (project_id, user_id))
-                if cur.fetchone() is None:
+                project = cur.fetchone()
+                if project is None:
                     return {"status": "project_not_found"}
+                if project["deleted_at"] is not None:
+                    return {"status": "project_deleted"}
             # 与删除会话共用同一把事务级咨询锁（advisory lock），避免「登记—删除」互相穿插
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
             cur.execute(

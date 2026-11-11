@@ -28,6 +28,7 @@ export interface ConversationSummary {
   kbOnly: boolean | null
   project_id: string | null
   project_name: string | null
+  project_deleted: boolean
 }
 
 export interface Conversation extends ConversationSummary, MessageHistory {}
@@ -53,6 +54,30 @@ export interface FileItem {
   path: string
   /** 根据入库记录判断；null 表示文件尚无记录，完整性另见检查报告。 */
   indexed: boolean | null
+}
+
+export interface SourcePassage {
+  source: string
+  version: string
+  location: string
+  page: number | null
+  excerpt: string
+  before: string
+  after: string
+  clipped_before: boolean
+  clipped_after: boolean
+}
+
+export function isSourceUrl(value: string): boolean {
+  // 只允许本站固定原文路由；绝不把凭证发送到回答中的外部链接。
+  return /^\/api\/projects\/[0-9a-f-]{36}\/sources\/[^/?#]+\?[^#]+$/.test(value)
+}
+
+export async function apiSourcePassage(url: string, signal: AbortSignal): Promise<SourcePassage> {
+  if (!isSourceUrl(url)) throw new Error('无效的原文链接')
+  const res = await apiFetch(url, { headers: authHeaders(), signal })
+  if (!res.ok) throw new Error(await errorMessage(res, '无法读取原文，请稍后重试'))
+  return res.json()
 }
 
 // ---------- auth helpers ----------
@@ -212,7 +237,7 @@ export async function fetchConversations(cursor?: string | null): Promise<{
 }
 
 export async function fetchMessages(id: string, before?: number | null): Promise<{
-  messages: Message[]; next_before: number | null; kbOnly: boolean | null; project_id: string | null; project_name: string | null; active_generation: { request_id: string } | null
+  messages: Message[]; next_before: number | null; kbOnly: boolean | null; project_id: string | null; project_name: string | null; project_deleted: boolean; active_generation: { request_id: string } | null
 }> {
   const query = new URLSearchParams({ limit: '50' })
   if (before != null) query.set('before', String(before))
@@ -268,6 +293,7 @@ export interface GenerationSnapshot {
   kb_only: boolean
   project_id: string | null
   project_name: string | null
+  project_deleted: boolean
   elapsed_seconds: number
   phase: string
   error: string | null

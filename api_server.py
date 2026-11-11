@@ -26,9 +26,10 @@ from rag.vector_store import get_vector_store
 from rag.index_health import IndexHealth
 from rag.index_manifest import ManifestStore, current_index_version, project_collection_name
 from utils.knowledge_files import list_supported_files
+from utils.source_evidence import SourceVersionChanged, read_source_passage
 from utils.config_loader import vector_db_config
 from utils.project_paths import get_knowledge_dir, get_knowledge_storage_root, scoped_knowledge_file
-from utils.pg_lock import SingleInstanceGuard, exclusive_section, project_index_lock_key
+from utils.pg_lock import SingleInstanceGuard, exclusive_section, shared_section, project_index_lock_key
 from utils.generation_runner import run_generation
 from utils.health_report_cache import HealthReportCache, HealthReportInvalidated
 from utils.health_scan import HealthScanRunner, ProjectGoneError
@@ -525,6 +526,8 @@ def require_project(project_id: UUID, user: dict = Depends(get_current_user)) ->
     project = get_project(user["user_id"], str(project_id))
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在或已被删除")
+    if project["deleted_at"] is not None:
+        raise HTTPException(status_code=410, detail="项目已删除，历史对话仅供查看，原文已不可用")
     return {**project, "user_id": user["user_id"]}
 
 
@@ -842,6 +845,8 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         get_generation, user["user_id"], req.thread_id, req.request_id, CHAT_GENERATION_STALE_SECONDS,
     )
     if existing is not None:
+        if existing["project_deleted"]:
+            raise HTTPException(status_code=410, detail="项目已删除，历史对话仅供查看，无法继续提问")
         if existing["kb_only"] != req.kb_only or existing["project_id"] != req.project_id:
             raise HTTPException(status_code=409, detail="请求编号已用于其他模式或项目，请重新发送")
         # 幂等重放和恢复只订阅已有任务，不消耗新的并发槽位或发送额度。
@@ -897,6 +902,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     project_errors = {
         "project_required": (400, "请先选择知识库项目"),
         "project_not_found": (404, "项目不存在或已被删除"),
+        "project_deleted": (410, "项目已删除，历史对话仅供查看，无法继续提问"),
         "project_conflict": (409, "请求的项目与问答模式或原请求不一致"),
         "conversation_project_conflict": (409, "此会话的项目已固定，请开启新对话后选择项目"),
     }
@@ -973,7 +979,7 @@ def api_delete_project(project: dict = Depends(require_project)):
         if result["status"] == "busy":
             raise HTTPException(status_code=409, detail="项目中有回答正在生成，请停止或等待完成后再删除")
         _invalidate_health(user_id, project_id)
-        return {"message": "项目及其文档、相关对话已删除"}
+        return {"message": "项目文档和索引已删除，历史对话已保留，仅供查看"}
     except HTTPException:
         raise
     except TimeoutError:
@@ -1015,6 +1021,39 @@ def list_files(project: dict = Depends(require_project)):
         manifests = ManifestStore({**vector_db_config, "collection_name":
                                    project_collection_name(vector_db_config, user_id, project_id)})
         return {"files": manifests.file_statuses(paths, current_index_version(vector_db_config))}
+
+
+@app.get("/api/projects/{project_id}/sources/{filename}")
+def get_source_passage(
+    filename: str,
+    version: str = Query(pattern=r"^[0-9a-f]{64}$"),
+    unit: int = Query(ge=0), start: int = Query(ge=0), end: int = Query(gt=0),
+    digest: str = Query(pattern=r"^[0-9a-f]{64}$"),
+    project: dict = Depends(require_project),
+):
+    """按账号鉴权后重新读取原文；历史引用不能悄悄落到覆盖后的新版本。"""
+    user_id, project_id = project["user_id"], project["id"]
+    try:
+        filename = _safe_filename(filename)
+        file_path = scoped_knowledge_file(get_knowledge_dir(user_id, project_id), filename)
+        with shared_section(PG_CONN, project_index_lock_key(user_id, project_id), timeout_seconds=10), \
+                project_access(user_id, project_id) as current:
+            _ensure_project(current)
+            passage = read_source_passage(file_path, version, unit, start, end, digest)
+        return JSONResponse(passage, headers={"Cache-Control": "no-store"})
+    except HTTPException:
+        raise
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except SourceVersionChanged as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except TimeoutError:
+        raise HTTPException(status_code=503, detail="原文件正在更新，请稍后重试")
+    except Exception:
+        logger.exception("[原文引用] 读取失败 project_id=%s file=%s", project_id, filename)
+        raise HTTPException(status_code=503, detail="暂时无法读取原文，请稍后重试")
 
 
 def _write_upload_to(file: UploadFile, tmp_path: str) -> None:

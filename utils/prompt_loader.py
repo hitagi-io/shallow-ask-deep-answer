@@ -10,7 +10,6 @@ from utils.answer_guard import (
     SEARCH_ERROR_MARKER,
 )
 from utils.retrieval_protocol import (
-    CITATION_SOURCE_LIMIT,
     REPORT_PROTOCOL,
     RETRIEVAL_EMPTY_MARKER,
     RETRIEVAL_ERROR_MARKER,
@@ -57,7 +56,6 @@ def render_kb_agent_prompt():
         copy_kb_down=COPY_KB_DOWN,
         copy_kb_miss=COPY_KB_MISS,
         copy_kb_unverified=COPY_KB_UNVERIFIED,
-        citation_source_limit=CITATION_SOURCE_LIMIT,
     )
 
 def render_retrieval_agent_prompt():
@@ -69,7 +67,6 @@ def render_retrieval_agent_prompt():
         sentinel_kb_miss=SENTINEL_KB_MISS,
         retrieval_error_marker=RETRIEVAL_ERROR_MARKER,
         retrieval_empty_marker=RETRIEVAL_EMPTY_MARKER,
-        citation_source_limit=CITATION_SOURCE_LIMIT,
     )
 
 def render_general_prompt():
