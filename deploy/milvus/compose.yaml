@@ -1,5 +1,5 @@
-# Based on the official Milvus 3.0.4 standalone bundle.
-# Local development: loopback ports and project-scoped named volumes.
+# 基于 Milvus 3.0.4 官方单机部署配置。
+# 用于本地开发：端口仅绑定回环地址，命名卷按项目隔离。
 name: shallow-ask-deep-answer
 
 services:

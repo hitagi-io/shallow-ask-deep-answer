@@ -89,11 +89,11 @@ def tavily_search(query: str) -> str:
     - 用户明确要求搜索、查证或提供来源。
     稳定知识和纯文本转换通常无需调用；用户禁止联网时不调用。
 
-    Args:
+    参数：
         query: 包含具体实体、问题及必要日期或地区的自包含查询。
             只传查证所需信息，不包含密码、密钥或无关的私人文本。
 
-    Returns:
+    返回值：
         str: JSON，summary 是未绑定来源的综合摘要，results 中每项包含
             title、url、content（对应该 URL 的搜索片段）及 content_truncated。
             最多 ${search_result_limit} 项，片段及综合摘要各最多 ${search_content_limit} 字符，summary_truncated

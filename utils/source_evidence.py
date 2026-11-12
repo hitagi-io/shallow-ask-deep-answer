@@ -1,6 +1,7 @@
-"""原文坐标与可核验引用。页码从 1 开始，段落按提取文本的空行划分。"""
+"""可核验的提取文本坐标，保留页序、表格单元格、幻灯片和 OCR 定位。"""
 
 import hashlib
+import json
 import os
 import re
 from bisect import bisect_left, bisect_right
@@ -9,6 +10,28 @@ from urllib.parse import quote, urlencode
 
 def text_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+SOURCE_FIELDS = ("source_unit", "source_start", "source_end", "page", "locator", "extraction", "source_location")
+
+
+def passage_digest(text: str, location: str, unit: int, start: int, end: int) -> str:
+    """证据协议及原文回读共同校验正文、可见位置和字符范围。"""
+    return text_digest(json.dumps([text, location, unit, start, end], ensure_ascii=False))
+
+
+def chunk_signature(text: str, metadata: dict) -> str:
+    """清单绑定正文与引用坐标，拒绝缺字段的旧块及已损坏的当前块。"""
+    values = {field: metadata[field] for field in SOURCE_FIELDS}
+    if (not isinstance(text, str) or not text.strip()
+            or any(type(values[field]) is not int or values[field] < 0
+                   for field in ("source_unit", "source_start", "source_end", "page"))
+            or values["source_end"] - values["source_start"] != len(text)
+            or not isinstance(values["locator"], str)
+            or values["extraction"] not in ("text", "ocr")
+            or not isinstance(values["source_location"], str) or not values["source_location"].strip()):
+        raise ValueError("分块原文坐标无效")
+    return text_digest(json.dumps([text, values], sort_keys=True, ensure_ascii=False))
 
 
 def paragraph_spans(text: str) -> list[tuple[int, int]]:
@@ -23,7 +46,7 @@ def paragraph_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def source_location(text: str, start: int, end: int, page: int, *, spans=None) -> str:
+def source_location(text: str, start: int, end: int, page: int, *, locator: str, extraction: str, spans=None) -> str:
     spans = paragraph_spans(text) if spans is None else spans
     first = bisect_right(spans, start, key=lambda span: span[1]) + 1
     last = bisect_left(spans, end, key=lambda span: span[0])
@@ -31,7 +54,10 @@ def source_location(text: str, start: int, end: int, page: int, *, spans=None) -
         raise ValueError("引用范围没有正文")
     numbers = str(first) if first == last else f"{first}–{last}"
     prefix = f"第 {page} 页 · " if page else ""
-    return f"{prefix}第 {numbers} 段（提取文本）"
+    if locator:
+        prefix += locator + " · "
+    kind = "OCR 识别文本" if extraction == "ocr" else "提取文本"
+    return f"{prefix}第 {numbers} 段（{kind}）"
 
 
 def split_located_documents(documents, splitter):
@@ -40,10 +66,9 @@ def split_located_documents(documents, splitter):
     for unit, document in enumerate(documents):
         text = document.page_content
         spans = paragraph_spans(text)
-        page = document.metadata.get("page")
-        page_number = page + 1 if type(page) is int and page >= 0 else 0
+        page_number = document.metadata["page"]
         for chunk in splitter.split_documents([document]):
-            start = chunk.metadata.get("start_index")
+            start = chunk.metadata.pop("start_index", None)
             if type(start) is not int or start < 0:
                 raise ValueError("分块缺少原文字符偏移")
             end = start + len(chunk.page_content)
@@ -51,8 +76,8 @@ def split_located_documents(documents, splitter):
                 raise ValueError("分块与原文字符偏移不一致")
             chunk.metadata.update({
                 "source_unit": unit, "source_start": start, "source_end": end,
-                "source_page": page_number,
-                "source_location": source_location(text, start, end, page_number, spans=spans),
+                "source_location": source_location(text, start, end, page_number, spans=spans,
+                    locator=document.metadata["locator"], extraction=document.metadata["extraction"]),
             })
             chunks.append(chunk)
     return chunks
@@ -60,13 +85,17 @@ def split_located_documents(documents, splitter):
 
 def make_source_evidence(document, project_id: str) -> dict:
     metadata = document.metadata
+    chunk_signature(document.page_content, metadata)
+    if metadata["chunk_sha256"] != text_digest(document.page_content):
+        raise ValueError("检索分块正文摘要不一致")
     source = os.path.basename(metadata["source"])
-    if not source.strip() or not document.page_content.strip():
-        raise ValueError("检索分块缺少有效来源或正文")
+    if not source.strip():
+        raise ValueError("检索分块缺少有效来源")
     query = {
         "version": metadata["content_sha256"], "unit": metadata["source_unit"],
         "start": metadata["source_start"], "end": metadata["source_end"],
-        "digest": metadata["chunk_sha256"],
+        "digest": passage_digest(document.page_content, metadata["source_location"], metadata["source_unit"],
+                                 metadata["source_start"], metadata["source_end"]),
     }
     url = f"/api/projects/{project_id}/sources/{quote(source, safe='')}?{urlencode(query)}"
     return {
@@ -96,15 +125,19 @@ def read_source_passage(file_path: str, version: str, unit: int, start: int, end
         raise ValueError("引用页段不存在")
     document = documents[unit]
     text = document.page_content
-    if not 0 <= start < end <= len(text) or text_digest(text[start:end]) != digest:
+    if not 0 <= start < end <= len(text):
+        raise SourceVersionChanged("原文解析结果已变化，无法定位该证据。请重新提问。")
+    page_number = document.metadata["page"]
+    location = source_location(text, start, end, page_number, locator=document.metadata["locator"],
+                               extraction=document.metadata["extraction"])
+    if passage_digest(text[start:end], location, unit, start, end) != digest:
         raise SourceVersionChanged("原文解析结果已变化，无法定位该证据。请重新提问。")
     if compute_file_sha256(file_path) != version:
         raise SourceVersionChanged("读取期间原文件发生变化，请重试。")
-    page = document.metadata.get("page")
-    page_number = page + 1 if type(page) is int and page >= 0 else 0
     return {
         "source": os.path.basename(file_path), "version": version,
-        "location": source_location(text, start, end, page_number),
+        "location": location,
+        "extraction": document.metadata["extraction"],
         "page": page_number or None, "excerpt": text[start:end],
         "before": text[max(0, start - 500):start], "after": text[end:end + 500],
         "clipped_before": start > 500, "clipped_after": end + 500 < len(text),

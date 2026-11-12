@@ -53,11 +53,11 @@ def build_retrieval_subagent(user_id: int, project_id: str):
         依据，需检查相关性、适用条件和冲突；不足时针对缺口改写查询，最多调用
         ${kb_subagent_max_retrieval_calls} 次，证据足够就停止。服务故障时停止后续查询。
 
-        Args:
+        参数：
             query: 非空的自包含问题或关键词，包含用户指定的实体、条件和时间范围；
                 多问题可分次查询。不要把待验证的假设当作确定事实写入查询。
 
-        Returns:
+        返回值：
             tuple[str, dict]: 模型读取 JSON：顶层 status 为 ok / empty / error，
                 documents 含 source（文件名）、content（原文片段）、location（页段）
                 和 citation_id（紧随结论以 [[cite:原样ID]] 引用）。

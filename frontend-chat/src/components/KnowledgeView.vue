@@ -5,6 +5,7 @@ import type { useProjects } from '../composables/useProjects'
 import AppIcon from './AppIcon.vue'
 import AppNotice from './AppNotice.vue'
 import AppDialog from './AppDialog.vue'
+import { knowledgeFileAccept, knowledgeFileTypes } from '../utils/knowledgeFormats'
 const props = defineProps<{ knowledge: ReturnType<typeof useKnowledge>; projects: ReturnType<typeof useProjects> }>()
 const emit = defineEmits<{ back: []; ask: [id: string]; deleted: [id: string] }>()
 const { files, knowledgeLoading, knowledgeBuilding, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput, deletingName, health, healthChecking, healthRepairing, knowledgeBusy, loadKnowledgeState, onFileSelect, onDrop, handleDeleteFile, handleBuild, handleHealthCheck, handleHealthRepair, formatHealthTime } = props.knowledge
@@ -81,9 +82,9 @@ async function removeProject() {
         </div>
         <p v-if="healthNotice" class="health-notice" role="status">{{ healthNotice }}</p>
         <div class="dropzone" role="button" :tabindex="busy ? -1 : 0" :aria-disabled="busy" :aria-busy="knowledgeUploading" aria-label="选择文件上传到当前项目" @keydown.enter.prevent="!busy && selectFiles()" @keydown.space.prevent="!busy && selectFiles()" :class="{ over: dragOver, busy }" @dragover.prevent="dragOver = !busy" @dragleave="dragOver = false" @drop.prevent="!busy && onDrop($event)" @click="!busy && selectFiles()">
-          <input ref="fileInput" type="file" accept=".txt,.pdf,.docx" :disabled="busy" multiple hidden @change="onFileSelect" />
+          <input ref="fileInput" type="file" :accept="knowledgeFileAccept" :disabled="busy" multiple hidden @change="onFileSelect" />
           <span class="upload-icon"><AppIcon name="upload" :size="22" /></span>
-          <div><strong>{{ knowledgeUploading ? '正在上传资料…' : '拖拽文档至此，或点击上传' }}</strong><p>TXT、PDF、DOCX · 保存后在后台自动入库</p></div>
+          <div><strong>{{ knowledgeUploading ? '正在上传资料…' : '拖拽文档至此，或点击上传' }}</strong><p>{{ knowledgeFileTypes }}</p><p>图片与扫描 PDF 自动识别文字 · 保存后在后台入库</p></div>
           <span class="upload-label"><AppIcon name="plus" :size="14" />选择文件</span>
         </div>
         <section v-if="uploadProgress.length" class="upload-progress" aria-label="上传进度" aria-live="polite">
@@ -108,14 +109,14 @@ async function removeProject() {
             <button class="btn btn-secondary btn-small" :disabled="busy" @click="loadKnowledgeState">{{ knowledgeLoading ? '刷新中…' : '刷新' }}</button>
             <button class="btn btn-secondary btn-small" :disabled="busy || indexing" @click="handleBuild">{{ knowledgeBuilding ? '补建中…' : '补建索引' }}</button>
           </div></div>
-          <div class="file-filters"><input v-model="search" class="filter-input" placeholder="搜索文档名称" aria-label="搜索文档名称" type="search" /><select v-model="statusFilter" class="filter-input" aria-label="入库状态"><option value="all">全部状态</option><option value="indexed">已入库</option><option value="pending">未入库</option><option value="unknown">待确认</option></select></div>
+          <div class="file-filters"><input v-model="search" class="filter-input" placeholder="搜索文档名称" aria-label="搜索文档名称" type="search" /><select v-model="statusFilter" class="filter-input" aria-label="入库状态"><option value="all">全部状态</option><option value="indexed">已入库</option><option value="pending">未入库</option></select></div>
           <div v-if="loadError" class="document-empty" role="alert">{{ loadError }} <button class="text-action" :disabled="busy" @click="loadKnowledgeState">重新加载</button></div>
           <div v-else-if="knowledgeLoading && !files.length" class="document-empty" role="status"><span class="loading-indicator" aria-hidden="true"></span>正在加载资料…</div>
           <div v-else-if="!filteredFiles.length" class="document-empty"><span class="empty-file-icon"><AppIcon name="file" :size="24" /></span><strong>{{ files.length ? '没有匹配的文档' : '这里将存放你的项目资料' }}</strong><p>{{ files.length ? '试试其他关键词，或调整入库状态筛选。' : '上传第一份文档，让知识问答从这里开始。' }}</p></div>
           <ul v-else class="file-list">
             <li v-for="file in filteredFiles" :key="file.name">
               <span class="file-icon"><AppIcon name="file" :size="20" /></span><div class="file-info"><span class="file-name">{{ file.name }}</span><small>{{ file.name.split('.').pop()?.toUpperCase() }} 文档</small></div>
-              <span class="file-status" :class="file.indexed ? 'indexed' : 'pending'">{{ file.indexed === null ? '待确认' : file.indexed ? '已入库' : '待入库' }}</span>
+              <span class="file-status" :class="file.indexed ? 'indexed' : 'pending'">{{ file.indexed ? '已入库' : '待入库' }}</span>
               <button class="btn btn-danger btn-small" :disabled="busy || indexing" :aria-label="`删除文档：${file.name}`" @click="handleDeleteFile(file.name)">{{ deletingName === file.name ? '删除中…' : '删除' }}</button>
             </li>
           </ul>

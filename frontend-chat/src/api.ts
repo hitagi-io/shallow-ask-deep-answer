@@ -52,8 +52,8 @@ export interface Project {
 export interface FileItem {
   name: string
   path: string
-  /** 根据入库记录判断；null 表示文件尚无记录，完整性另见检查报告。 */
-  indexed: boolean | null
+  /** 只有当前有效且已发布的入库记录才为 true；完整性另见检查报告。 */
+  indexed: boolean
 }
 
 export interface SourcePassage {
@@ -61,6 +61,7 @@ export interface SourcePassage {
   version: string
   location: string
   page: number | null
+  extraction: 'text' | 'ocr'
   excerpt: string
   before: string
   after: string
@@ -80,7 +81,7 @@ export async function apiSourcePassage(url: string, signal: AbortSignal): Promis
   return res.json()
 }
 
-// ---------- auth helpers ----------
+// ---------- 认证辅助函数 ----------
 
 const TOKEN_KEY = 'shallow_ask_deep_answer_token'
 const USER_KEY = 'shallow_ask_deep_answer_user'
@@ -133,7 +134,7 @@ export function setUnauthorizedHandler(fn: (() => void) | null) {
 async function apiFetch(input: string, init?: RequestInit, waitForCredentialChange = true): Promise<Response> {
   const token = getToken()
   const res = await fetch(input, init)
-  // An old in-flight request may be rejected between password rotation and saving the new token.
+  // 更新账号凭证期间，旧请求可能返回 401；待变更结束后再核对令牌。
   if (res.status === 401 && waitForCredentialChange && credentialChange) await credentialChange
   if (!init?.signal?.aborted && res.status === 401 && token === getToken()) {
     clearAuth()
@@ -152,7 +153,7 @@ async function errorMessage(res: Response, fallback: string): Promise<string> {
   return typeof detail === 'string' && detail ? detail : fallback
 }
 
-// ---------- auth API ----------
+// ---------- 认证接口 ----------
 
 export async function apiRegister(username: string, password: string): Promise<void> {
   const res = await fetch('/api/auth/register', {
@@ -224,7 +225,7 @@ export async function apiDeleteAccount(confirmation_token: string, confirmation_
   clearAuth()
 }
 
-// ---------- conversation API ----------
+// ---------- 会话接口 ----------
 
 export async function fetchConversations(cursor?: string | null): Promise<{
   conversations: ConversationSummary[]; next_cursor: string | null
@@ -274,7 +275,7 @@ export async function deleteConversationApi(id: string): Promise<void> {
   if (!res.ok) throw new Error(await errorMessage(res, '删除会话失败'))
 }
 
-// ---------- chat API ----------
+// ---------- 问答接口 ----------
 
 /** 生成请求幂等键；非安全上下文（HTTP 内网访问）没有 randomUUID 时用时间戳兜底 */
 export function newRequestId(): string {
@@ -410,7 +411,7 @@ export async function streamChat(
   return { status: 'cancelled', started }
 }
 
-// ---------- knowledge API ----------
+// ---------- 知识库接口 ----------
 
 function projectPath(id: string) { return `/api/projects/${encodeURIComponent(id)}` }
 
@@ -442,7 +443,7 @@ async function fetchKnowledgeJson<T>(url: string, fallback: string, options: Kno
   options.signal?.addEventListener('abort', cancel, { once: true })
   if (options.signal?.aborted) cancel()
   try {
-    // Keep the deadline active through response parsing, including error responses.
+    // 响应解析期间仍受截止时间约束，错误响应也不例外。
     const request = async () => {
       controller.signal.throwIfAborted()
       const res = await apiFetch(url, { headers: authHeaders(), signal: controller.signal })

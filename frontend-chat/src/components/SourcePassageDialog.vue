@@ -50,7 +50,7 @@ onBeforeUnmount(() => { const request = controller; controller = null; request?.
     <template v-else-if="passage">
       <p class="source-name">{{ passage.source }}</p>
       <p class="source-location">{{ passage.location }}</p>
-      <p class="source-hint">高亮部分是该引用对应的原文证据，周围保留上下文。段落按提取文本的空行编号{{ passage.page ? '，页码为 PDF 文件页序' : '，原文件未提供稳定页码' }}。</p>
+      <p class="source-hint">高亮部分是该引用对应的提取文本，周围保留上下文。位置按文件页序、工作表单元格、幻灯片或文本块标注；段落按提取文本编号。<template v-if="passage.extraction === 'ocr'">此处为 OCR 识别结果，可能存在错字，请结合原始图片核对。</template></p>
       <div class="source-content"><span v-if="passage.clipped_before">…</span>{{ passage.before }}<mark>{{ passage.excerpt }}</mark>{{ passage.after }}<span v-if="passage.clipped_after">…</span></div>
     </template>
   </AppDialog>

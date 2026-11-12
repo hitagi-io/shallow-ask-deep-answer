@@ -1,4 +1,4 @@
-"""Cancel a read-only request's waiter when its HTTP client goes away."""
+"""HTTP 客户端断开时，取消对应只读请求的等待任务。"""
 import asyncio
 from collections.abc import Awaitable
 from typing import TypeVar
@@ -11,8 +11,8 @@ T = TypeVar("T")
 
 async def wait_for_client(request: Request, result: Awaitable[T]) -> T:
     async def disconnected():
-        # These are GET endpoints with no request body. Waiting on ASGI receive
-        # avoids polling and also notices disconnect while the scan is blocked.
+        # 这些 GET 接口没有请求体；等待 ASGI 接收消息可避免轮询，
+        # 并能在扫描阻塞期间发现客户端断开。
         while True:
             message = await request.receive()
             if message["type"] == "http.disconnect":
@@ -29,5 +29,5 @@ async def wait_for_client(request: Request, result: Awaitable[T]) -> T:
         for task in (work, disconnect):
             if not task.done():
                 task.cancel()
-        # Cache cancellation waits for its last scanner to close all resources.
+        # 取消缓存等待时，会先等待最后一个扫描任务关闭所有资源。
         await asyncio.gather(work, disconnect, return_exceptions=True)

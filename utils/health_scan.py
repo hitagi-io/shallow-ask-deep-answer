@@ -1,4 +1,4 @@
-"""Bounded, read-only project scans. Workers never import the API application."""
+"""有总时限的项目只读扫描；扫描进程不导入 API 应用。"""
 from __future__ import annotations
 
 import asyncio
@@ -22,7 +22,7 @@ class HealthScanRunner:
 
     async def scan(self, user_id: int, project_id: str, conninfo: str,
                    lock_timeout_seconds: float) -> dict:
-        # Admission wait is part of the deadline; waiting requests own no DB resources.
+        # 等待并发名额也计入总时限；等待中的请求不占用数据库资源。
         expires_at = time.monotonic() + self.timeout_seconds
         async with asyncio.timeout(self.timeout_seconds):
             async with self._slots:
@@ -40,8 +40,8 @@ class HealthScanRunner:
 
 
 def _scan_project(request: dict) -> dict:
-    # Imports, client initialization, disk reads, database operations and JSON
-    # serialization are all covered by the parent's process deadline.
+    # 模块导入、客户端初始化、磁盘读取、数据库操作及 JSON 序列化，
+    # 都受父进程设定的总时限约束。
     expires_at = time.monotonic() + request["timeout_seconds"]
     import psycopg
     from psycopg.conninfo import conninfo_to_dict
@@ -55,8 +55,8 @@ def _scan_project(request: dict) -> dict:
     lock_ms = max(1, math.ceil(min(remaining, request["lock_timeout_seconds"]) * 1000))
     options = conninfo_to_dict(request["conninfo"]).get("options", "")
     options = f"{options} -c statement_timeout={statement_ms} -c lock_timeout={lock_ms}".strip()
-    # The worker owns one transaction for the project/advisory locks. Closing the
-    # connection (including process termination) releases both without an unlock RPC.
+    # 扫描进程在同一个事务中持有项目锁和咨询锁。
+    # 关闭连接或终止进程即可释放两种锁，无需额外的解锁请求。
     with psycopg.connect(
         request["conninfo"], connect_timeout=max(1, math.ceil(remaining)),
         options=options,

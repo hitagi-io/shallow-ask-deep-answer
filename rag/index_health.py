@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 from rag.index_manifest import chunks_match
 from rag.vector_store import get_vector_store
-from utils.knowledge_files import list_supported_files, compute_file_sha256
+from utils.knowledge_files import list_supported_files, compute_file_sha256, document_format
 from utils.config_loader import vector_db_config
 from utils.logging_config import get_logger
 
@@ -43,15 +43,15 @@ class IndexHealth:
         disk = {path: compute_file_sha256(path) for path in
                 list_supported_files(self.knowledge_dir, self.allowed_types)}
         by_norm = {os.path.normcase(path): path for path in disk}
-        by_hash = defaultdict(list)
+        by_identity = defaultdict(list)
         for path, digest in disk.items():
             if digest:
-                by_hash[digest].append(path)
+                by_identity[(digest, document_format(path))].append(path)
             else:
                 issue("file_unreadable", "源文件读取失败", "无法确认文件内容，修复不会删除其索引", path)
         report["stats"]["files"] = len(disk)
-        state = {"disk": disk, "by_norm": by_norm, "by_hash": by_hash,
-                 "records": {}, "rows": [], "healthy_hashes": set(), "unpublished_files": {}}
+        state = {"disk": disk, "by_norm": by_norm, "by_identity": by_identity,
+                 "records": {}, "rows": [], "healthy_keys": set(), "unpublished_files": {}}
         try:
             records = state["records"] = self.vector_store.manifests.all()
             published = {os.path.normcase(path): digest for path, digest in
@@ -71,19 +71,21 @@ class IndexHealth:
             report["issues"] = list(issues.values())
             return report, state
         report["stats"]["chunks"] = len(rows)
-        rows_by_hash = defaultdict(list)
+        rows_by_identity = defaultdict(list)
         for row in rows:
-            rows_by_hash[row.get("content_sha256")].append(row)
+            identity = (row.get("content_sha256"), row.get("source_format"))
+            rows_by_identity[identity].append(row)
             source = row.get("source")
             if not isinstance(source, str) or os.path.normcase(source) not in by_norm:
                 issue("ghost_vectors", "向量库存在残留分块", "对应源文件不存在或来源元数据缺失", source or str(row.get("pk")))
-            if row.get("content_sha256") not in records:
+            if identity not in records:
                 issue("missing_manifest", "分块缺少索引清单", "现有分块不能证明完整性，需从源文件重新索引", source or str(row.get("pk")))
 
-        for digest, record in records.items():
+        for identity, record in records.items():
+            digest = record.content_sha256
             path = by_norm.get(os.path.normcase(record.source))
             source_current = path is not None and disk[path] == digest
-            if not by_hash.get(digest) and (path is None or disk[path] is not None):
+            if not by_identity.get(identity) and (path is None or disk[path] is not None):
                 issue("orphan_manifest", "索引清单对应内容已不在磁盘", "源文件已删除或被修改，需重建或清理旧索引", record.source)
             if path is None:
                 issue("missing_source", "索引来源文件已丢失", "存在同内容副本时会转移索引来源", record.source)
@@ -93,22 +95,22 @@ class IndexHealth:
                 issue("incomplete_index", "索引构建未完成", "上次写入未完成校验和提交，需要重建", record.source)
             if record.index_version != self.vector_store.index_version:
                 issue("outdated_index_version", "索引版本已过期", "解析、分块或嵌入配置已改变，需要重建", record.source)
-            actual = rows_by_hash.get(digest, [])
+            actual = rows_by_identity.get(identity, [])
             matched = chunks_match(record, actual)
             if not actual:
                 issue("missing_vectors", "索引分块全部缺失", "清单存在，但 Milvus 中没有对应分块", record.source)
             elif len(actual) != record.expected_chunks:
                 issue("chunk_count_mismatch", "索引分块数量不符", "存在部分缺失、重复或残留分块", f"{record.source}（预期 {record.expected_chunks}，实际 {len(actual)}）")
             elif not matched:
-                issue("chunk_integrity_mismatch", "索引分块内容或身份不符", "分块序号、逐块 SHA-256、来源、版本或写入代次与清单不一致", record.source)
+                issue("chunk_integrity_mismatch", "索引分块内容或身份不符", "分块正文、引用坐标、来源、版本或写入代次与清单不一致", record.source)
             if source_current and record.state == "ready" and record.index_version == self.vector_store.index_version and matched:
-                state["healthy_hashes"].add(digest)
+                state["healthy_keys"].add(identity)
         for path, digest in disk.items():
-            if digest in state["healthy_hashes"] and published.get(os.path.normcase(path)) != digest:
+            if (digest, document_format(path)) in state["healthy_keys"] and published.get(os.path.normcase(path)) != digest:
                 state["unpublished_files"][path] = digest
                 issue("unpublished_index", "就绪索引尚未发布", "文件尚未指向已校验版本，修复后才可用于检索", path)
         report["stats"]["indexed_files"] = sum(
-            digest in state["healthy_hashes"] and path not in state["unpublished_files"]
+            (digest, document_format(path)) in state["healthy_keys"] and path not in state["unpublished_files"]
             for path, digest in disk.items())
         report["issues"] = list(issues.values())
         return report, state
@@ -127,7 +129,7 @@ class IndexHealth:
             report, state = self._scan()
             return {"report": report, "files": [
                 {"name": os.path.basename(path), "path": path,
-                 "indexed": digest in state["healthy_hashes"] and path not in state["unpublished_files"]}
+                 "indexed": (digest, document_format(path)) in state["healthy_keys"] and path not in state["unpublished_files"]}
                 for path, digest in state["disk"].items()
             ]}
 
@@ -140,25 +142,26 @@ class IndexHealth:
             summary = {"ghost_deleted": [], "ghost_errors": [], "manifest_rebuilt": False,
                        "re_indexed": [], "re_index_failures": []}
             targets = {}
-            for digest, record in state["records"].items():
-                if digest in state["healthy_hashes"]:
+            for identity, record in state["records"].items():
+                if identity in state["healthy_keys"]:
                     continue
-                copies = state["by_hash"].get(digest)
+                copies = state["by_identity"].get(identity)
                 if copies:
-                    targets[digest] = copies[0]
+                    targets[identity] = copies[0]
                 source = state["by_norm"].get(os.path.normcase(record.source))
                 if source and state["disk"][source]:
-                    targets[state["disk"][source]] = source
+                    targets[(state["disk"][source], document_format(source))] = source
             # 清单遗失时重新解析源文件，不信任现存块数和元数据。
             for row in state["rows"]:
                 source = row.get("source")
                 path = state["by_norm"].get(os.path.normcase(source)) if isinstance(source, str) else None
-                if row.get("content_sha256") not in state["records"]:
+                identity = (row.get("content_sha256"), row.get("source_format"))
+                if identity not in state["records"]:
                     if path and state["disk"][path]:
-                        targets[state["disk"][path]] = path
-                    copies = state["by_hash"].get(row.get("content_sha256"))
+                        targets[(state["disk"][path], document_format(path))] = path
+                    copies = state["by_identity"].get(identity)
                     if copies:
-                        targets[row["content_sha256"]] = copies[0]
+                        targets[identity] = copies[0]
             paths = list(dict.fromkeys([*targets.values(), *state["unpublished_files"]]))
             if paths:
                 failures = self.vector_store.index_pending_files(paths)
@@ -173,16 +176,16 @@ class IndexHealth:
                 after_report["repair"] = summary
                 return after_report
             unreadable = any(digest is None for digest in after["disk"].values())
-            for digest, record in after["records"].items():
-                if after["by_hash"].get(digest) or unreadable:
+            for identity, record in after["records"].items():
+                if after["by_identity"].get(identity) or unreadable:
                     continue
                 path = after["by_norm"].get(os.path.normcase(record.source))
-                if path and after["disk"][path] not in after["healthy_hashes"]:
+                if path and (after["disk"][path], document_format(path)) not in after["healthy_keys"]:
                     continue  # 文件不可读或新版本仍未成功，保留旧清单以便再次修复。
                 try:
                     deleted = self.vector_store._delete_pks([row["pk"] for row in after["rows"]
-                                                            if row.get("content_sha256") == digest])
-                    self.vector_store.manifests.delete(digest)
+                                                            if (row.get("content_sha256"), row.get("source_format")) == identity])
+                    self.vector_store.manifests.delete(identity)
                     summary["manifest_rebuilt"] = True
                     if deleted and record.source not in summary["ghost_deleted"]:
                         summary["ghost_deleted"].append(record.source)
@@ -193,11 +196,11 @@ class IndexHealth:
             # 无清单的残留块仅在源文件已丢失或替代索引已验证后删除。
             leftovers = defaultdict(list)
             for row in self.vector_store.chunk_rows():
-                if row.get("content_sha256") in records:
+                if (row.get("content_sha256"), row.get("source_format")) in records:
                     continue
                 source = row.get("source")
                 path = after["by_norm"].get(os.path.normcase(source)) if isinstance(source, str) else None
-                if unreadable or (path and after["disk"][path] not in after["healthy_hashes"]):
+                if unreadable or (path and (after["disk"][path], document_format(path)) not in after["healthy_keys"]):
                     continue
                 leftovers[source or "(来源缺失)"].append(row["pk"])
             for source, pks in leftovers.items():

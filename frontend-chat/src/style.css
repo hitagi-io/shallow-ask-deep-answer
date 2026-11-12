@@ -1,6 +1,6 @@
 *, *::before, *::after { box-sizing: border-box; }
 
-/* Shared visual language: neutral surfaces, charcoal controls, semantic status colors. */
+/* 统一视觉风格：中性背景、深灰控件，以及表达状态含义的颜色。 */
 :root {
   font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   color: var(--text); background: var(--canvas); font-size: 14px; line-height: 1.6;

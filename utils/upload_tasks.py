@@ -1,4 +1,4 @@
-"""Persistent upload task queue used by the knowledge index workers."""
+"""供知识库索引工作进程使用的持久化上传任务队列。"""
 from __future__ import annotations
 
 import hashlib
@@ -17,11 +17,10 @@ def _project_queue_lock_key(user_id: int, project_id: str) -> int:
 
 
 class UploadTaskStore:
-    """Small PostgreSQL-backed task store.
+    """基于 PostgreSQL 的轻量任务存储。
 
-    The queue is durable, while the actual indexing work remains in the API
-    worker process. A running task is claimed once and the existing project
-    advisory lock still protects the index mutation itself.
+    队列持久化保存，实际索引工作仍在 API 工作进程中执行。
+    运行中的任务不会被重复领取，索引变更仍受现有项目咨询锁保护。
     """
 
     def __init__(self, conninfo: str | None = None):
@@ -32,8 +31,8 @@ class UploadTaskStore:
 
     @staticmethod
     def setup(cur) -> None:
-        # Uploads are acknowledged after the source bytes are staged;
-        # indexing is performed by a durable, project-ordered worker.
+        # 源文件暂存完成后即确认接收；索引任务持久化到队列，
+        # 由后台工作进程按同一项目的提交顺序执行。
         cur.execute("""
             CREATE TABLE IF NOT EXISTS upload_tasks (
                 id          VARCHAR(36) PRIMARY KEY,
@@ -134,11 +133,11 @@ class UploadTaskStore:
         return {**dict(task), "files": [dict(item) for item in items]}
 
     def claim_next(self) -> tuple[dict, psycopg.Connection] | None:
-        """Hold a session lock until the caller finishes the task.
+        """持有会话锁，直到调用方处理完任务。
 
-        A running row with an available lock belongs to a dead worker. Return
-        it for explicit failure recovery, without racing a long live job.
-        The lease connection must be closed by the caller, even on failure.
+        任务仍标记为运行中但锁已可获取，说明原工作进程已失去租约。
+        返回该任务以执行明确的中断恢复，避免与仍在运行的长任务竞争。
+        调用方必须关闭租约连接，即使处理失败也不例外。
         """
         lease = psycopg.connect(self.conninfo, autocommit=True, row_factory=dict_row)
         try:
@@ -173,8 +172,8 @@ class UploadTaskStore:
             raise
 
     def list_tasks(self, user_id: int, project_id: str) -> list[dict]:
-        # Active tasks are never hidden by a history limit. Read all rows in
-        # one snapshot, with two queries regardless of the number of tasks.
+        # 历史条数限制不隐藏未结束任务；在同一快照中读取全部所需记录，
+        # 无论任务数量多少，都只执行两次查询。
         with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             tasks = conn.execute("""

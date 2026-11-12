@@ -1,6 +1,6 @@
 import { onUnmounted, ref } from 'vue'
 
-/** One replaceable notice per owner; stale timers cannot dismiss a newer notice. */
+/** 每个调用方只保留一条可替换的提示；旧计时器不能关闭新提示。 */
 export function useNotice(duration = 4000) {
   const message = ref('')
   const type = ref<'success' | 'error' | ''>('')

@@ -1,7 +1,7 @@
 import { computed, onScopeDispose, ref } from 'vue'
 import type { HealthReport } from '../api'
 
-// Display freshness is based on the scan time, never on when a cached response arrives.
+// 报告时效按实际检查时间判断，不使用缓存响应的接收时间。
 export const HEALTH_REPORT_MAX_AGE_MS = 5 * 60_000
 type StatusTone = 'neutral' | 'success' | 'warning' | 'error'
 interface DisplayStatus { label: string; tone: StatusTone }

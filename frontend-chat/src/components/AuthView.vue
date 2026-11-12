@@ -114,7 +114,7 @@ async function handleSubmit() {
 <style scoped>
 .auth-page { background: var(--canvas); padding: 48px 32px; }
 .auth-layout { --auth-inset: 38px; width: min(1060px, 100%); display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); align-items: stretch; column-gap: clamp(40px, 7vw, 112px); row-gap: 28px; margin: auto; }
-/* Share a header and content edges so unequal text sizes don't shift the two columns. */
+/* 两列共用标题区域并对齐内容边缘，避免文字尺寸不同导致错位。 */
 .auth-intro { display: flex; flex-direction: column; padding: calc(var(--auth-inset) + 1px) 0; }
 .auth-brand { grid-column: 1 / -1; display: flex; align-items: center; gap: 11px; font-size: 18px; font-weight: 650; letter-spacing: -.4px; }
 .auth-brand-icon { display: grid; place-items: center; width: 42px; height: 42px; border: 1px solid var(--accent-border); border-radius: 12px; background: var(--accent-soft); }

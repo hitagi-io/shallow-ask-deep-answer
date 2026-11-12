@@ -150,7 +150,7 @@ async def lifespan(_app: FastAPI):
         for generation_task in list(_generation_tasks):
             generation_task.cancel()
         await asyncio.gather(task, *_generation_tasks, return_exceptions=True)
-        # Drain in-flight work; cancellation of to_thread cannot stop an index write.
+        # 等待正在执行的任务结束；取消 to_thread 无法中止索引写入。
         await asyncio.gather(*upload_workers, return_exceptions=True)
         upload_executor.shutdown(wait=True)
 
@@ -199,7 +199,7 @@ def _invalidate_health(user_id: int, project_id: str) -> None:
     with _health_reports_lock:
         cache = _health_reports.get((user_id, project_id))
         if cache is not None:
-            # Keep any in-flight task registered until it has released its resources.
+            # 正在执行的任务释放资源前，保留其登记状态。
             cache.invalidate()
 
 
@@ -209,8 +209,8 @@ async def _request_health_snapshot(request: Request, user_id: int, project_id: s
         return await _health_scanner.scan(user_id, project_id, PG_CONN, INDEX_READ_LOCK_TIMEOUT_SECONDS)
 
     try:
-        # require_project has already authenticated/authorized this request. Only
-        # the shared scan task acquires index/project locks and storage connections.
+        # require_project 已完成请求鉴权；仅由共享扫描任务
+        # 获取索引锁、项目锁及存储连接。
         return await wait_for_client(request, _health_cache(user_id, project_id).get(check, refresh=refresh))
     except ProjectGoneError:
         raise HTTPException(status_code=404, detail="项目不存在或已被删除")
@@ -281,7 +281,7 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
 
 
 def _upload_task_payload(task: dict) -> dict:
-    """Return task state without exposing staged filesystem paths."""
+    """返回任务状态，不暴露暂存文件的磁盘路径。"""
     return {
         "task_id": task["id"],
         "status": task["status"],
@@ -304,7 +304,7 @@ def _upload_task_payload(task: dict) -> dict:
 
 
 def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
-    """Index one task; the database queue guarantees project ordering."""
+    """执行一个上传任务的索引操作；数据库队列保证同一项目内按顺序执行。"""
     task_id = task["id"]
     user_id, project_id = task["user_id"], task["project_id"]
     try:
@@ -319,7 +319,7 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
             staged_path = item["staged_path"]
             try:
                 with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
-                    # Stop using a queue lease lost to a database disconnect.
+                    # 检查队列租约连接，数据库断连导致租约丢失时停止处理。
                     lease.execute("SELECT 1")
                     _ensure_project(current)
                     knowledge_dir = get_knowledge_dir(user_id, project_id)
@@ -367,9 +367,9 @@ def _run_next_upload() -> bool:
     task, lease = claimed
     try:
         if task["status"] == "running":
-            # Only a worker whose session lease disappeared can reach here.
-            # A crash may have moved the staged bytes already: do not replay a
-            # replacement blindly or report that it was successfully indexed.
+            # 只有原工作进程的会话租约已消失，运行中的任务才会进入此分支。
+            # 崩溃前可能已移动暂存文件，不能盲目重做覆盖，
+            # 也不能将中断的任务报告为入库成功。
             with _index_write_section(task["user_id"], task["project_id"]):
                 _upload_task_store.fail(task["id"], "后台任务中断，请检查文档状态或重新上传")
                 for item in _upload_task_store.items(task["id"]):
@@ -608,7 +608,7 @@ def api_delete_account(req: DeleteAccountRequest, user: dict = Depends(get_curre
                 agent.forget_project(user_id, project_id)
             finally:
                 _invalidate_health(user_id, project_id)
-        # Only remove the now-empty account directory, never an unchecked subtree.
+        # 仅删除清理后已为空的账号目录，不递归删除未经校验的子目录。
         root = Path(get_knowledge_storage_root()).resolve()
         account_dir = root / str(user_id)
         if account_dir.resolve() != account_dir or account_dir.parent != root:
@@ -795,7 +795,7 @@ async def _generation_events(user_id: int, conv_id: str, request_id: str, auth_v
     while True:
         account = await asyncio.to_thread(get_user_by_id, user_id)
         if account is None or account["auth_version"] != auth_version:
-            # Reconnecting clients receive 401; old streams stop exposing snapshots.
+            # 重连请求会收到 401；已建立的流停止发送快照。
             return
         generation = await asyncio.to_thread(
             get_generation, user_id, conv_id, request_id, CHAT_GENERATION_STALE_SECONDS,
@@ -1075,8 +1075,8 @@ def _write_upload_to(file: UploadFile, tmp_path: str) -> None:
 def upload_files(files: list[UploadFile] = File(...), project: dict = Depends(require_project)):
     user_id, project_id = project["user_id"], project["id"]
     staged, errors = [], []
-    # Shared project access prevents deletion during staging; there is no
-    # index lock here, so even a slow embedding request cannot delay upload.
+    # 项目共享锁防止暂存期间项目被删除；此处不持有索引锁，
+    # 即使嵌入请求缓慢，也不会阻塞上传保存。
     with project_access(user_id, project_id) as current:
         _ensure_project(current)
         knowledge_dir = get_knowledge_dir(user_id, project_id)
@@ -1089,7 +1089,7 @@ def upload_files(files: list[UploadFile] = File(...), project: dict = Depends(re
                 try:
                     name = _safe_filename(name)
                     if os.path.splitext(name)[1].lower() not in allowed_types:
-                        raise ValueError("仅支持 TXT、PDF、DOCX")
+                        raise ValueError("支持的文件类型：" + "、".join(ext.lstrip(".").upper() for ext in allowed_types))
                     _write_upload_to(file, staged_path)
                     staged.append({"name": name, "staged_path": staged_path})
                     accepted = True

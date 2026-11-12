@@ -3,6 +3,7 @@ import { fetchFiles, fetchUploadTasks, uploadFiles, deleteFile, buildKnowledgeIn
 import { useNotice } from './useNotice'
 import { useHealthReport } from './useHealthReport'
 import type { ConfirmAction } from './useConfirmation'
+import { knowledgeFileTypes, supportsKnowledgeFile } from '../utils/knowledgeFormats'
 
 type Operation = '' | 'loading' | 'uploading' | 'building' | 'checking' | 'repairing' | 'deleting'
 interface UploadResult { name: string; status: 'waiting' | 'uploading' | 'queued' | 'error'; detail: string }
@@ -24,7 +25,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   const dragOver = ref(false)
   const fileInput = ref<HTMLInputElement | null>(null)
   const search = ref('')
-  const statusFilter = ref<'all' | 'indexed' | 'pending' | 'unknown'>('all')
+  const statusFilter = ref<'all' | 'indexed' | 'pending'>('all')
   const uploadResults = ref<UploadResult[]>([])
   const uploadTasks = ref<UploadTask[]>([])
   const taskLoadError = ref('')
@@ -51,7 +52,6 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     if (loadError.value) return { label: '状态未知', tone: 'warning' }
     if (knowledgeLoading.value) return { label: '加载中', tone: 'neutral' }
     if (!files.value.length) return { label: '暂无资料', tone: 'neutral' }
-    if (files.value.some(file => file.indexed === null)) return { label: '部分待确认', tone: 'warning' }
     const indexed = files.value.filter(file => file.indexed).length
     if (!indexed) return { label: '待入库', tone: 'warning' }
     return indexed === files.value.length
@@ -59,7 +59,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   })
   const filteredFiles = computed(() => files.value.filter(file =>
     file.name.toLocaleLowerCase().includes(search.value.trim().toLocaleLowerCase()) &&
-    (statusFilter.value === 'all' || file.indexed === (statusFilter.value === 'unknown' ? null : statusFilter.value === 'indexed'))))
+    (statusFilter.value === 'all' || file.indexed === (statusFilter.value === 'indexed'))))
   const errorText = (error: unknown) => error instanceof Error ? error.message : '操作失败，请稍后重试'
 
   function cancelReads() {
@@ -69,12 +69,12 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     tasksRequestVersion++
   }
 
-  // All entry points share one synchronous lock, including drag/drop and keyboard input.
+  // 所有操作入口共用一把同步锁，拖放和键盘操作也不例外。
   async function run(kind: Operation, action: (id: string) => Promise<void>) {
     if (disposed || !projectId.value || knowledgeBusy.value) return
     const id = projectId.value
     const view = viewVersion
-    // A foreground operation supersedes any poll already in flight, including its errors.
+    // 前台操作开始后，忽略正在执行的旧轮询结果及其错误。
     healthState.beginRequest()
     cancelReads()
     operation.value = kind
@@ -140,7 +140,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
       for (let index = 0; index < picked.length && !disposed; index++) {
         const file = picked[index]
         const row = rows[index]
-        if (!/\.(txt|pdf|docx)$/i.test(file.name)) { row.status = 'error'; row.detail = '仅支持 TXT、PDF、DOCX'; continue }
+        if (!supportsKnowledgeFile(file.name)) { row.status = 'error'; row.detail = `支持的文件类型：${knowledgeFileTypes}`; continue }
         row.status = 'uploading'; row.detail = '正在上传'
         try {
           const result = await uploadFiles(id, [file], () => { row.detail = '传输完成，正在保存' }, uploadAbort.signal)
@@ -230,7 +230,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
           lastFullRefresh = Date.now()
         }
       }
-    } catch { /* The persistent health notice marks failures; intentional cancellation stays silent. */ }
+    } catch { /* 读取失败由各自的状态提示展示；主动取消不提示。 */ }
     finally {
       if (!disposed) pollTimer = setTimeout(poll, indexing.value ? 2_000 : 5_000)
     }

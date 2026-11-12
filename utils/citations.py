@@ -3,7 +3,7 @@
 import re
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from utils.source_evidence import text_digest
+from utils.source_evidence import passage_digest, text_digest
 
 CITATION_RE = re.compile(r"\[\[cite:([0-9a-f]{64})\]\]")
 _SOURCE_PATH_RE = re.compile(r"/api/projects/[0-9a-f-]{36}/sources/[^/]+")
@@ -31,7 +31,8 @@ def valid_evidence(item: dict) -> bool:
     if any(not re.fullmatch(r"\d{1,12}", query[k][0]) for k in ("unit", "start", "end")):
         return False
     return (int(query["end"][0]) - int(query["start"][0]) == len(item["excerpt"])
-            and text_digest(item["excerpt"]) == query["digest"][0]
+            and passage_digest(item["excerpt"], item["location"], int(query["unit"][0]),
+                               int(query["start"][0]), int(query["end"][0])) == query["digest"][0]
             and text_digest(item["source_url"]) == item["citation_id"])
 
 

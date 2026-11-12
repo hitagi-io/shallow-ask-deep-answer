@@ -12,11 +12,11 @@ from langchain_milvus import BM25BuiltInFunction, Milvus
 from dotenv import load_dotenv
 
 from rag.embeddings import DashScopeEmbeddings
-from rag.index_manifest import IndexManifest, ManifestStore, chunks_match, current_index_version, project_collection_name, text_sha256
+from rag.index_manifest import IndexManifest, ManifestStore, chunks_match, current_index_version, project_collection_name
 from rag.retrieval import HybridRetriever
 from utils.config_loader import vector_db_config
-from utils.knowledge_files import list_supported_files, compute_file_sha256, get_document_loader
-from utils.source_evidence import split_located_documents
+from utils.knowledge_files import list_supported_files, compute_file_sha256, get_document_loader, document_format
+from utils.source_evidence import SOURCE_FIELDS, chunk_signature, split_located_documents, text_digest
 from utils.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
 from utils.logging_config import get_logger
 
@@ -107,7 +107,7 @@ class VectorStore:
             batch_size=self._ITER_BATCH_SIZE,
             filter=expression,
             output_fields=["pk", "text", "source", "content_sha256", "index_version",
-                           "index_id", "chunk_index", "chunk_sha256"],
+                           "index_id", "chunk_index", "chunk_sha256", "source_format", *SOURCE_FIELDS],
             consistency_level="Strong",
         )
         try:
@@ -115,7 +115,7 @@ class VectorStore:
             while batch := iterator.next():
                 # 动态元数据损坏时仍要报告/清理该主键，不能让异常类型中断全库检查。
                 for row in batch:
-                    for field in ("content_sha256", "source"):
+                    for field in ("content_sha256", "source", "source_format"):
                         if not isinstance(row.get(field), str):
                             row[field] = None
                 rows.extend(batch)
@@ -123,15 +123,16 @@ class VectorStore:
         finally:
             iterator.close()
 
-    def _content_rows(self, sha256: str) -> list[dict]:
-        return self.chunk_rows(f"content_sha256 == {json.dumps(sha256)}")
+    def _content_rows(self, identity: tuple[str, str]) -> list[dict]:
+        digest, kind = identity
+        return self.chunk_rows(f"content_sha256 == {json.dumps(digest)} and source_format == {json.dumps(kind)}")
 
     def manifest_is_current(self, manifest: IndexManifest, rows: list[dict] | None = None) -> bool:
         source = scoped_knowledge_file(self.knowledge_dir, manifest.source)
         if (manifest.state != "ready" or manifest.index_version != self.index_version
                 or compute_file_sha256(source) != manifest.content_sha256):
             return False
-        return chunks_match(manifest, self._content_rows(manifest.content_sha256) if rows is None else rows)
+        return chunks_match(manifest, self._content_rows(manifest.identity) if rows is None else rows)
 
     def index_pending_files(self, file_paths=None) -> list[dict]:
         """补建未入库或校验失败的内容；成功后清理同路径的过期版本。"""
@@ -168,15 +169,19 @@ class VectorStore:
             if sha256 is None:
                 return {**result, "error": "SHA-256 计算失败"}
             result["content_sha256"] = sha256
-            old = self.manifests.all().get(sha256)
-            if not force and old and self.manifest_is_current(old):
-                self.manifests.publish_existing_file(file_path, sha256)
-                return {**result, "chunks": old.expected_chunks, "ok": True, "error": None}
             loader = get_document_loader(file_path)
             if loader is None:
                 return {**result, "error": "不支持的文件类型"}
+            identity = (sha256, document_format(file_path))
+            old = self.manifests.all().get(identity)
+            if not force and old and self.manifest_is_current(old):
+                self.manifests.publish_existing_file(file_path, sha256)
+                return {**result, "chunks": old.expected_chunks, "ok": True, "error": None}
             try:
                 documents = split_located_documents(loader(file_path), self.splitter)
+            except ValueError as exc:
+                logger.warning("[向量库] 文件内容无法解析 file=%s: %s", file_path, exc)
+                return {**result, "error": str(exc)}
             except Exception:
                 logger.exception("[向量库] 文件加载或分块失败 file=%s", file_path)
                 return result
@@ -184,8 +189,8 @@ class VectorStore:
                 return {**result, "error": "文件分割后为空"}
             if compute_file_sha256(file_path) != sha256:
                 return {**result, "error": "解析期间文件发生变化，请重试"}
-            hashes = tuple(text_sha256(doc.page_content) for doc in documents)
-            manifest = IndexManifest(sha256, file_path, self.index_version,
+            hashes = tuple(chunk_signature(doc.page_content, doc.metadata) for doc in documents)
+            manifest = IndexManifest(sha256, file_path, identity[1], self.index_version,
                                      uuid.uuid4().hex, len(documents), hashes, "building")
             if old is None or old.state != "ready":
                 self.manifests.put(manifest)
@@ -200,8 +205,9 @@ class VectorStore:
             for ordinal, doc in enumerate(documents):
                 doc.metadata.update({
                     "source": file_path, "content_sha256": sha256,
+                    "source_format": identity[1],
                     "index_version": manifest.index_version, "index_id": manifest.index_id,
-                    "chunk_index": ordinal, "chunk_sha256": hashes[ordinal],
+                    "chunk_index": ordinal, "chunk_sha256": text_digest(doc.page_content),
                 })
             try:
                 if not self.vector_store.client.has_collection(collection_name=self.vector_store.collection_name):
@@ -231,7 +237,7 @@ class VectorStore:
             result = {**result, "chunks": len(documents), "ok": True,
                       "error": None, "committed": True}
             try:
-                self._delete_pks([row["pk"] for row in self._content_rows(sha256)
+                self._delete_pks([row["pk"] for row in self._content_rows(identity)
                                   if row.get("index_id") != manifest.index_id])
             except Exception:
                 logger.exception("[向量库] 新清单已提交，旧分块清理失败 file=%s", file_path)
@@ -259,6 +265,8 @@ class VectorStore:
         for path in list_supported_files(self.knowledge_dir, tuple(vector_db_config["allowed_types"])):
             if os.path.normcase(os.path.abspath(path)) == norm_self:
                 continue
+            if document_format(path) != document_format(file_path):
+                continue
             digest = compute_file_sha256(path)
             if digest is None:
                 raise OSError(f"无法确认同内容副本，保留原索引：{path}")
@@ -269,7 +277,8 @@ class VectorStore:
     def _retire_source_versions(self, file_path: str, keep_sha256: str | None = None) -> None:
         """过期内容先转移到同内容副本；无副本时先删向量再删清单，失败仍可追踪。"""
         file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
-        for sha256, record in self.manifests.all().items():
+        for identity, record in self.manifests.all().items():
+            sha256 = record.content_sha256
             if os.path.normcase(record.source) != os.path.normcase(file_path) or sha256 == keep_sha256:
                 continue
             survivor = self._another_file_with_same_content(file_path, sha256)
@@ -278,8 +287,8 @@ class VectorStore:
                 if not result["ok"]:
                     raise RuntimeError(f"同内容副本重建失败：{survivor}")
             else:
-                self._delete_pks([row["pk"] for row in self._content_rows(sha256)])
-                self.manifests.delete(sha256)
+                self._delete_pks([row["pk"] for row in self._content_rows(identity)])
+                self.manifests.delete(identity)
         self._delete_pks([row["pk"] for row in self.chunk_rows(f"source == {json.dumps(file_path)}")
                           if keep_sha256 is None or row.get("content_sha256") != keep_sha256])
 

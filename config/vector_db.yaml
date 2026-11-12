@@ -4,13 +4,13 @@ embedding_model: qwen3.7-text-embedding-flash
 embedding_endpoint: https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding
 # 索引管线修订号：解析规则或服务端模型行为变化时递增，触发完整重建。
 # 分块参数、嵌入模型与解析依赖版本也会自动计入索引版本指纹。
-index_version: 2
+index_version: 1
 
 # Milvus 配置（通过 Docker 部署 Milvus 服务）
 milvus_uri: "http://localhost:19530"
 
-# Milvus gRPC 连接池大小（每个 API 进程各自持有），默认值 1 在高并发下会成为瓶颈。
-# 检索并发上不去时可继续调大；多 worker 部署时总量为 workers × 本值。
+# 此参数透传给 Milvus 客户端；当前固定的 PyMilvus 3.0.2 不使用 pool_size。
+# 调整此值不会改变 gRPC 连接数或并发上限。
 pool_size: 50
 
 chunk_size: 500
@@ -32,7 +32,15 @@ bm25_analyzer:
 
 # 源文件位于项目外，默认仓库同级 shallow-ask-deep-answer-data/账号 ID/项目 UUID。
 # 使用环境变量 KNOWLEDGE_STORAGE_ROOT 指定其他绝对路径。
-allowed_types: [".txt",".pdf",".docx"]
+allowed_types: [".txt", ".md", ".pdf", ".docx", ".xlsx", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"]
+
+# 本地解析与中英文 OCR；这些参数变化后需要重建索引。
+parsing:
+  pdf_dpi: 200
+  ocr_max_side: 2600
+  ocr_min_confidence: 0.5
+  max_pages: 500
+  max_sheet_cells: 250000
 
 # 索引健康自检间隔（小时）：逐项目检查 PostgreSQL 清单 / 源文件 / Milvus 每一块内容
 health_check_interval_hours: 6

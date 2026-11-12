@@ -1,12 +1,12 @@
 """知识库检索：向量与 BM25 各召回候选，RRF 去重融合后精排返回 TopK。"""
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import time
 
 from utils.config_loader import load_config
+from utils.source_evidence import text_digest
 from utils.dashscope_client import DashScopeRequestError, make_client, request_json, validate_request_settings
 from utils.logging_config import get_logger
 
@@ -36,9 +36,8 @@ SETTINGS = validate_settings(load_config("retrieval.yaml"))
 
 def chunk_id(document) -> str:
     metadata = document.metadata
-    identity = [metadata["content_sha256"], metadata["chunk_index"], metadata["chunk_sha256"]]
-    return hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True,
-                                     separators=(",", ":")).encode()).hexdigest()
+    identity = [metadata["content_sha256"], metadata["source_format"], metadata["chunk_index"], metadata["chunk_sha256"]]
+    return text_digest(json.dumps(identity, ensure_ascii=False, separators=(",", ":")))
 
 
 def fuse_rrf(rankings, constant: int):
@@ -97,9 +96,9 @@ class HybridRetriever:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("检索 query 必须为非空字符串")
         started = time.perf_counter()
-        # The caller holds the project read lock through both searches. Read
-        # once so dense and sparse recall use the same publication snapshot.
-        # An empty allowlist never falls back to an unrestricted search.
+        # 调用方在两路检索期间持有项目读锁；只读取一次发布白名单，
+        # 确保稠密向量与稀疏向量召回使用同一份发布快照。
+        # 白名单为空时不回退到无过滤检索。
         index_ids = self.store.manifests.published_index_ids(self.store.index_version)
         if not index_ids:
             return []

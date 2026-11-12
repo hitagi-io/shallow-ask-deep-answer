@@ -158,7 +158,7 @@ async function clearInput() {
 .jump-latest:hover { background: var(--surface); color: var(--text); }
 .latest-button { align-self: center; max-width: calc(100% - 24px); padding: 9px 16px; border: 1px solid var(--danger-border); border-radius: var(--radius-control); background: var(--danger-bg); color: var(--danger); font-size: 12px; }
 .chat-area { flex: 1; min-height: 0; overflow-y: auto; padding: 36px 32px 24px; scroll-padding-bottom: 24px; }
-/* Auto margins center short empty states and leave tall content scrollable from the top. */
+/* 自动外边距使较短的空状态居中，较长的内容仍可从顶部开始滚动。 */
 .chat-area.chat-area-empty { display: flex; flex-direction: column; padding-block: 20px; }
 .chat-area-empty > .empty { flex-shrink: 0; min-height: auto; width: 100%; margin-block: auto; padding-block: 0; }
 .loading-state { gap: 14px; color: var(--muted); font-size: 13px; }

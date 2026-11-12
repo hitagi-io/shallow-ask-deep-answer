@@ -109,7 +109,7 @@ def delete_account(user_id: int, version: int, token: str, confirmation: str, *,
             cur.execute("SELECT id FROM projects WHERE user_id = %s ORDER BY id", (user_id,))
             project_ids = [row["id"] for row in cur.fetchall()]
             for project_id in project_ids:
-                # Same keys as normal index operations, all on one connection.
+                # 与常规索引操作使用相同的锁键，所有锁都由同一个连接持有。
                 cur.execute("SELECT pg_advisory_xact_lock(%s)", (project_index_lock_key(user_id, project_id),))
             cur.execute("SELECT id FROM projects WHERE user_id = %s ORDER BY id FOR UPDATE", (user_id,))
             project_ids = [row["id"] for row in cur.fetchall()]
