@@ -146,14 +146,23 @@ class ChatAgent:
             max_size=PG_CHECKPOINT_POOL_MAX,
             kwargs={"autocommit": True, "prepare_threshold": 0},
         )
-        self.checkpointer = PostgresSaver(self._pg_pool)
-        with exclusive_section(_PG_CONNECTION_STRING, PG_LOCK_KEY_SETUP):
-            self.checkpointer.setup()
-        self.kb_only_prompt = render_kb_agent_prompt()
-        self.general_prompt = render_general_prompt()
-        self._kb_agents = OrderedDict()
-        self._kb_agents_lock = threading.Lock()
-        self._general_agent = self._build_general_agent()
+        try:
+            self.checkpointer = PostgresSaver(self._pg_pool)
+            with exclusive_section(_PG_CONNECTION_STRING, PG_LOCK_KEY_SETUP):
+                self.checkpointer.setup()
+            self.kb_only_prompt = render_kb_agent_prompt()
+            self.general_prompt = render_general_prompt()
+            self._kb_agents = OrderedDict()
+            self._kb_agents_lock = threading.Lock()
+            self._general_agent = self._build_general_agent()
+        except BaseException:
+            # 构造失败时实例不会交给 lifespan，必须在这里释放已创建的连接池。
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """显式结束检查点连接池的工作线程，避免留到解释器退出时清理。"""
+        self._pg_pool.close()
 
     def _build_middleware(self, static_prompt: str):
         return [

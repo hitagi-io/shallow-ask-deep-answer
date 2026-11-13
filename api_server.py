@@ -12,7 +12,7 @@ from pathlib import Path
 from uuid import UUID
 from functools import partial
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, Request, Query
 
@@ -43,6 +43,7 @@ from auth import (
     PG_CONN,
     PG_POOL_MAX,
     init_db,
+    close_db_pool,
     register,
     login,
     consume_rate_limit,
@@ -133,30 +134,40 @@ def _warn_connection_budget() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global agent
     reset_shutdown()
     get_knowledge_storage_root()
     anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_SIZE
     logger.info(f"[启动] AnyIO 默认线程池并发额度为 {THREADPOOL_SIZE}，工作进程数为 {UVICORN_WORKERS}")
-    _warn_connection_budget()
-    task = asyncio.create_task(_scheduled_health_loop(), name="scheduled-health")
-    task.add_done_callback(_background_task_done)
-    upload_stop = asyncio.Event()
-    upload_executor = ThreadPoolExecutor(max_workers=UPLOAD_WORKERS, thread_name_prefix="upload-index")
-    upload_workers = [asyncio.create_task(_upload_worker_loop(i, upload_stop, upload_executor),
-                                         name=f"upload-index-{i}") for i in range(UPLOAD_WORKERS)]
-    try:
-        yield
-    finally:
-        request_shutdown()
-        upload_stop.set()
-        logger.info("[关闭] 已通知后台入库停止，等待当前步骤收尾")
-        task.cancel()
-        for generation_task in list(_generation_tasks):
-            generation_task.cancel()
-        await asyncio.gather(task, *_generation_tasks, return_exceptions=True)
-        # 线程在解析/嵌入边界响应停止；等待回滚、状态写回和已提交写入的收尾。
-        await asyncio.gather(*upload_workers, return_exceptions=True)
-        upload_executor.shutdown(wait=True)
+    with ExitStack() as resources:
+        # 导入模块时不建池；正常退出和启动中途失败都由生命周期释放资源。
+        resources.callback(close_db_pool)
+        init_db()
+        agent = ChatAgent()
+        resources.callback(agent.close)
+        _warn_connection_budget()
+        background_stop = asyncio.Event()
+        upload_executor = resources.enter_context(
+            ThreadPoolExecutor(max_workers=UPLOAD_WORKERS, thread_name_prefix="upload-index")
+        )
+        task = asyncio.create_task(_scheduled_health_loop(background_stop), name="scheduled-health")
+        task.add_done_callback(_background_task_done)
+        upload_workers = [asyncio.create_task(_upload_worker_loop(i, background_stop, upload_executor),
+                                             name=f"upload-index-{i}") for i in range(UPLOAD_WORKERS)]
+        try:
+            yield
+        finally:
+            request_shutdown()
+            background_stop.set()
+            logger.info("[关闭] 已通知后台入库和健康检查停止，等待当前步骤收尾")
+            generation_tasks = tuple(_generation_tasks)
+            for generation_task in generation_tasks:
+                generation_task.cancel()
+            # 不取消健康检查的 asyncio 等待，确保底层线程退出后再关闭连接池。
+            await asyncio.gather(task, *generation_tasks, return_exceptions=True)
+            # 线程在解析/嵌入边界响应停止；等待回滚、状态写回和已提交写入的收尾。
+            await asyncio.gather(*upload_workers, return_exceptions=True)
+    logger.info("[关闭] PostgreSQL 连接池已释放")
 
 
 app = FastAPI(
@@ -167,9 +178,8 @@ app = FastAPI(
     openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
 )
 
-init_db()
-
-agent = ChatAgent()
+# 仅在 lifespan 启动时创建，避免脚本入口和 Uvicorn 导入分别创建连接池。
+agent: ChatAgent
 allowed_types = vector_db_config["allowed_types"]
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
@@ -431,7 +441,7 @@ async def _upload_worker_loop(worker_id: int, stop: asyncio.Event, executor: Thr
             pass
 
 
-async def _scheduled_health_loop():
+async def _scheduled_health_loop(stop: asyncio.Event):
     """定时健康检查和自动修复。
 
     多 worker/多实例下必须只由一个进程执行，否则会重复修复、重复触发嵌入调用；
@@ -441,8 +451,10 @@ async def _scheduled_health_loop():
     guard = SingleInstanceGuard(PG_CONN, _PG_LOCK_KEY_HEALTH)
     next_run = 0.0
     was_leader = False
-    while True:
+    while not stop.is_set():
         is_leader = await asyncio.to_thread(guard.try_acquire)
+        if stop.is_set():
+            return
         if is_leader != was_leader:
             logger.info(
                 "[索引健康检查] 当前进程已获得定时检查和修复的执行权" if is_leader
@@ -450,16 +462,24 @@ async def _scheduled_health_loop():
             )
             was_leader = is_leader
         if not is_leader or time.monotonic() < next_run:
-            await asyncio.sleep(_HEALTH_LEADER_POLL_SECONDS)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=_HEALTH_LEADER_POLL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
             continue
         try:
             for scope in await asyncio.to_thread(list_project_scopes):
+                check_shutdown()
                 try:
                     report = await asyncio.to_thread(_auto_heal_report, scope["user_id"], scope["id"])
                     if report is not None:
                         logger.info("[索引健康检查] 项目 %s 检查完成 healthy=%s", scope["id"], report["healthy"])
+                except ServiceStopping:
+                    return
                 except Exception:
                     logger.exception("[索引健康检查] 项目 %s 检查失败", scope["id"])
+        except ServiceStopping:
+            return
         except Exception as e:
             logger.error(f"[索引健康检查] 执行失败：{e}")
         next_run = time.monotonic() + interval

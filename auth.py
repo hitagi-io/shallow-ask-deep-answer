@@ -74,6 +74,15 @@ def _get_pool() -> ConnectionPool:
     return _pool
 
 
+def close_db_pool() -> None:
+    """后台任务收尾后关闭业务连接池；下次启动时可重新创建。"""
+    global _pool
+    with _pool_lock:
+        if _pool is not None:
+            _pool.close()
+            _pool = None
+
+
 @contextmanager
 def _connection():
     """借用业务连接；提交由调用方决定，退出时沿用未提交事务的回滚策略。"""
