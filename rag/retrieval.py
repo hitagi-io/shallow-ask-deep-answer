@@ -5,10 +5,10 @@ import json
 import math
 import time
 
-from utils.config_loader import load_config
-from utils.source_evidence import text_digest
-from utils.dashscope_client import DashScopeRequestError, make_client, request_json, validate_request_settings
-from utils.logging_config import get_logger
+from utils.core.config_loader import load_config
+from utils.retrieval.source_evidence import text_digest
+from utils.core.dashscope_client import DashScopeRequestError, make_client, request_json, validate_request_settings
+from utils.core.logging_config import get_logger
 
 logger = get_logger(__name__)
 

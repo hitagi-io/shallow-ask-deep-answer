@@ -182,12 +182,18 @@ export async function apiLogin(username: string, password: string): Promise<User
 
 export async function apiMe(): Promise<UserInfo> {
   const token = getToken()
-  const res = await apiFetch('/api/auth/me', { headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '验证登录状态失败，请稍后重试'))
-  const data = await res.json()
-  if (!token || token !== getToken()) throw new Error('登录状态已变更')
-  localStorage.setItem(USER_KEY, JSON.stringify(data.user))
-  return data.user
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 10000)
+  try {
+    const res = await apiFetch('/api/auth/me', { headers: authHeaders(), signal: controller.signal })
+    if (!res.ok) throw new Error(await errorMessage(res, '验证登录状态失败，请稍后重试'))
+    const data = await res.json()
+    if (!token || token !== getToken()) throw new Error('登录状态已变更')
+    localStorage.setItem(USER_KEY, JSON.stringify(data.user))
+    return data.user
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 export async function apiUpdateAccount(changes: { username?: string; current_password?: string; new_password?: string }): Promise<UserInfo> {

@@ -1,12 +1,13 @@
 import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted, type Ref } from 'vue'
 import { fetchConversations, fetchMessages, createConversationApi, updateConversationTitle, deleteConversationApi, streamChat, cancelGeneration, newRequestId, withEmptyHistory, type Conversation, type Message, type Project } from '../api'
 import { useNotice } from './useNotice'
+import { useProjectReadiness } from './useProjectReadiness'
 import type { ConfirmAction } from './useConfirmation'
 
 const PROJECT_REQUIRED_NOTICE = '请先选择一个可用项目，再发送知识库问题'
 const PROJECT_DELETED_NOTICE = '项目已删除，历史对话仅供查看，无法继续提问'
 
-export function useChat(userId: number, projects: Ref<Project[]>, confirmAction: ConfirmAction) {
+export function useChat(userId: number, projects: Ref<Project[]>, confirmAction: ConfirmAction, updatingProjectId: Readonly<Ref<string | null>>, active: Readonly<Ref<boolean>>) {
   let disposed = false
   // 输入框随内容自适应高度；清空内容时需手动复位（程序化清空不会触发 input 事件）
   const inputEl = ref<HTMLTextAreaElement | null>(null)
@@ -75,6 +76,9 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   const selectedProject = computed(() => projects.value.find(project => project.id === projectId.value))
   const projectDeleted = computed(() => !!conversations.value[currentId.value]?.project_deleted)
   const projectReady = computed(() => !projectDeleted.value && (!kbOnly.value || !!selectedProject.value))
+  const knowledgeReadiness = useProjectReadiness(computed(() => active.value && kbOnly.value && projectReady.value ? projectId.value : null), updatingProjectId)
+  const { blocked: knowledgeBlocked, notice: knowledgeNotice, status: knowledgeStatus, refresh: refreshKnowledgeReadiness } = knowledgeReadiness
+  const checkingSend = ref(false)
   watch(projectReady, ready => {
     if (ready && persistNotice.value === PROJECT_REQUIRED_NOTICE) clearNotice()
   })
@@ -392,13 +396,26 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
 
   async function sendMessage(retryText?: string, answerMode = kbOnly.value, previousRequestId?: string) {
     const text = (retryText ?? input.value).trim()
-    if (!text || isProcessing.value || conversationBusy.value || loading.value) return
+    if (!text || isProcessing.value || conversationBusy.value || loading.value || checkingSend.value || !active.value) return
     const convId = currentId.value
     const conv = conversations.value[convId]
     if (!conv || answerMode !== kbOnly.value || !conv.messagesLoaded || conv.messagesLoading) return
     if (!projectReady.value) {
       showNotice(projectDeleted.value ? PROJECT_DELETED_NOTICE : PROJECT_REQUIRED_NOTICE, 'error')
       return
+    }
+    if (answerMode) {
+      if (knowledgeBlocked.value) return
+      const selectedId = conv.project_id
+      const draft = input.value
+      checkingSend.value = true
+      let ready: boolean
+      try { ready = await refreshKnowledgeReadiness() }
+      finally { checkingSend.value = false }
+      // 确认期间切换会话、模式或修改草稿时，不提交旧问题或清空新草稿。
+      if (!ready || disposed || !active.value || currentId.value !== convId || conv.project_id !== selectedId
+        || answerMode !== kbOnly.value || isProcessing.value || conversationBusy.value || loading.value
+        || (retryText == null && input.value !== draft)) return
     }
     const hadMessages = conv.hasMessages
     conv.hasMessages = true
@@ -422,7 +439,10 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   }
 
   function refreshCurrent() {
-    if (!document.hidden && currentId.value && !runs.value[currentId.value]) void loadMessages()
+    if (!document.hidden) {
+      void refreshKnowledgeReadiness()
+      if (currentId.value && !runs.value[currentId.value]) void loadMessages()
+    }
   }
   onMounted(() => {
     void initConversations()
@@ -437,5 +457,6 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   })
   return { input, inputEl, chatArea, current, currentId, convList, hasEmptyConv, isProcessing, processingIds, reconnecting, stopping, isThinking, thinkingSeconds, thinkingPhase, kbOnly, switchMode, newConversation, selectConversation, deleteConversation, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
     nextCursor, loadingMore, loadMoreConversations, loadMessages, hasEarlier, loading, loadError, initConversations, conversationBusy, renameConversation, following, onScroll, jumpToLatest, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend,
-    projectId, selectedProject, projectReady, projectDeleted, selectProject, markProjectDeleted }
+    projectId, selectedProject, projectReady, projectDeleted, selectProject, markProjectDeleted,
+    knowledgeBlocked, knowledgeNotice, knowledgeStatus, refreshKnowledgeReadiness, checkingSend }
 }

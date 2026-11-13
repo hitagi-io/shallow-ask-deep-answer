@@ -1,75 +1,53 @@
 # 浅问深答
 
-多用户私有知识库问答系统，使用 FastAPI、Vue 3 和 DeepAgents。每个账号可按项目组织文档并围绕资料提问，也可使用通用模式问答。PostgreSQL 保存账号、项目、会话与索引清单，Milvus 按账号和项目保存独立的文档向量集合。
+基于 FastAPI、Vue 3 和 DeepAgents 的多用户私有知识库问答系统，使用 PostgreSQL 保存业务数据、Milvus 存储文档向量。
 
-- **双模式问答**：知识库模式检索内部资料并校验检索报告与引用文件；通用模式使用模型知识，可通过 Tavily 联网搜索。
-- **流式会话**：保存历史、停止生成、断线重连，支持多个会话同时生成。
-- **私有项目管理**：所有用户均可创建、重命名、删除自己的项目，上传、覆盖、删除 TXT、Markdown、PDF、DOCX、XLSX、PPTX 和图片，并检查、修复索引；资料、索引与对话按账号隔离。
-- **混合检索与精排**：向量召回和 BM25 关键词召回各取 20 个片段，按分块去重并进行 RRF 融合，再用 rerank 返回最相关的 5 个片段。
+## 功能
 
-知识库模式围绕所选项目的资料回答，建立「结论 → 证据 → 原文」的对应关系：结论旁标注引用编号，文末参考来源按文件归组，默认只显示文件名，点击文件名展开该文件的引用编号和位置链接；点击正文编号或展开后的链接，可查看提取文本、上下文和高亮证据。历史回答也采用相同的折叠展示。PDF 使用从 1 开始的文件页序，Excel 标注工作表、行和单元格，PPTX 标注幻灯片编号，Markdown 标注标题和源文件行范围，DOCX 标注内容块；段落按清洗后提取文本的空行编号，不虚构页码。OCR 结果明确标注识别文本，重要数字需结合原始图片核对。通用模式适合一般问答、写作和公开信息查询，联网搜索片段与各自来源对应，并按已知信息提供原句或章节定位。
-
-引用标识与链接由代码生成，模型只选择本轮证据。子代理缺少引用、引用未知片段，或主助手引用了子代理未使用的片段，均不能通过输出校验。校验覆盖引用归属与原文一致性，结论是否被证据充分支持仍需结合原文判断。原文链接按账号和项目鉴权，核对文件 SHA-256，以及绑定正文、定位描述和字符范围的证据摘要；覆盖或删除文件后，点击引用时提示版本变化或文件缺失，不会跳到新版本的同名段落。
+- **双模式问答**：知识库检索与通用问答，通用模式支持 Tavily 联网搜索。
+- **文档入库**：支持 TXT、Markdown、PDF、DOCX、XLSX、PPTX 和图片，扫描文档支持本地 OCR。
+- **检索与引用**：向量与 BM25 混合检索、rerank 精排，点击知识库来源可查看提取文本、上下文及高亮证据。
+- **私有工作空间**：项目、资料和会话按账号隔离，支持流式回答、历史记录、停止生成和索引维护。
 
 ## 快速开始
 
-以下命令使用 Windows PowerShell，默认在项目根目录执行。
+准备 Python 3.13、[Node.js 22.12+](https://vite.dev/guide/#scaffolding-your-first-vite-project)、PostgreSQL 和 Milvus。以下命令使用 Windows PowerShell，在项目根目录执行。
 
-### 1. 准备环境
+### 1. 准备存储与依赖
 
-准备以下环境：
-
-| 依赖 | 说明 |
-| --- | --- |
-| Python | 使用 3.13；当前依赖清单注明基于 Python 3.13.18 环境核对 |
-| Node.js 与 npm | 使用 Node.js 22.12+；前端依赖版本由 `package-lock.json` 锁定 |
-| PostgreSQL | 需提前创建数据库；服务账号需有建表、修改表权限 |
-| Milvus | 可使用已有服务，或用仓库内的 Docker Compose 配置启动 |
-| Docker 与 Docker Compose | 仅本地部署 Milvus 时需要；Windows 下使用 Linux 容器 |
-
-启动 PostgreSQL 后创建数据库（已存在时跳过）：
+启动 PostgreSQL 后创建数据库；本地 Milvus 使用 Docker Compose 启动（需 Linux 容器）：
 
 ```powershell
 psql -U postgres -c "CREATE DATABASE shallow_ask_deep_answer;"
-```
-
-使用 [Compose 配置](./deploy/milvus/compose.yaml) 启动本地 Milvus 及其依赖：
-
-```powershell
 docker compose -f deploy/milvus/compose.yaml up -d --wait
 ```
 
-Milvus 地址为 `http://localhost:19530`，健康检查地址为 `http://localhost:9092/healthz`。该配置用于本地开发，数据保存在 Docker 命名卷中；已有 Milvus 服务可跳过此步并修改 `config/vector_db.yaml` 中的连接地址。
-
-后端启动时初始化业务表、索引清单与文件入库记录表，以及模型会话检查点结构，项目向量集合按需创建。首次部署请使用空数据库；旧版共享知识库与角色数据没有自动迁移流程。
-
-### 2. 安装依赖与配置
+已有数据库或 Milvus 服务可跳过对应命令；使用已有 Milvus 时，在 `config/vector_db.yaml` 设置 `milvus_uri`。首次部署使用空数据库，后端自动建表，数据库账号需有建表权限；不提供旧版业务数据迁移。
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -s -m pip install -r requirements.txt
-python -s -m pip check
 if (!(Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-编辑 `.env`：
+### 2. 配置环境变量
 
-| 参数 | 用途 |
+编辑 `.env`，完整参数见 [.env.example](./.env.example)：
+
+| 变量 | 用途 |
 | --- | --- |
-| `PG_CONNECTION_STRING` | PostgreSQL 连接地址，数据库名与上一步一致 |
-| `JWT_SECRET` | 必填，登录令牌签名密钥 |
-| `OPENAI_API_KEY` | 聊天模型密钥，当前使用 DashScope 兼容接口 |
-| `DASHSCOPE_API_KEY` | DashScope 原生文本嵌入与 rerank 精排密钥 |
-| `TAVILY_API_KEY` | 可选，仅联网搜索需要 |
+| `PG_CONNECTION_STRING` | PostgreSQL 连接地址 |
+| `JWT_SECRET` | 登录令牌签名密钥，必填随机值 |
+| `OPENAI_API_KEY` | 聊天模型密钥，默认使用 DashScope 兼容接口 |
+| `DASHSCOPE_API_KEY` | DashScope 嵌入与精排密钥 |
+| `TAVILY_API_KEY` | 可选，联网搜索密钥 |
 
-同一个具有相应权限的 DashScope 密钥可填入两项模型密钥。生成 `JWT_SECRET`：
+同一个具有对应模型权限的 DashScope 密钥可填入两项模型密钥。生成 `JWT_SECRET`：
 
 ```powershell
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
-
-启动前核对 `config/agent.yaml` 中的聊天模型和接口地址、`config/vector_db.yaml` 中的嵌入模型和 Milvus 连接，以及 `config/retrieval.yaml` 中的精排模型，确保所填密钥有对应模型的调用权限。`.env` 已被 Git 忽略，真实凭证只保存在本地。
 
 ### 3. 启动服务
 
@@ -79,189 +57,47 @@ python -c "import secrets; print(secrets.token_hex(32))"
 python -s api_server.py
 ```
 
-在另一个终端，从项目根目录安装前端依赖并启动：
+另开终端，在项目根目录启动前端：
 
 ```powershell
 npm --prefix frontend-chat ci
 npm --prefix frontend-chat run dev
 ```
 
-打开 [http://localhost:5173](http://localhost:5173)。后端默认监听 `0.0.0.0:8000`；修改后端端口时，同步调整 [Vite 代理](./frontend-chat/vite.config.ts)。
+访问 [http://localhost:5173](http://localhost:5173)。后端默认端口为 `8000`；修改时同步调整 [Vite 代理](./frontend-chat/vite.config.ts)。
 
-检查存储服务是否就绪：
+## 使用
 
-```powershell
-Invoke-RestMethod http://localhost:8000/api/health/ready
-```
+1. 注册并登录，在「知识库」中创建项目、上传文档，等待文件显示「已入库」。
+2. 在对话输入区启用「知识库」，选择项目后提问；关闭该按钮则使用通用问答。
+3. 点击知识库回答末尾的来源查看提取文本；文档未入库或索引异常时，可在知识库页面补建、检查或修复索引。
 
-两项存储探测通过时返回 HTTP 200 和 `status: ready`；失败或超时返回 HTTP 503。该接口不检查聊天模型、嵌入模型或 Tavily，问答与入库能力仍需通过实际操作确认。
+上传或入库期间，该项目暂不能发送新问题。单文件默认上限 50 MB；TXT、Markdown 使用 UTF-8，Office 文件需为未加密的新格式。OCR 可能存在识别误差，关键内容请核对原文。
 
-### 4. 注册与使用
+## 配置与维护
 
-在页面注册并登录：用户名 2～50 字符；密码 10～128 字符，包含英文字母、数字和特殊符号。所有账号具有相同能力，不设置管理员角色。
-
-1. 从首页侧边栏进入「知识库」，创建项目并上传文档。上传后自动尝试入库，确认文件显示「已入库」。
-2. 返回对话页，在输入框下方点亮「知识库」按钮，选择项目后发送问题。新对话默认未选择项目。
-3. 取消选中「知识库」按钮即使用通用模式，此时项目选择禁用。
-4. 首页侧边栏底部的齿轮菜单提供「编辑信息」和「关于」。编辑信息可修改用户名（同时也是登录名）和密码；关于页面介绍两种模式、文档入库、对话操作和引用查看。
-
-单文件上传上限默认为 50 MB，可通过 `MAX_UPLOAD_MB` 调整。TXT、Markdown 使用 UTF-8（支持 BOM）。图片支持 PNG、JPG/JPEG、WebP、BMP、TIF/TIFF，包含多帧 TIFF；扫描 PDF 自动 OCR，无需预先转换。
-
-### 文档解析与清洗
-
-所有格式统一清理 BOM、零宽空格、无效控制字符、行尾空白及多余空行，统一换行和 Unicode NFC，保留代码缩进、数字、单位和否定词。原始上传文件不改写，索引与引用回看使用同一套确定性解析逻辑。
-
-| 格式 | 提取与清洗 |
+| 位置 | 内容 |
 | --- | --- |
-| TXT | 保留正文、缩进和制表符，不猜测非 UTF-8 编码 |
-| Markdown | 按标题组织正文，按渲染规则保留有序列表的起始编号、连续编号和嵌套层级，保留代码、链接文字，清理 HTML 块中的脚本、样式和注释；表格逐行保留列关系，不下载外链资源 |
-| PDF | 按可见裁剪范围提取文字及有边框表格，去除重叠文字；扫描页及内嵌图片使用 OCR，根据实际文字判断重复，少量页脚或水印不会使整幅图片被跳过 |
-| DOCX | 按正文块顺序提取段落、表格及多层嵌套表，保留自动编号的起始值、层级和重启规则，支持十进制、字母及罗马数字，其他编号格式保留序号并标注格式；保留横纵合并提示，区分默认、首页及偶数页页眉页脚；栅格图片按单元格和内容块定位 |
-| XLSX | 按工作表和行保留单元格坐标、合并范围、日期、简单百分比及正负整数补零（负号不占补零位数）；带逗号分组、缩放或其他复杂数字格式的值保留存储值及原格式；普通、数组及模拟运算表公式区分缓存结果与未计算结果，不执行公式或外部链接；识别工作表中的栅格图片 |
-| PPTX | 提取文本、分组对象、表格、含多级类别及系列名称的图表缓存数据和演讲者备注，识别内嵌栅格图片，保留幻灯片编号 |
-| 图片与扫描页 | 按 EXIF 纠正方向，透明图按白底合成，限制识别尺寸；本地中英文 OCR 按阅读行组织文字，有明确横纵边框的表格按行列提取 |
+| [.env.example](./.env.example) | 连接、密钥、端口、并发与超时 |
+| [config/agent.yaml](./config/agent.yaml) | 聊天模型、接口、搜索与会话参数 |
+| [config/vector_db.yaml](./config/vector_db.yaml) | Milvus、嵌入模型、文档解析与切块 |
+| [config/retrieval.yaml](./config/retrieval.yaml) | 混合检索与精排 |
+| [prompts/](./prompts/) | 问答、检索与会话压缩提示词 |
 
-OCR 使用固定版本的 RapidOCR、ONNX Runtime 和随包模型，在本机 CPU 执行；文档不会发送给外部 OCR 服务，后续嵌入、精排和问答仍使用项目配置的模型服务。手写、模糊图片、复杂合并或无边框扫描表格不能保证准确恢复；无边框扫描内容保留为 OCR 文本，不猜测表格结构。Office 中的矢量图、SmartArt、嵌入附件等不保证完整提取，关键资料可先导出为 PDF 或清晰栅格图。Excel 导入用于知识检索，不提供工作簿重算、跨表统计或数据库查询。
-
-解析参数位于 `config/vector_db.yaml` 的 `parsing`：默认 PDF 渲染 200 DPI，OCR 最长边 2600 像素，识别置信度下限 0.5；最多 500 页/幻灯片/图片帧，工作簿单元格范围合计最多 250000，Office 解压后不超过 256 MB，单张图片不超过 4000 万像素。超出限制需先拆分或缩小文件。每个进程最多缓存 8 份、共约 400 万字符的解析文本及元数据，按文件路径和 SHA-256 隔离；覆盖文件后不会复用旧识别结果。
-
-按空数据初始化，仅接受当前文档元数据和索引结构；修订号由 `config/vector_db.yaml` 的 `index_version` 管理。索引清单以文件 SHA-256 和解析格式共同标识内容，同字节 TXT 与 Markdown 分别建索引。分块完整性校验同时覆盖正文、页序、定位描述、提取方式和字符范围；缺少必需字段直接拒绝，不补默认值。当前表结构包含 `source_format`，不兼容或迁移旧表。
-
-## 配置
-
-| 文件或目录 | 内容 |
-| --- | --- |
-| [.env.example](./.env.example) | 环境变量模板：连接、密钥、端口、并发、限流和超时 |
-| [config/agent.yaml](./config/agent.yaml) | 聊天模型、接口地址、请求超时与重试、检索上限、搜索裁剪与会话压缩参数 |
-| [config/vector_db.yaml](./config/vector_db.yaml) | Milvus、嵌入模型及请求限制、文档切块、BM25 分词与健康检查 |
-| [config/retrieval.yaml](./config/retrieval.yaml) | 每路候选数、RRF 融合、rerank 模型与最终返回片段数 |
-| [prompts/](./prompts/) | 知识库、检索、通用问答和会话压缩提示词 |
-| [deploy/milvus/compose.yaml](./deploy/milvus/compose.yaml) | 本地 Milvus、etcd 与 MinIO 部署 |
-
-修改配置或提示词后重启后端。需要查看接口文档时，在 `.env` 设置 `ENABLE_API_DOCS=true`，重启后访问 [http://localhost:8000/docs](http://localhost:8000/docs)。
-
-知识库统一使用混合检索与精排，主要参数如下：
-
-| 参数 | 默认值 | 中文说明 |
-| --- | --- | --- |
-| `top_k` | `5` | 精排后交给检索子代理的最大片段数 |
-| `candidate_k` | `20` | 向量和 BM25 各自的候选数，须不小于 `top_k` |
-| `rrf_k` | `60` | 倒数排名融合的平滑常数 |
-| `rerank.model` | `qwen3.7-text-rerank` | 对融合后的完整候选并集进行相关性精排 |
-| `embedding_model` | `qwen3.7-text-embedding-flash` | 文档和查询使用的稠密嵌入模型 |
-
-同一分块在两路召回中只进入精排一次；最多 40 个候选全部送入精排，不先截取 Top5。一个文件的不同分块保留各自身份，引用保留原文件名并定位到具体页段。BM25 采用 Milvus 内置稀疏索引和 Jieba 分词，与稠密向量共用分块主键，上传、覆盖、删除沿用项目索引事务。
-
-嵌入与精排使用原生 DashScope HTTP 接口：连接超时均为 5 秒，单次读写超时分别为 20 秒和 30 秒，最多尝试 3 次（含首次请求）。仅网络故障、超时、远端协议错误及 408/429/部分 5xx 响应会重试；鉴权、参数、本地协议和响应格式错误直接报错。嵌入按每批 20 个片段独立重试；Milvus SDK 负责请求级重试，入库失败会清理本次写入，不再重复执行整个入库事务。精排失败会走现有服务故障协议，停止该次知识库查询。
-
-`config/agent.yaml` 中的主要检索与会话参数如下，表中为仓库当前配置值：
-
-| 参数 | 配置值 | 用途 |
-| --- | --- | --- |
-| `kb_subagent_max_retrieval_calls` | `3` | 每个知识库子任务的检索次数上限，空结果和失败也计入 |
-| `search_result_limit` | `5` | Tavily 请求和返回结果列表共用的数量上限；本项目要求为 1～20 |
-| `search_content_limit` | `3000` | 每条搜索片段及综合摘要的最大字符数，超出时截断并标记 |
-| `summary_trigger_messages` | `30` | 达到此消息数量时触发会话压缩 |
-| `summary_trigger_tokens` | `20000` | 达到此估算 token 数时触发会话压缩，与消息数条件为“或”关系 |
-| `summary_keep_messages` | `10` | 压缩时保留的近期消息数量；中间件可能为保留完整工具调用对而调整边界 |
-
-以上六项参数均须为正整数，`search_result_limit` 不得超过 20，`summary_keep_messages` 须小于 `summary_trigger_messages`；不接受布尔值、字符串或小数。缺失或无效配置会在启动时直接报错。搜索工具描述与实际结果裁剪共用这些配置。
-
-`llm_request_timeout_seconds` 与 `health_check_interval_hours` 须为有限正数，`llm_max_retries` 须为非负整数，`health_auto_repair_max_rounds` 须为正整数；这些 YAML 配置缺失或非法时直接报错。内部模型消息沿用 LangChain 的文本接口，不把非文本块强转为回答；检索与搜索响应异常不会被伪装成正常的空结果。
-
-提示词位于 [prompts/](./prompts/)，模板变量由 [utils/prompt_loader.py](./utils/prompt_loader.py) 注入。修改时保留模板占位符与检索协议约定；会话压缩提示词中的 `{messages}` 由中间件在运行时填充。
-
-## 日常使用
-
-- **会话**：首次发送后固定问答模式与项目；切换模式或项目会打开或复用空白会话。刷新、切换会话或短暂断网不会取消生成，点击“停止生成”才会取消；服务进程重启后不会自动续跑。连接持续失败最多尝试 5 次后提示刷新重试，响应格式或页面处理错误会直接报告。生成中的会话不能再次发送或删除。
-- **文档**：同名文件可覆盖上传，同内容且解析格式相同的文件仅在同一项目内共用索引。文件列表读取磁盘目录和已记录的入库状态，不查询 Milvus 或扫描文档正文；只有当前有效且已发布的入库记录显示「已入库」，缺少记录或记录无效时显示「待入库」，完整性另看检查报告。文件未入库时可点击「补建索引」；在「索引维护」中使用「检查索引」查看健康报告，使用「修复索引」处理异常。
-- **项目**：删除项目会清理文档、向量集合、索引清单、上传任务和模型上下文，保留项目名称、删除状态及历史对话。历史对话仅供查看，来源标记为“已删除”，无法打开原文或继续使用该项目提问；新问题需另建对话并选择可用项目。项目内有回答正在生成时不能删除。数据库结构按全新初始化定义，不提供旧结构迁移。
-
-### 账号管理
-
-从侧边栏底部齿轮菜单进入「编辑信息」：
-
-- **修改用户名**：用户名同时用于登录，修改后使用新用户名登录，项目和对话保留。
-- **修改密码**：需验证当前密码。修改后所有旧登录凭证失效，当前页面及同浏览器其他标签页退出；其他设备在下一次请求、页面重新获得焦点或可见页面的定期复核（每 15 秒）时返回登录页。已建立的回答流也会复核凭证版本并断开失效订阅。
-- **注销账号**：依次阅读须知、验证当前密码、输入「注销 用户名」并最终确认。验证凭证仅在 5 分钟内有效，不能用于普通登录。最终确认会删除账号、项目源文件、向量与索引清单、对话及模型上下文，无法撤销。有生成中的回答或正在启动的对话请求时拒绝注销；外部存储清理失败时保留账号供重试，但部分数据可能已经删除。
-
-## 部署与维护
-
-### 数据存储与版本更新
-
-源文件默认保存在仓库同级的 `<仓库目录名>-data/<账号 ID>/<项目 UUID>/`，仓库目录名为 `shallow-ask-deep-answer` 时即为 `shallow-ask-deep-answer-data/`。可用 `KNOWLEDGE_STORAGE_ROOT` 指定其他绝对路径，但必须位于源码目录之外。索引修复依赖源文件，备份时需同时考虑源文件、PostgreSQL 数据和 Milvus 数据。
-
-启动时按当前定义创建业务表：`users.auth_version` 用于跨 worker 校验凭证版本，`indexed_source_files` 保存已知文件摘要、大小和修改时间。更新代码、配置或提示词后需重启后端。
-
-新上传文件在入库时记录原文页段与字符坐标，只支持当前证据引用格式，不提供旧引用或旧索引的兼容与迁移。修改分块参数、嵌入模型或相关解析依赖后需重建索引；修改解析逻辑或模型服务行为时，还需递增 `config/vector_db.yaml` 的 `index_version`。集合名由 `collection_prefix`、账号 ID 与项目 UUID 生成，每个项目独立存储。
-
-上传接口先将文件保存为项目目录内的独立暂存文件，再登记 PostgreSQL 任务并返回 HTTP 202。后台按项目排队索引；不同账号或同一账号的不同项目可并行。上传不会等待前一个文件的 embedding 调用，页面在保存完成后可继续上传、切换项目或关闭，重新进入时会读取服务端任务状态。覆盖上传在后台执行时才替换正式文件，并沿用原有的索引失败回滚逻辑。
-
-- `POST /api/projects/{project_id}/files/upload` 返回 `{task_id, errors}`；`task_id` 为 `null` 表示没有文件被接受，`errors` 是校验或保存失败的逐文件错误。202 仅代表已保存并排队，入库结果须查询任务。
-- `GET /api/projects/{project_id}/upload-tasks/{task_id}` 返回任务状态、完成/成功/失败数量和逐文件结果。
-- `GET /api/projects/{project_id}/upload-tasks` 返回全部未结束任务及最近 20 个任务。页面处理中每 2 秒、空闲时每 5 秒刷新任务，文件元数据在任务进展变化或每 60 秒刷新。
-
-启动时自动创建 `upload_tasks` 和 `upload_task_items` 表，无需额外队列服务。默认每个 API worker 使用 4 个后台线程，可用 `UPLOAD_WORKERS` 调整；多实例必须连接同一个 PostgreSQL，并共享相同的 `KNOWLEDGE_STORAGE_ROOT` 路径及文件。运行任务持有项目队列会话锁，不会仅因任务耗时较长而被重复领取。正常关闭会等待当前任务；进程异常退出后，排队任务继续执行，已开始但未完成的任务会标记为中断失败，用户可检查文档状态或重新上传。任务历史由 PostgreSQL 保存，删除项目或账号时清理。上传待处理期间，文件删除、补建和手动修复返回 409，避免已删除文件被排队上传重新创建。
-
-检索使用 PostgreSQL `published_source_files` 保存文件已发布的内容版本，并关联 `index_manifests` 中的 `ready` 批次。完整写入、校验分块后，就绪清单和发布指针在同一事务提交；覆盖失败不会切换指针。同内容重建提交新的 `index_id` 后，旧批次立即退出召回。向量与 BM25 使用同一份已发布批次白名单，在 Milvus 召回前过滤，避免旧批次挤占 TopK。没有已发布索引时返回空结果；读取清单失败时报告检索故障，不退回无过滤搜索。配置指纹已过期的批次也不参与检索，需补建索引。
-
-启动时只创建发布表结构，不从已有文件记录迁移发布数据。健康检查更新文件观察记录不会改变发布版本；检查会报告“就绪索引尚未发布”，修复可为校验通过的文件重新发布。项目读写锁仍保留，索引期间检索可能等待写锁。
-
-集合包含 `vector` 和 `sparse` 两个字段及 BM25 函数，使用当前结构新建集合。BM25 分词配置也属于集合结构，修改后须重新创建集合。索引版本指纹包含嵌入接口、双向量结构、BM25 分词参数和实际解析依赖版本；查询的候选数、精排参数，以及 `httpx`、`langchain-milvus` 客户端版本变化不触发重新 embedding，不保留旧指纹兼容种子。
-
-### 健康检查与超时
-
-后端启动后逐项目检查索引，此后默认每 6 小时检查并尝试修复，单轮最多修复 3 次；检查间隔和修复次数在 `config/vector_db.yaml` 中配置。检查会扫描源文件及向量文本，耗时随资料量增加，不同项目使用独立的索引操作锁。
-
-| 参数 | 默认值 | 作用 |
-| --- | --- | --- |
-| `READINESS_TIMEOUT_SECONDS` | `3` 秒 | 就绪探针总时限，包含进程启动及 PostgreSQL、Milvus 并行探测 |
-| `HEALTH_REPORT_TTL_SECONDS` | `120` 秒 | 项目健康报告缓存有效期；过期后普通读取返回 `null`，不会自动重扫 |
-| `HEALTH_CHECK_TIMEOUT_SECONDS` | `60` 秒 | 只读检查总时限，包含排队、进程启动、扫描和结果传输 |
-| `HEALTH_CHECK_MAX_CONCURRENT` | `4` | 每个 API worker 的只读检查进程并发上限 |
-| `VITE_KNOWLEDGE_REQUEST_TIMEOUT_MS` | `65000` 毫秒 | 前端文件列表和健康报告请求超时 |
-
-就绪探针结果缓存 1 秒。页面加载、刷新和自动轮询只读取文件入库记录及已有健康报告，不启动完整扫描；没有缓存报告时返回 `null`，页面显示「待检查」，过期报告保留检查时间供参考。「检查索引」通过 `GET /api/projects/{project_id}/index/health?refresh=1` 执行完整扫描，同一 API worker 内、同一项目的并发检查共享任务。检查超时返回 HTTP 503，超时或全部等待客户端断开时结束并回收检查进程。上述只读检查限制不适用于手动补建、修复或定时自动修复。
-
-前端超时应略大于后端只读检查时限，需写入 `frontend-chat/.env.local` 或前端构建环境，根目录 `.env` 对此参数不生效。修改后重新启动或构建前端。自动轮询仅重试报告读取，不反复触发深度检查；切换项目、隐藏知识库页面或退出时取消旧请求。
-
-显式配置不会被静默替换：前端请求超时须为 1～2147483647 的整数毫秒；后端就绪与只读检查超时须为不小于 0.5 秒的有限数值，并发上限须为正整数。生成保存间隔须为不小于 0.1 秒的有限数值，失联判定时间须不小于保存间隔的 3 倍。`LOG_LEVEL` 支持 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`。
-
-### 前端发布
-
-```powershell
-npm --prefix frontend-chat ci
-npm --prefix frontend-chat run build
-```
-
-托管构建产物 `frontend-chat/dist/`，将同域 `/api` 请求转发到后端，并关闭 SSE 响应缓冲。Vite 的开发代理仅在开发服务器中生效。后端监听地址、worker 数、并发、限流和超时参数见 [.env.example](./.env.example)。
-
-### 常见问题
-
-| 现象 | 排查方向 |
-| --- | --- |
-| 后端无法启动 | 检查 PostgreSQL 是否运行、数据库是否创建、账号是否有建表和修改表权限，以及 `JWT_SECRET` 是否已填写 |
-| `/api/health/ready` 返回 503 | 查看响应中的 `checks`，检查存储连接；若进程启动或依赖加载较慢，可适当增大 `READINESS_TIMEOUT_SECONDS` |
-| 就绪检查通过，但问答或入库失败 | 检查模型名称、接口地址、密钥权限及后端日志；就绪检查不验证外部模型服务 |
-| 文档显示「待入库」或索引异常 | 确认文件可提取文本及嵌入服务可用，尝试「补建索引」；在「索引维护」中检查和修复 |
-| 文件列表或健康报告超时 | 检查资料量和存储响应，按需调整前后端检查时限及扫描并发 |
-| 发布后 API 请求失败或回答无法逐步显示 | 检查同域 `/api` 反向代理、SSE 响应缓冲及代理超时配置 |
+- 修改后端配置或提示词后重启后端；修改嵌入模型、切块或解析参数后需重建索引，修改解析代码还需递增 `config/vector_db.yaml` 的 `index_version`。前端环境变量需写入 `frontend-chat/.env.local` 或构建环境，修改后重启或重新构建前端。
+- 源文件默认位于仓库同级的 `<仓库目录名>-data/<账号 ID>/<项目 UUID>/`，可通过 `KNOWLEDGE_STORAGE_ROOT` 指定源码目录之外的绝对路径作为存储根目录。备份需包含源文件、PostgreSQL 和 Milvus 数据。
+- [就绪检查](http://localhost:8000/api/health/ready)仅检测 PostgreSQL 和 Milvus，不验证模型服务。设置 `ENABLE_API_DOCS=true` 并重启后，可访问 [API 文档](http://localhost:8000/docs)。
+- 前端发布：运行 `npm --prefix frontend-chat run build`，托管 `frontend-chat/dist/`，将同域 `/api` 代理到后端，并关闭 SSE 响应缓冲。
 
 ## 开发检查
 
-在项目根目录执行：
-
 ```powershell
+python -s -m pip check
 python -m compileall -q api_server.py auth.py accounts.py chat_agent.py rag utils
-git diff --check
 npm --prefix frontend-chat run build
 ```
 
-Python 编译检查仅验证语法，前端构建包含 TypeScript 类型检查。业务改动还需联调注册登录、改密与注销、项目管理、跨账号访问隔离、上传、双模式问答、停止生成和索引修复；提示词改动需核对模板变量、工具及协议契约，检查引用、无结果和检索失败场景。
-
-回归验证应覆盖错误传递、重试范围、消息与检索协议；存储联测使用独立的临时数据库 schema 和 Milvus 集合，验证后清理测试数据与脚本。错误处理遵循明确边界：外部输入、权限、来源及索引完整性仍须校验；内部必需字段直接按契约读取；异常须向调用方或日志暴露，不能用空结果、默认成功或无依据的兼容分支掩盖。临时故障恢复、取消清理和上传回滚保留各自明确的触发条件。
-
-这一约定参考了 [OpenAI Codex Prompting Guide 的错误处理建议](https://developers.openai.com/cookbook/examples/gpt-5/codex_prompting_guide)，以及[社区对 Codex 过度防御与复杂化的直接讨论](https://www.reddit.com/r/codex/comments/1qa3s7y/any_advice_for_codex_52_thinking_medium_to_calm/)。社区反馈用于识别排查线索，具体修复以本项目调用链与回归结果为依据。
+后端入口为 `api_server.py`，问答逻辑位于 `chat_agent.py` 与 `rag/`；辅助模块位于 `utils/`，前端位于 `frontend-chat/src/`。
 
 ## 许可证
 

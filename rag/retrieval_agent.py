@@ -8,7 +8,7 @@ from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain.chat_models import init_chat_model
 from langchain.tools import tool
 from langchain_core.runnables import RunnableLambda
-from utils.retrieval_protocol import (
+from utils.retrieval.retrieval_protocol import (
     STATUS_EMPTY,
     STATUS_ERROR,
     STATUS_OK,
@@ -17,13 +17,13 @@ from utils.retrieval_protocol import (
     build_retrieval_artifact,
     build_retrieval_content,
 )
-from utils.prompt_loader import render_retrieval_agent_prompt
+from utils.chat.prompt_loader import render_retrieval_agent_prompt
 from rag.vector_store import get_vector_store
-from utils.config_loader import agent_config, get_kb_subagent_max_retrieval_calls
-from utils.logging_config import get_logger
-from utils.pg_lock import project_index_lock_key, shared_section
-from utils.project_paths import knowledge_scope
-from utils.source_evidence import make_source_evidence
+from utils.core.config_loader import agent_config, get_kb_subagent_max_retrieval_calls
+from utils.core.logging_config import get_logger
+from utils.core.pg_lock import project_index_lock_key, shared_section
+from utils.core.project_paths import knowledge_scope
+from utils.retrieval.source_evidence import make_source_evidence
 from langchain.agents import create_agent
 from dotenv import load_dotenv
 load_dotenv(override=True)
@@ -49,13 +49,13 @@ def build_retrieval_subagent(user_id: int, project_id: str):
     def do_retrieval(query: str):
         """从内部知识库检索问题相关片段；知识回答必须先取得本次任务的证据。
 
-        用于内部文档、概念、事实和资料查询，不联网。返回片段不等于回答已有
-        依据，需检查相关性、适用条件和冲突；不足时针对缺口改写查询，最多调用
-        ${kb_subagent_max_retrieval_calls} 次，证据足够就停止。服务故障时停止后续查询。
+        只查询当前项目，不联网、不切换项目或读取全文。检查片段是否支持所问
+        要点，保留适用条件和冲突；不足时定向补查，最多 ${kb_subagent_max_retrieval_calls} 次，
+        空结果和故障也计入。每次一个查询，证据足够就停止，故障后停止补查。
 
         参数：
             query: 非空的自包含问题或关键词，包含用户指定的实体、条件和时间范围；
-                多问题可分次查询。不要把待验证的假设当作确定事实写入查询。
+                多问题可分次查询。待验证的假设用中性表述，文件名查询仍须核对返回的source。
 
         返回值：
             tuple[str, dict]: 模型读取 JSON：顶层 status 为 ok / empty / error，
@@ -113,12 +113,12 @@ def build_retrieval_subagent(user_id: int, project_id: str):
     return CompiledSubAgent(
         name="rag_summary_subagents",
         description=(
-            "当前项目的知识库检索入口。主助手澄清并拆解问题后，每个 task 传入一个自包含检索目标、"
-            "必要的实体、时间范围及回答粒度；可按独立目标委派多个本类子代理。"
-            f"每个子代理最多检索 {max_retrieval_calls} 次，只处理分配的目标，依据片段总结并保留缺证和冲突。返回由代码封装的 "
+            "当前项目的知识库检索入口。每个 task 传入自包含的问题、用户限定的范围、"
+            "场景条件及交付要求；同一对象的相关要点可一起查证。"
+            f"每个子代理最多检索 {max_retrieval_calls} 次，只回答所问事项，保留影响结论的条件和冲突；缺证说明也仅限所问。返回由代码封装的 "
             "kb_retrieval_report，主助手按顶层 status 处理，只用 answer 作事实正文。"
             "sources 是召回文件集合；保留 answer 中每条结论紧随的 [[cite:ID]]，"
-            "由代码将实际引用的证据生成原文页段链接；"
+            "由代码将实际引用的证据生成文末文件来源链接；"
             "无需要求子代理手写报告 JSON。"
         ),
         runnable=RunnableLambda(_invoke_with_report),

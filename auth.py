@@ -17,10 +17,10 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from dotenv import load_dotenv
 
-from utils.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
-from utils.logging_config import get_logger
+from utils.core.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
+from utils.core.logging_config import get_logger
 from rag.index_manifest import ManifestStore
-from utils.upload_tasks import UploadTaskStore
+from utils.indexing.upload_tasks import UploadTaskStore
 
 logger = get_logger(__name__)
 

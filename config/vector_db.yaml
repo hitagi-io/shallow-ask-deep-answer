@@ -4,7 +4,7 @@ embedding_model: qwen3.7-text-embedding-flash
 embedding_endpoint: https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding
 # 索引管线修订号：解析规则或服务端模型行为变化时递增，触发完整重建。
 # 分块参数、嵌入模型与解析依赖版本也会自动计入索引版本指纹。
-index_version: 1
+index_version: 2
 
 # Milvus 配置（通过 Docker 部署 Milvus 服务）
 milvus_uri: "http://localhost:19530"
@@ -19,6 +19,8 @@ separators: ["\n\n", "\n", "? ", "! ", "。", "？", "！", "; ", "；", ": ", "
 
 # 单次 embedding 请求最多提交的块数，每批独立重试。
 embedding_batch_size: 20
+# 单进程所有文档共享请求并发上限，避免多个上传任务叠加冲击模型接口。
+embedding_concurrency: 4
 embedding_connect_timeout_seconds: 5
 embedding_timeout_seconds: 20
 # 包括首次请求，避免上游网络故障时使用 SDK 的长时间等待。

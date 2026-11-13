@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 
 from rag.index_manifest import chunks_match
 from rag.vector_store import get_vector_store
-from utils.knowledge_files import list_supported_files, compute_file_sha256, document_format
-from utils.config_loader import vector_db_config
-from utils.logging_config import get_logger
+from utils.documents.knowledge_files import list_supported_files, compute_file_sha256, document_format
+from utils.core.config_loader import vector_db_config
+from utils.core.logging_config import get_logger
 
 logger = get_logger(__name__)
 

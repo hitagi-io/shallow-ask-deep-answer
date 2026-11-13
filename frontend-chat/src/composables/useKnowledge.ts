@@ -21,6 +21,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   const healthState = useHealthReport()
   const { health, healthNotice, indexStatus } = healthState
   const operation = ref<Operation>('')
+  const updatingProjectId = ref<string | null>(null)
   const deletingName = ref('')
   const dragOver = ref(false)
   const fileInput = ref<HTMLInputElement | null>(null)
@@ -78,11 +79,12 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     healthState.beginRequest()
     cancelReads()
     operation.value = kind
+    if (kind === 'uploading' || kind === 'building' || kind === 'repairing') updatingProjectId.value = id
     clearNotice()
     try { await action(id) }
     catch (error) { if (!isRequestCancelled(error) && !disposed && viewVersion === view) show(errorText(error), 'error') }
     finally {
-      operation.value = ''; deletingName.value = ''
+      operation.value = ''; deletingName.value = ''; updatingProjectId.value = null
       if (!disposed && active.value && viewVersion !== view) void loadKnowledgeState()
     }
   }
@@ -137,24 +139,42 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
       uploadResults.value = Array.from(fileList).map(file => ({ name: file.name, status: 'waiting', detail: '等待上传' }))
       const rows = uploadResults.value
       const picked = Array.from(fileList)
-      for (let index = 0; index < picked.length && !disposed; index++) {
-        const file = picked[index]
-        const row = rows[index]
-        if (!supportsKnowledgeFile(file.name)) { row.status = 'error'; row.detail = `支持的文件类型：${knowledgeFileTypes}`; continue }
-        row.status = 'uploading'; row.detail = '正在上传'
-        try {
-          const result = await uploadFiles(id, [file], () => { row.detail = '传输完成，正在保存' }, uploadAbort.signal)
-          const error = result.errors[0]?.error
-          row.status = result.task_id && !error ? 'queued' : 'error'
-          row.detail = error || (result.task_id ? '已保存，等待后台入库' : '上传未被接受')
-        } catch (error) { row.status = 'error'; row.detail = errorText(error) }
+      let next = 0
+      const sameName = new Map<string, Promise<void>>()
+      async function uploadWorker() {
+        while (next < picked.length && !disposed) {
+          const index = next++
+          const file = picked[index]
+          const row = rows[index]
+          if (!supportsKnowledgeFile(file.name)) { row.status = 'error'; row.detail = `支持的文件类型：${knowledgeFileTypes}`; continue }
+          // 不同文件并发传输；同名覆盖仍按选择顺序提交，含 Windows 大小写等价名。
+          const key = file.name.toLowerCase()
+          const previous = sameName.get(key)
+          let release!: () => void
+          const current = new Promise<void>(resolve => { release = resolve })
+          sameName.set(key, current)
+          try {
+            await previous
+            if (disposed) return
+            row.status = 'uploading'; row.detail = '正在上传'
+            const result = await uploadFiles(id, [file], () => { row.detail = '传输完成，正在保存' }, uploadAbort.signal)
+            const error = result.errors[0]?.error
+            row.status = result.task_id && !error ? 'queued' : 'error'
+            row.detail = error || (result.task_id ? '已保存，等待后台入库' : '上传未被接受')
+          } catch (error) { row.status = 'error'; row.detail = errorText(error) }
+          finally {
+            release()
+            if (sameName.get(key) === current) sameName.delete(key)
+          }
+        }
       }
+      await Promise.all(Array.from({ length: Math.min(3, picked.length) }, uploadWorker))
       if (!disposed) {
         const failures = rows.filter(result => result.status === 'error')
         const succeeded = rows.length - failures.length
         const summary = failures.length
           ? `已提交 ${succeeded} 个文件，上传失败 ${failures.length} 个`
-          : `已保存 ${succeeded} 个文件，后台将自动入库，可继续上传或离开页面`
+          : `已保存 ${succeeded} 个文件，后台将自动入库`
         const details = failures.map(result => `${result.name}：${result.detail}`)
         uploadResults.value = []
         if (projectId.value === id) healthState.reset()
@@ -249,7 +269,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   onUnmounted(() => { disposed = true; cancelReads(); clearTimeout(pollTimer); uploadAbort.abort() })
   function formatHealthTime(iso: string | null) { return iso ? new Date(iso).toLocaleString() : '从未' }
 
-  return { uploadTasks, indexing, taskLoadError, taskCompleted, taskTotal, taskFileDetail, files, filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, loadError, selectFiles, clearNotice,
+  return { updatingProjectId, uploadTasks, indexing, taskLoadError, taskCompleted, taskTotal, taskFileDetail, files, filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, loadError, selectFiles, clearNotice,
     knowledgeLoading, knowledgeBuilding, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput,
     deletingName, health, healthNotice, documentStatus, indexStatus, healthChecking, healthRepairing, healthIssueCount, knowledgeBusy, loadKnowledgeState, onFileSelect,
     onDrop, handleDeleteFile, handleBuild, handleHealthCheck, handleHealthRepair, formatHealthTime }

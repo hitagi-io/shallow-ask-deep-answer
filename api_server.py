@@ -25,18 +25,19 @@ from chat_agent import ChatAgent, PG_CHECKPOINT_POOL_MAX
 from rag.vector_store import get_vector_store
 from rag.index_health import IndexHealth
 from rag.index_manifest import ManifestStore, current_index_version, project_collection_name
-from utils.knowledge_files import list_supported_files
-from utils.source_evidence import SourceVersionChanged, read_source_passage
-from utils.config_loader import vector_db_config
-from utils.project_paths import get_knowledge_dir, get_knowledge_storage_root, scoped_knowledge_file
-from utils.pg_lock import SingleInstanceGuard, exclusive_section, shared_section, project_index_lock_key
-from utils.generation_runner import run_generation
-from utils.health_report_cache import HealthReportCache, HealthReportInvalidated
-from utils.health_scan import HealthScanRunner, ProjectGoneError
-from utils.readiness import check_readiness
-from utils.request_wait import wait_for_client
-from utils.logging_config import configure_logging, get_logger
-from utils.upload_tasks import UploadTaskStore
+from utils.documents.knowledge_files import list_supported_files
+from utils.retrieval.source_evidence import SourceVersionChanged, read_source_passage
+from utils.core.config_loader import vector_db_config
+from utils.core.project_paths import get_knowledge_dir, get_knowledge_storage_root, scoped_knowledge_file
+from utils.core.pg_lock import SingleInstanceGuard, exclusive_section, shared_section, project_index_lock_key
+from utils.chat.generation_runner import run_generation
+from utils.indexing.health_report_cache import HealthReportCache, HealthReportInvalidated
+from utils.indexing.health_scan import HealthScanRunner, ProjectGoneError
+from utils.runtime.readiness import check_readiness
+from utils.runtime.request_wait import wait_for_client
+from utils.runtime.shutdown import ServiceStopping, check_shutdown, request_shutdown, reset_shutdown
+from utils.core.logging_config import configure_logging, get_logger
+from utils.indexing.upload_tasks import UploadTaskStore
 from auth import (
     PASSWORD_MAX_LENGTH,
     PG_CONN,
@@ -132,6 +133,7 @@ def _warn_connection_budget() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    reset_shutdown()
     get_knowledge_storage_root()
     anyio.to_thread.current_default_thread_limiter().total_tokens = THREADPOOL_SIZE
     logger.info(f"[启动] AnyIO 默认线程池并发额度为 {THREADPOOL_SIZE}，工作进程数为 {UVICORN_WORKERS}")
@@ -145,12 +147,14 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        request_shutdown()
         upload_stop.set()
+        logger.info("[关闭] 已通知后台入库停止，等待当前步骤收尾")
         task.cancel()
         for generation_task in list(_generation_tasks):
             generation_task.cancel()
         await asyncio.gather(task, *_generation_tasks, return_exceptions=True)
-        # 等待正在执行的任务结束；取消 to_thread 无法中止索引写入。
+        # 线程在解析/嵌入边界响应停止；等待回滚、状态写回和已提交写入的收尾。
         await asyncio.gather(*upload_workers, return_exceptions=True)
         upload_executor.shutdown(wait=True)
 
@@ -235,7 +239,8 @@ INDEX_READ_LOCK_TIMEOUT_SECONDS = int(os.getenv("INDEX_READ_LOCK_TIMEOUT_SECONDS
 
 def _index_write_section(user_id: int, project_id: str):
     """索引写操作的跨进程互斥段（写入方使用，带等待上限）。"""
-    return exclusive_section(PG_CONN, project_index_lock_key(user_id, project_id), INDEX_WRITE_LOCK_TIMEOUT_SECONDS)
+    return exclusive_section(PG_CONN, project_index_lock_key(user_id, project_id),
+                             INDEX_WRITE_LOCK_TIMEOUT_SECONDS, cancel_check=check_shutdown)
 
 
 def _format_repair_summary(repair: dict) -> str:
@@ -256,6 +261,7 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
     等待下一轮健康检查再试。
     """
     with _index_write_section(user_id, project_id), project_access(user_id, project_id) as project:
+        check_shutdown()
         if project is None:
             return None
         if _upload_task_store.has_active(user_id, project_id):
@@ -264,6 +270,7 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
         max_rounds = vector_db_config["health_auto_repair_max_rounds"]
         report = index_health.check(record_files=True)
         for _ in range(max_rounds):
+            check_shutdown()
             if report["healthy"]:
                 break
             if report["milvus_error"] or report["manifest_error"]:
@@ -273,6 +280,8 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
                 report = index_health.repair()
                 repair = report["repair"]
                 logger.info(f"[索引自动修复] 本轮修复完成：{_format_repair_summary(repair)}")
+            except ServiceStopping:
+                raise
             except Exception as e:
                 logger.error(f"[索引自动修复] 执行失败：{e}")
                 break
@@ -311,6 +320,7 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
         for item in _upload_task_store.items(task_id):
             if item["status"] != "queued":
                 continue
+            check_shutdown()
             _upload_task_store.mark_item_running(task_id, item["id"])
             status = "error"
             overwritten = None
@@ -319,6 +329,7 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
             staged_path = item["staged_path"]
             try:
                 with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
+                    check_shutdown()
                     # 检查队列租约连接，数据库断连导致租约丢失时停止处理。
                     lease.execute("SELECT 1")
                     _ensure_project(current)
@@ -335,6 +346,8 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
                     error = result.get("error")
                     status = "success" if indexed and not error else "error"
                 _invalidate_health(user_id, project_id)
+            except ServiceStopping:
+                raise
             except TimeoutError:
                 error = "索引正被其他操作占用，请稍后重试"
             except HTTPException as exc:
@@ -351,16 +364,24 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
                 task_id, item["id"], status=status, overwritten=overwritten,
                 indexed=indexed, error=error,
             )
+            if error:
+                check_shutdown()
         _upload_task_store.finish(task_id)
-    except Exception:
-        logger.exception("[知识库] 后台上传任务异常 task_id=%s", task_id)
+    except Exception as exc:
+        if isinstance(exc, ServiceStopping):
+            logger.info("[知识库] 后台上传任务已停止 task_id=%s", task_id)
+            error = str(exc)
+        else:
+            logger.exception("[知识库] 后台上传任务异常 task_id=%s", task_id)
+            error = "后台任务异常中断，请重新上传"
         try:
-            _upload_task_store.fail(task_id, "后台任务异常中断，请重新上传")
+            _upload_task_store.fail(task_id, error)
         except Exception:
             logger.exception("[知识库] 后台上传任务状态写回失败 task_id=%s", task_id)
 
 
 def _run_next_upload() -> bool:
+    check_shutdown()
     claimed = _upload_task_store.claim_next()
     if claimed is None:
         return False
@@ -400,6 +421,8 @@ async def _upload_worker_loop(worker_id: int, stop: asyncio.Event, executor: Thr
             worked = await asyncio.get_running_loop().run_in_executor(executor, _run_next_upload)
             if worked:
                 continue
+        except ServiceStopping:
+            return
         except Exception:
             logger.exception("[知识库] 上传 worker=%s 轮询失败", worker_id)
         try:
@@ -852,6 +875,8 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         # 幂等重放和恢复只订阅已有任务，不消耗新的并发槽位或发送额度。
         return StreamingResponse(_generation_events(user["user_id"], req.thread_id, req.request_id, user["auth_version"]),
                                  media_type="text/event-stream", headers=SSE_HEADERS)
+    if req.kb_only and await asyncio.to_thread(_upload_task_store.has_active, user["user_id"], req.project_id):
+        raise HTTPException(status_code=409, detail="项目资料正在入库，请等待完成后再提问；新文件显示“已入库”后才能用于回答")
     if not await asyncio.to_thread(
         consume_rate_limit, "chat", str(user["user_id"]), CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_SECONDS
     ):
@@ -1073,6 +1098,7 @@ def _write_upload_to(file: UploadFile, tmp_path: str) -> None:
 
 @app.post("/api/projects/{project_id}/files/upload", status_code=202)
 def upload_files(files: list[UploadFile] = File(...), project: dict = Depends(require_project)):
+    started = time.monotonic()
     user_id, project_id = project["user_id"], project["id"]
     staged, errors = [], []
     # 项目共享锁防止暂存期间项目被删除；此处不持有索引锁，
@@ -1108,6 +1134,8 @@ def upload_files(files: list[UploadFile] = File(...), project: dict = Depends(re
             for item in staged:
                 _remove_staged_upload(user_id, project_id, item["staged_path"])
             raise
+    logger.info("[上传] 已保存并排队 task_id=%s 文件=%s 保存耗时=%.3fs",
+                task_id, len(staged), time.monotonic() - started)
     return {"task_id": task_id, "errors": errors}
 
 

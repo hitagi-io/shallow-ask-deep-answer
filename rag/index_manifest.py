@@ -12,9 +12,9 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from utils.project_paths import knowledge_scope
-from utils.knowledge_files import document_format
-from utils.source_evidence import chunk_signature, text_digest
+from utils.core.project_paths import knowledge_scope
+from utils.documents.knowledge_files import document_format
+from utils.retrieval.source_evidence import chunk_signature, text_digest
 
 
 def current_index_version(config: dict) -> str:

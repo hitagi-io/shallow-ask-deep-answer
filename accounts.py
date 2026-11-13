@@ -6,7 +6,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
 import auth
-from utils.pg_lock import project_index_lock_key
+from utils.core.pg_lock import project_index_lock_key
 
 
 class AccountError(ValueError):

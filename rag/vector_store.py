@@ -14,11 +14,12 @@ from dotenv import load_dotenv
 from rag.embeddings import DashScopeEmbeddings
 from rag.index_manifest import IndexManifest, ManifestStore, chunks_match, current_index_version, project_collection_name
 from rag.retrieval import HybridRetriever
-from utils.config_loader import vector_db_config
-from utils.knowledge_files import list_supported_files, compute_file_sha256, get_document_loader, document_format
-from utils.source_evidence import SOURCE_FIELDS, chunk_signature, split_located_documents, text_digest
-from utils.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
-from utils.logging_config import get_logger
+from utils.core.config_loader import vector_db_config
+from utils.documents.knowledge_files import list_supported_files, compute_file_sha256, get_document_loader, document_format
+from utils.retrieval.source_evidence import SOURCE_FIELDS, chunk_signature, split_located_documents, text_digest
+from utils.core.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
+from utils.core.logging_config import get_logger
+from utils.runtime.shutdown import ServiceStopping, check_shutdown, interruptible_lock
 
 logger = get_logger(__name__)
 load_dotenv()
@@ -140,8 +141,9 @@ class VectorStore:
             self.knowledge_dir, tuple(vector_db_config["allowed_types"])
         )
         failures = []
-        with self._store_lock:
+        with interruptible_lock(self._store_lock):
             for path in paths:
+                check_shutdown()
                 try:
                     result = self.index_file(path)
                     if result["ok"]:
@@ -150,6 +152,8 @@ class VectorStore:
                         if result.get("content_sha256"):
                             self.manifests.record_files({path: result["content_sha256"]})
                         failures.append({"file": path, "error": result["error"]})
+                except ServiceStopping:
+                    raise
                 except Exception:
                     logger.exception("[向量库] 入库失败 file=%s", os.path.basename(path))
                     failures.append({"file": path, "error": _INDEX_FAIL_GENERIC})
@@ -164,7 +168,7 @@ class VectorStore:
         """
         file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
         result = {"file": file_path, "chunks": None, "ok": False, "error": _INDEX_FAIL_GENERIC}
-        with self._store_lock:
+        with interruptible_lock(self._store_lock):
             sha256 = compute_file_sha256(file_path)
             if sha256 is None:
                 return {**result, "error": "SHA-256 计算失败"}
@@ -179,6 +183,9 @@ class VectorStore:
                 return {**result, "chunks": old.expected_chunks, "ok": True, "error": None}
             try:
                 documents = split_located_documents(loader(file_path), self.splitter)
+                check_shutdown()
+            except ServiceStopping as exc:
+                return {**result, "error": str(exc)}
             except ValueError as exc:
                 logger.warning("[向量库] 文件内容无法解析 file=%s: %s", file_path, exc)
                 return {**result, "error": str(exc)}
@@ -198,6 +205,9 @@ class VectorStore:
             try:
                 # 每批请求由嵌入适配器有限重试。
                 embeddings = self.vector_store.embedding_func.embed_documents(texts)
+                check_shutdown()
+            except ServiceStopping as exc:
+                return {**result, "error": str(exc)}
             except Exception:
                 logger.exception("[向量库] 嵌入失败，停止本次入库 file=%s", os.path.basename(file_path))
                 return result
@@ -302,7 +312,7 @@ class VectorStore:
         """覆盖失败回滚源文件；提交新清单前始终保留旧向量和清单。"""
         file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
         tmp_path = scoped_knowledge_file(self.knowledge_dir, tmp_path)
-        with self._store_lock:
+        with interruptible_lock(self._store_lock):
             existed = os.path.isfile(file_path)
             backup = os.path.join(os.path.dirname(file_path), f".bak_{uuid.uuid4().hex}")
             if existed:
@@ -315,6 +325,8 @@ class VectorStore:
                 raise
             try:
                 result = self.index_file(file_path)
+            except ServiceStopping as exc:
+                result = {"file": file_path, "chunks": None, "ok": False, "error": str(exc)}
             except Exception:
                 logger.exception("[向量库] 覆盖上传入库异常 file=%s", file_path)
                 result = {"file": file_path, "chunks": None, "ok": False, "error": _INDEX_FAIL_GENERIC}
