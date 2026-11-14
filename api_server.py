@@ -1298,7 +1298,7 @@ def repair_index_health(project: dict = Depends(require_project)):
         with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
             _ensure_project(current)
             _ensure_no_uploads(user_id, project_id)
-            report = IndexHealth(user_id, project_id).repair()
+            report = IndexHealth(user_id, project_id).repair(include_pending=True)
             _health_cache(user_id, project_id).set({"report": report})
         return report
     except HTTPException:
@@ -1306,8 +1306,8 @@ def repair_index_health(project: dict = Depends(require_project)):
     except TimeoutError:
         raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
     except Exception:
-        logger.exception("[索引健康检查] 修复失败 project_id=%s", project_id)
-        raise HTTPException(status_code=500, detail="修复失败，请稍后重试")
+        logger.exception("[索引健康检查] 修复与补建失败 project_id=%s", project_id)
+        raise HTTPException(status_code=500, detail="修复与补建失败，请稍后重试")
 
 
 if __name__ == "__main__":

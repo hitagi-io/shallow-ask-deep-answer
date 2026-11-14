@@ -133,8 +133,8 @@ class IndexHealth:
                 for path, digest in state["disk"].items()
             ]}
 
-    def repair(self) -> dict:
-        """按源文件重建异常内容；失败保留清单供重试，绝不据剩余向量补齐清单。"""
+    def repair(self, *, include_pending: bool = False) -> dict:
+        """按源文件修复异常内容；手动维护可同时补建未入库文件，失败保留清单供重试。"""
         with self._lock, self.vector_store._store_lock:
             report, state = self._scan()
             if report["milvus_error"] or report["manifest_error"]:
@@ -162,7 +162,12 @@ class IndexHealth:
                     copies = state["by_identity"].get(identity)
                     if copies:
                         targets[identity] = copies[0]
-            paths = list(dict.fromkeys([*targets.values(), *state["unpublished_files"]]))
+            paths = [*targets.values(), *state["unpublished_files"]]
+            if include_pending:
+                # 同内容的每个文件都需发布索引，不能只补建其中一个副本。
+                paths.extend(path for path, digest in state["disk"].items()
+                             if (digest, document_format(path)) not in state["healthy_keys"])
+            paths = list(dict.fromkeys(paths))
             if paths:
                 failures = self.vector_store.index_pending_files(paths)
                 failed = {item["file"] for item in failures}

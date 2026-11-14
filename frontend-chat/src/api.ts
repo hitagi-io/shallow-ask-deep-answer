@@ -547,13 +547,6 @@ export async function deleteFile(projectId: string, name: string): Promise<void>
   if (!res.ok) throw new Error(await errorMessage(res, '删除失败'))
 }
 
-/** 为尚未记录的知识库内容补建索引。 */
-export async function buildKnowledgeIndex(projectId: string): Promise<{ message: string; failures: { file: string; error: string }[] }> {
-  const res = await apiFetch(`${projectPath(projectId)}/vector/build`, { method: 'POST', headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '构建失败'))
-  return res.json()
-}
-
 export interface HealthIssue {
   type: string
   severity: 'warn' | 'error'
@@ -589,6 +582,6 @@ export async function fetchIndexHealth(projectId: string, refresh = false, optio
 
 export async function repairIndexHealth(projectId: string): Promise<IndexRepairReport> {
   const res = await apiFetch(`${projectPath(projectId)}/index/health/repair`, { method: 'POST', headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '修复失败'))
+  if (!res.ok) throw new Error(await errorMessage(res, '修复与补建失败'))
   return res.json()
 }

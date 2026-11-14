@@ -1,5 +1,5 @@
 import { ref, computed, watch, onMounted, onUnmounted, type Ref } from 'vue'
-import { fetchFiles, fetchUploadTasks, uploadFiles, deleteFile, buildKnowledgeIndex, fetchIndexHealth, repairIndexHealth, isRequestCancelled, type FileItem, type UploadTask } from '../api'
+import { fetchFiles, fetchUploadTasks, uploadFiles, deleteFile, fetchIndexHealth, repairIndexHealth, isRequestCancelled, type FileItem, type UploadTask } from '../api'
 import { useNotice } from './useNotice'
 import { useHealthReport } from './useHealthReport'
 import type { ConfirmAction } from './useConfirmation'
@@ -7,7 +7,7 @@ import { knowledgeFileTypes, supportsKnowledgeFile } from '../utils/knowledgeFor
 import { fileProgressStageCount, transferredPercent, taskFileDetail, taskFilePercent } from '../utils/uploadProgress'
 import type { FileFilter, FileSort, FileSummary } from '../utils/knowledgeFiles'
 
-type Operation = '' | 'loading' | 'uploading' | 'building' | 'checking' | 'repairing' | 'deleting'
+type Operation = '' | 'loading' | 'uploading' | 'checking' | 'repairing' | 'deleting'
 interface UploadResult {
   id: number
   taskId: string | null
@@ -87,7 +87,6 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   const knowledgeBusy = computed(() => operation.value !== '')
   const knowledgeLoading = computed(() => operation.value === 'loading')
   const knowledgeUploading = computed(() => operation.value === 'uploading')
-  const knowledgeBuilding = computed(() => operation.value === 'building')
   const healthChecking = computed(() => operation.value === 'checking')
   const healthRepairing = computed(() => operation.value === 'repairing')
   const healthIssueCount = computed(() => health.value?.issues.length || 0)
@@ -125,7 +124,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     healthState.beginRequest()
     cancelReads()
     operation.value = kind
-    if (kind === 'uploading' || kind === 'building' || kind === 'repairing') updatingProjectId.value = id
+    if (kind === 'uploading' || kind === 'repairing') updatingProjectId.value = id
     clearNotice()
     try { await action(id) }
     catch (error) { if (!isRequestCancelled(error) && !disposed && viewVersion === view) show(errorText(error), 'error') }
@@ -281,22 +280,12 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
       show(`已删除：${name}`, 'success')
     })
   }
-  function handleBuild() {
-    if (indexing.value) return
-    return run('building', async id => {
-      const result = await buildKnowledgeIndex(id)
-      if (projectId.value === id) healthState.reset()
-      await refreshAll(id)
-      const errors = result.failures.map(f => `${f.file.split(/[\\/]/).pop()}：${f.error}`)
-      show([result.message, ...errors].join('；'), errors.length ? 'error' : 'success')
-    })
-  }
   function handleHealthCheck() {
     if (indexing.value) return
     return run('checking', async id => { await refreshHealth(id, true); await refreshFiles(id) })
   }
   async function handleHealthRepair() {
-    if (knowledgeBusy.value || indexing.value || !await confirmAction('立即修复索引？将清理残留向量，并重建分块缺失、损坏或内容陈旧的索引。')) return
+    if (knowledgeBusy.value || indexing.value || !await confirmAction('立即修复并补建索引？将为未入库文件建立索引，修复缺失、损坏或过期的索引，并清理残留分块。')) return
     await run('repairing', async id => {
       const request = healthState.beginRequest()
       let report
@@ -310,7 +299,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
       await refreshFiles(id)
       const repair = report.repair
       const errors = [...repair.ghost_errors, ...repair.re_index_failures.map(f => `${f.file}：${f.error}`)]
-      show(errors.length ? `修复部分失败：${errors.join('；')}` : report.healthy ? '修复完成，索引状态良好' : '修复已执行，仍有异常，请查看检查结果', errors.length || !report.healthy ? 'error' : 'success')
+      show(errors.length ? `修复与补建部分失败：${errors.join('；')}` : report.healthy ? '修复与补建完成，索引状态良好' : '修复与补建已执行，仍有异常，请查看检查结果', errors.length || !report.healthy ? 'error' : 'success')
     })
   }
   // 可见项目只轮询文件元数据和缓存报告，不启动完整性扫描。
@@ -363,7 +352,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   function formatHealthTime(iso: string | null) { return iso ? new Date(iso).toLocaleString() : '从未' }
 
   return { updatingProjectId, uploadTasks, indexing, taskLoadError, files, fileTotal, indexedTotal, matchedFiles, filePage, filePageCount, filesLoading, goToFilePage, search, statusFilter, fileSort, uploadProgress, loadError, selectFiles, clearNotice,
-    knowledgeLoading, knowledgeBuilding, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput,
+    knowledgeLoading, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput,
     deletingName, health, healthNotice, documentStatus, indexStatus, healthChecking, healthRepairing, healthIssueCount, knowledgeBusy, loadKnowledgeState, onFileSelect,
-    onDrop, handleDeleteFile, handleBuild, handleHealthCheck, handleHealthRepair, formatHealthTime }
+    onDrop, handleDeleteFile, handleHealthCheck, handleHealthRepair, formatHealthTime }
 }

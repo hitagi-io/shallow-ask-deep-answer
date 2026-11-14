@@ -11,7 +11,7 @@ import { knowledgeFileAccept, knowledgeFileTypes } from '../utils/knowledgeForma
 import { fileSortLabels, type FileSort } from '../utils/knowledgeFiles'
 const props = defineProps<{ knowledge: ReturnType<typeof useKnowledge>; projects: ReturnType<typeof useProjects> }>()
 const emit = defineEmits<{ back: []; ask: [id: string]; deleted: [id: string] }>()
-const { files, knowledgeLoading, knowledgeBuilding, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput, deletingName, health, healthChecking, healthRepairing, knowledgeBusy, loadKnowledgeState, onFileSelect, onDrop, handleDeleteFile, handleBuild, handleHealthCheck, handleHealthRepair, formatHealthTime } = props.knowledge
+const { files, knowledgeLoading, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput, deletingName, health, healthChecking, healthRepairing, knowledgeBusy, loadKnowledgeState, onFileSelect, onDrop, handleDeleteFile, handleHealthCheck, handleHealthRepair, formatHealthTime } = props.knowledge
 const { fileTotal, indexedTotal, matchedFiles, filePage, filePageCount, filesLoading, goToFilePage, search, statusFilter, fileSort, uploadProgress, loadError, selectFiles, clearNotice } = props.knowledge
 const { healthNotice, documentStatus, indexStatus } = props.knowledge
 const { indexing, taskLoadError } = props.knowledge
@@ -156,7 +156,7 @@ async function removeProject() {
           <div class="health-content">
             <div class="section-heading"><p class="hint">最近检查：{{ formatHealthTime(health?.checked_at || null) }}<br />{{ health?.stats.chunks || 0 }} 个资料片段</p><div class="section-actions">
               <button class="btn btn-secondary btn-small" :disabled="busy || indexing" @click="handleHealthCheck">{{ healthChecking ? '检查中…' : '检查索引' }}</button>
-              <button class="btn btn-secondary btn-small" :disabled="busy || indexing" @click="handleHealthRepair">{{ healthRepairing ? '修复中…' : '修复索引' }}</button>
+              <button class="btn btn-secondary btn-small" :disabled="busy || indexing" @click="handleHealthRepair">{{ healthRepairing ? '处理中…' : '修复与补建' }}</button>
             </div></div>
             <ul v-if="health?.issues.length" class="health-issues"><li v-for="(issue, i) in health.issues" :key="i"><span class="issue-severity" :class="issue.severity">{{ issue.severity === 'error' ? '异常' : '提醒' }}</span><div>{{ issue.title }}（{{ issue.count }}）<p v-if="issue.detail">{{ issue.detail }}</p></div></li></ul>
           </div>
@@ -165,7 +165,6 @@ async function removeProject() {
         <section ref="documentsSection" class="documents-section" aria-labelledby="documents-title" :aria-busy="filesLoading">
           <div class="section-heading"><h3 id="documents-title">项目资料 <span>{{ fileTotal }}</span></h3><div class="section-actions">
             <button class="btn btn-secondary btn-small" :disabled="busy" @click="loadKnowledgeState">{{ knowledgeLoading ? '刷新中…' : '刷新' }}</button>
-            <button class="btn btn-secondary btn-small" :disabled="busy || indexing" @click="handleBuild">{{ knowledgeBuilding ? '补建中…' : '补建索引' }}</button>
           </div></div>
           <div class="file-filters">
             <input v-model="search" class="filter-input" placeholder="搜索全部文档名称" aria-label="搜索文档名称" type="search" maxlength="220" :disabled="busy" />
