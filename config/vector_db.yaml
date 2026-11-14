@@ -9,10 +9,6 @@ index_version: 2
 # Milvus 配置（通过 Docker 部署 Milvus 服务）
 milvus_uri: "http://localhost:19530"
 
-# 此参数透传给 Milvus 客户端；当前固定的 PyMilvus 3.0.2 不使用 pool_size。
-# 调整此值不会改变 gRPC 连接数或并发上限。
-pool_size: 50
-
 chunk_size: 500
 chunk_overlap: 50
 separators: ["\n\n", "\n", "? ", "! ", "。", "？", "！", "; ", "；", ": ", "：", " ", ""]

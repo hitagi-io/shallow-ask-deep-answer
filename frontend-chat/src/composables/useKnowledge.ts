@@ -351,7 +351,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   onUnmounted(() => { disposed = true; cancelReads(); clearTimeout(pollTimer); uploadAbort.abort() })
   function formatHealthTime(iso: string | null) { return iso ? new Date(iso).toLocaleString() : '从未' }
 
-  return { updatingProjectId, uploadTasks, indexing, taskLoadError, files, fileTotal, indexedTotal, matchedFiles, filePage, filePageCount, filesLoading, goToFilePage, search, statusFilter, fileSort, uploadProgress, loadError, selectFiles, clearNotice,
+  return { updatingProjectId, indexing, taskLoadError, files, fileTotal, indexedTotal, matchedFiles, filePage, filePageCount, filesLoading, goToFilePage, search, statusFilter, fileSort, uploadProgress, loadError, selectFiles, clearNotice,
     knowledgeLoading, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput,
     deletingName, health, healthNotice, documentStatus, indexStatus, healthChecking, healthRepairing, healthIssueCount, knowledgeBusy, loadKnowledgeState, onFileSelect,
     onDrop, handleDeleteFile, handleHealthCheck, handleHealthRepair, formatHealthTime }

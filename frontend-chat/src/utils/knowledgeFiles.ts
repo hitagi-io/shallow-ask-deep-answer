@@ -1,3 +1,5 @@
+import { isRecord, isCount } from './validation'
+
 export type FileFilter = 'all' | 'indexed' | 'pending'
 export type FileSort = 'uploaded_desc' | 'uploaded_asc' | 'name_asc' | 'name_desc' | 'pending_first' | 'indexed_first'
 export const fileSortLabels: Record<FileSort, string> = {
@@ -25,12 +27,6 @@ export interface FilePage {
 }
 export const FILE_PAGE_SIZE = 10
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-function isCount(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
-}
 export function parseFileSummary(value: unknown): FileSummary {
   if (!isRecord(value) || !isCount(value.total) || !isCount(value.indexed) || value.indexed > value.total) {
     throw new Error('项目资料统计数据格式无效')

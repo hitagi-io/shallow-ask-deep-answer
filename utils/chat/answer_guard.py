@@ -11,6 +11,8 @@
 固定文案以本模块为唯一来源，提示词模板经 utils.chat.prompt_loader 注入。
 """
 
+from collections.abc import Callable
+
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 
 from utils.retrieval.retrieval_protocol import (
@@ -31,9 +33,8 @@ SEARCH_ERROR_MARKER = "__SEARCH_UNAVAILABLE__"
 SEARCH_EMPTY_MARKER = "__SEARCH_EMPTY__"
 
 COPY_KB_DOWN = "抱歉，知识库暂时无法查询，请稍后再试。"
-COPY_KB_NO_ANSWER = "抱歉，本次未能根据知识库资料给出可靠回答。您可以补充问题描述后重试。"
 COPY_KB_MISS = "当前知识库中未检索到足以回答这个问题的资料。请补充具体对象或相关文档。"
-COPY_KB_UNVERIFIED = COPY_KB_NO_ANSWER
+COPY_KB_UNVERIFIED = "抱歉，本次未能根据知识库资料给出可靠回答。您可以补充问题描述后重试。"
 
 _COPY_BY_WINNER = {
     "kb_down": COPY_KB_DOWN,
@@ -234,21 +235,8 @@ def _is_answer_message(chunk: BaseMessage, metadata: dict) -> bool:
     )
 
 
-def _general_stream(raw_stream, should_stop=None):
+def _general_stream(raw_stream, phase_event: Callable[[str], dict[str, str] | None], should_stop=None):
     """通用模式：只透传回答文本，过滤工具与内部摘要，按工具调用下发阶段提示。"""
-    phase = ""
-
-    def phase_event(name: str) -> dict | None:
-        nonlocal phase
-        if name == phase:
-            return None
-        phase = name
-        return {"type": "phase", "phase": name}
-
-    event = phase_event("thinking")
-    if event:
-        yield event
-
     for chunk, metadata in raw_stream:
         if should_stop is not None and should_stop():
             return
@@ -297,24 +285,22 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
     保证取消能继续传播到 LangGraph / 模型请求，而不是只停在外层包装器。
     """
     try:
-        if not kb_only:
-            yield from _general_stream(raw_stream, should_stop=should_stop)
-            return
+        phase = "thinking"
 
-        guard = AnswerGuard()
-        emitted: list[str] = []
-        phase = ""
-
-        def phase_event(name: str) -> dict | None:
+        def phase_event(name: str) -> dict[str, str] | None:
             nonlocal phase
             if name == phase:
                 return None
             phase = name
             return {"type": "phase", "phase": name}
 
-        event = phase_event("thinking")
-        if event:
-            yield event
+        yield {"type": "phase", "phase": phase}
+        if not kb_only:
+            yield from _general_stream(raw_stream, phase_event, should_stop=should_stop)
+            return
+
+        guard = AnswerGuard()
+        emitted: list[str] = []
 
         for chunk, metadata in raw_stream:
             if should_stop is not None and should_stop():

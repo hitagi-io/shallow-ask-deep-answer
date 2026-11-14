@@ -63,10 +63,7 @@ class VectorStore:
                 analyzer_params=vector_db_config["bm25_analyzer"],
                 function_name="knowledge_bm25",
             ),
-            connection_args={
-                "uri": vector_db_config["milvus_uri"],
-                "pool_size": vector_db_config.get("pool_size", 50),
-            },
+            connection_args={"uri": vector_db_config["milvus_uri"]},
             drop_old=False,
             auto_id=False,
             enable_dynamic_field=True,
@@ -277,13 +274,6 @@ class VectorStore:
                 logger.exception("[向量库] 新清单已提交，旧分块清理失败 file=%s", file_path)
                 return {**result, "ok": False, "error": "新版本已入库，但旧分块清理失败，请执行索引修复"}
             return result
-
-    def pks_by_source(self, file_path: str) -> list:
-        file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
-        return [row["pk"] for row in self.chunk_rows(f"source == {json.dumps(file_path)}")]
-
-    def delete_vectors_by_source(self, file_path: str) -> int:
-        return self._delete_pks(self.pks_by_source(file_path))
 
     def _delete_pks(self, pks: list) -> int:
         if not pks or not self.vector_store.client.has_collection(

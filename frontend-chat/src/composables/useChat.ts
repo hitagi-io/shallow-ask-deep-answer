@@ -136,8 +136,8 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
       conv.nextBefore = page.next_before
       conv.messagesLoaded = true
       if (page.messages.length) conv.hasMessages = true
-      if (page.kbOnly != null) conv.kbOnly = page.kbOnly
       if (page.kbOnly != null) {
+        conv.kbOnly = page.kbOnly
         conv.project_id = page.project_id
         conv.project_name = page.project_name
         conv.project_deleted = page.project_deleted
@@ -160,7 +160,6 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
 
   const current = computed(() => conversations.value[currentId.value])
   const convList = computed(() => Object.values(conversations.value).sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()))
-  const hasEmptyConv = computed(() => convList.value.some(isEmptyConversation))
   const messageOffset = computed(() => Math.max(0, (current.value?.messages.length || 0) - visibleCount.value))
   const visibleMessages = computed(() => current.value?.messages.slice(messageOffset.value) || [])
   const hasEarlier = computed(() => messageOffset.value > 0 || !!current.value?.nextBefore)
@@ -455,7 +454,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     window.removeEventListener('focus', refreshCurrent)
     if (thinkingTimer !== null) clearInterval(thinkingTimer)
   })
-  return { input, inputEl, chatArea, current, currentId, convList, hasEmptyConv, isProcessing, processingIds, reconnecting, stopping, isThinking, thinkingSeconds, thinkingPhase, kbOnly, switchMode, newConversation, selectConversation, deleteConversation, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
+  return { input, inputEl, chatArea, current, currentId, convList, isProcessing, processingIds, reconnecting, stopping, isThinking, thinkingSeconds, thinkingPhase, kbOnly, switchMode, newConversation, selectConversation, deleteConversation, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
     nextCursor, loadingMore, loadMoreConversations, loadMessages, hasEarlier, loading, loadError, initConversations, conversationBusy, renameConversation, following, onScroll, jumpToLatest, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend,
     projectId, selectedProject, projectReady, projectDeleted, selectProject, markProjectDeleted,
     knowledgeBlocked, knowledgeNotice, knowledgeStatus, refreshKnowledgeReadiness, checkingSend }

@@ -1,3 +1,5 @@
+import { isRecord, isCount } from './validation'
+
 export const indexStages = ['preparing', 'parsing', 'splitting', 'embedding', 'writing', 'verifying', 'finalizing'] as const
 export type IndexStage = typeof indexStages[number]
 export interface IndexProgress {
@@ -52,12 +54,6 @@ export function taskFilePercent(file: UploadTask['files'][number]): number {
   return file.progress === null ? transferredPercent : file.progress.percent
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-function isCount(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
-}
 function isNullableText(value: unknown): value is string | null {
   return value === null || typeof value === 'string'
 }

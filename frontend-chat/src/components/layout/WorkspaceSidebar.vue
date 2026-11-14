@@ -105,9 +105,6 @@ function toggleGearMenu() {
   showGearMenu.value = !showGearMenu.value
 }
 
-function navigateToKnowledge() {
-  navigateTo('knowledge')
-}
 function navigateTo(mode: AppMode) {
   showGearMenu.value = false
   emit('navigate', mode)
@@ -137,7 +134,7 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
     <input v-if="searchOpen" id="conversation-search" ref="searchInput" v-model="search" class="filter-input conversation-search" placeholder="搜索已加载的对话" aria-label="搜索已加载的对话" type="search" @keydown.esc.stop="toggleSearch" />
 
     <nav class="workspace-nav" aria-label="工作空间">
-      <button class="knowledge-entry" @click="navigateToKnowledge"><AppIcon name="book" :size="18" /><span>知识库</span><span v-if="healthIssueCount > 0" class="nav-badge">{{ healthIssueCount }}</span><AppIcon v-else name="arrow-up-right" :size="15" /></button>
+      <button class="knowledge-entry" @click="navigateTo('knowledge')"><AppIcon name="book" :size="18" /><span>知识库</span><span v-if="healthIssueCount > 0" class="nav-badge">{{ healthIssueCount }}</span><AppIcon v-else name="arrow-up-right" :size="15" /></button>
     </nav>
     <div class="history-label"><span>最近对话</span><span class="history-count">{{ convList.length }}{{ hasMore ? '+' : '' }}</span></div>
     <ul class="conv-list" aria-label="对话历史">
@@ -186,7 +183,7 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
             <span v-if="healthIssueCount > 0" class="badge">{{ healthIssueCount }}</span>
           </button>
           <div v-if="showGearMenu" id="account-menu" class="menu-panel gear-menu" role="group" aria-label="账号操作">
-            <button @click="navigateToKnowledge">
+            <button @click="navigateTo('knowledge')">
               管理知识库
               <span v-if="healthIssueCount > 0" class="badge menu-badge">{{ healthIssueCount }}</span>
             </button>

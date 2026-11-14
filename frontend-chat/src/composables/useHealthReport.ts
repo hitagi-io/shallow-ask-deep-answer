@@ -2,7 +2,7 @@ import { computed, onScopeDispose, ref } from 'vue'
 import type { HealthReport } from '../api'
 
 // 报告时效按实际检查时间判断，不使用缓存响应的接收时间。
-export const HEALTH_REPORT_MAX_AGE_MS = 5 * 60_000
+const HEALTH_REPORT_MAX_AGE_MS = 5 * 60_000
 type StatusTone = 'neutral' | 'success' | 'warning' | 'error'
 interface DisplayStatus { label: string; tone: StatusTone }
 
@@ -54,6 +54,6 @@ export function useHealthReport() {
     return { label: '现有索引完整', tone: 'success' }
   })
 
-  return { health, healthError, healthExpired, healthNotice, indexStatus,
+  return { health, healthNotice, indexStatus,
     beginRequest, acceptReport, rejectReport, reset }
 }
