@@ -57,7 +57,7 @@ async function handleSubmit() {
 <template>
   <div class="auth-page">
     <div class="auth-layout">
-      <div class="auth-brand"><span class="auth-brand-icon"><BrandMark /></span><span>浅问深答</span><span class="auth-brand-caption">私有知识工作台</span></div>
+      <div class="auth-brand"><span class="brand-tile"><BrandMark /></span><span>浅问深答</span><span class="auth-brand-caption">私有知识工作台</span></div>
       <section class="auth-intro" aria-labelledby="brand-title">
         <div class="intro-copy">
           <p class="intro-eyebrow">让知识，成为你的答案</p>
@@ -85,21 +85,21 @@ async function handleSubmit() {
       <AppNotice v-if="authSuccess" class="auth-notice" tone="success">{{ authSuccess }}</AppNotice>
       <AppNotice v-if="authError" class="auth-notice" tone="error">{{ authError }}</AppNotice>
 
-      <form @submit.prevent="handleSubmit" class="auth-form" :aria-busy="authLoading">
+      <form @submit.prevent="handleSubmit" class="form-stack auth-form" :aria-busy="authLoading">
         <div class="auth-field">
           <label for="auth-username">用户名</label>
-          <input id="auth-username" v-model="authUsername" type="text" :placeholder="authMode === 'login' ? '请输入用户名' : '设置用户名，2–50 个字符'" autocomplete="username" :minlength="authMode === 'register' ? 2 : undefined" maxlength="50" required :disabled="authLoading" />
+          <input class="filter-input input-large" id="auth-username" v-model="authUsername" type="text" :placeholder="authMode === 'login' ? '请输入用户名' : '设置用户名，2–50 个字符'" autocomplete="username" :minlength="authMode === 'register' ? 2 : undefined" maxlength="50" required :disabled="authLoading" />
         </div>
         <div class="auth-field">
           <label for="auth-password">密码</label>
-          <input id="auth-password" v-model="authPassword" type="password" :placeholder="authMode === 'login' ? '请输入密码' : '设置你的登录密码'" :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'" :aria-describedby="authMode === 'register' ? 'password-hint' : undefined" :minlength="authMode === 'register' ? 10 : undefined" maxlength="128" required :disabled="authLoading" />
+          <input class="filter-input input-large" id="auth-password" v-model="authPassword" type="password" :placeholder="authMode === 'login' ? '请输入密码' : '设置你的登录密码'" :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'" :aria-describedby="authMode === 'register' ? 'password-hint' : undefined" :minlength="authMode === 'register' ? 10 : undefined" maxlength="128" required :disabled="authLoading" />
           <p v-if="authMode === 'register'" id="password-hint" class="field-hint">10–128 个字符，包含英文字母、数字和特殊符号。</p>
         </div>
         <div v-if="authMode === 'register'" class="auth-field">
           <label for="auth-password-confirm">确认密码</label>
-          <input id="auth-password-confirm" v-model="authPassword2" type="password" placeholder="请再次输入密码" autocomplete="new-password" maxlength="128" required :disabled="authLoading" />
+          <input class="filter-input input-large" id="auth-password-confirm" v-model="authPassword2" type="password" placeholder="请再次输入密码" autocomplete="new-password" maxlength="128" required :disabled="authLoading" />
         </div>
-        <button type="submit" class="btn btn-primary btn-auth" :disabled="authLoading">
+        <button type="submit" class="btn btn-primary btn-large btn-auth" :disabled="authLoading">
           <span v-if="authLoading" class="auth-spinner" aria-hidden="true"></span>
           {{ authLoading ? '处理中…' : (authMode === 'login' ? '登录工作台' : '创建账号') }}
           <AppIcon v-if="!authLoading" name="arrow-up-right" :size="17" />
@@ -112,61 +112,52 @@ async function handleSubmit() {
 </template>
 
 <style scoped>
-.auth-page { background: var(--canvas); padding: 48px 32px; }
-.auth-layout { --auth-inset: 38px; width: min(1060px, 100%); display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); align-items: stretch; column-gap: clamp(40px, 7vw, 112px); row-gap: 28px; margin: auto; }
+.auth-page { padding: var(--page-gutter); }
+.auth-layout { --auth-inset: 32px; width: min(1060px, 100%); display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); align-items: stretch; column-gap: clamp(40px, 7vw, 112px); row-gap: 28px; margin: auto; }
 /* 两列共用标题区域并对齐内容边缘，避免文字尺寸不同导致错位。 */
 .auth-intro { display: flex; flex-direction: column; padding: calc(var(--auth-inset) + 1px) 0; }
-.auth-brand { grid-column: 1 / -1; display: flex; align-items: center; gap: 11px; font-size: 18px; font-weight: 650; letter-spacing: -.4px; }
-.auth-brand-icon { display: grid; place-items: center; width: 42px; height: 42px; border: 1px solid var(--accent-border); border-radius: 12px; background: var(--accent-soft); }
-.auth-brand-icon :deep(.brand-mark) { color: var(--accent); }
-.auth-brand-caption { padding-left: 14px; border-left: 1px solid var(--line-strong); color: var(--muted); font-size: 12px; font-weight: 400; letter-spacing: 0; }
+.auth-brand { grid-column: 1 / -1; display: flex; align-items: center; gap: 11px; font-size: var(--font-heading); font-weight: 600; letter-spacing: -.4px; }
+.auth-brand-caption { padding-left: 14px; border-left: 1px solid var(--line-strong); color: var(--muted); font-size: var(--font-caption); font-weight: 400; letter-spacing: 0; }
 .intro-copy { margin: 0 0 36px; }
-.intro-eyebrow, .auth-card-eyebrow { margin: 0 0 14px; color: var(--accent); font-size: 12px; font-weight: 600; letter-spacing: 1.2px; }
+.intro-eyebrow, .auth-card-eyebrow { margin: 0 0 14px; color: var(--accent); font-size: var(--font-caption); font-weight: 600; letter-spacing: 1.2px; }
 .intro-copy h1 { margin: 0; color: var(--text); font-size: clamp(32px, 3.3vw, 43px); line-height: 1.5; font-weight: 600; letter-spacing: -1.4px; }
-.intro-description { margin: 21px 0 0; color: var(--muted); font-size: 15px; line-height: 1.9; }
+.intro-description { margin: 21px 0 0; color: var(--muted); font-size: var(--font-reading); line-height: 1.9; }
 .intro-features { display: grid; gap: 22px; margin-top: auto; padding-top: 28px; border-top: 1px solid var(--line); }
 .intro-feature { display: flex; align-items: center; gap: 14px; }
-.feature-icon { display: grid; place-items: center; flex-shrink: 0; width: 40px; height: 40px; border: 1px solid var(--line); border-radius: 12px; color: var(--accent); background: var(--bg); }
-.intro-feature h2 { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
-.intro-feature p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.feature-icon { display: grid; place-items: center; flex-shrink: 0; width: 40px; height: 40px; border: 1px solid var(--line); border-radius: var(--radius-card); color: var(--accent); background: var(--bg); }
+.intro-feature h2 { margin: 0 0 4px; font-size: var(--font-body); font-weight: 600; }
+.intro-feature p { margin: 0; color: var(--muted); font-size: var(--font-caption); line-height: 1.7; }
 .auth-card { width: 100%; padding: var(--auth-inset); border: 1px solid var(--line); border-radius: var(--radius-panel); background: var(--bg); box-shadow: var(--shadow-md); }
-.auth-card-heading h2 { margin: 0; font-size: 26px; line-height: 1.4; letter-spacing: -.7px; font-weight: 600; }
-.auth-card-heading > p:last-child { margin: 10px 0 0; font-size: 13px; line-height: 1.7; color: var(--muted); }
+.auth-card-heading h2 { margin: 0; font-size: var(--font-title); line-height: 1.4; font-weight: 600; }
+.auth-card-heading > p:last-child { margin: 10px 0 0; font-size: var(--font-small); line-height: 1.7; color: var(--muted); }
 .auth-card-eyebrow { letter-spacing: .5px; margin-bottom: 10px; }
-.auth-tabs { display: flex; padding: 4px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-control); margin: 28px 0 24px; }
-.auth-tabs button { flex: 1; min-height: 36px; padding: 7px 10px; font-size: 13px; color: var(--muted); border-radius: 7px; transition: color var(--duration-fast), background var(--duration-fast); }
+.auth-tabs { display: flex; padding: 4px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-control); margin: 24px 0; }
+.auth-tabs button { flex: 1; min-height: var(--control-small); padding: 6px 12px; line-height: 20px; font-size: var(--font-small); color: var(--muted); border-radius: var(--radius-small); transition: color var(--duration-fast), background var(--duration-fast); }
 .auth-tabs button:hover:not(:disabled) { color: var(--accent); }
 .auth-tabs button.active { color: var(--accent); background: var(--bg); font-weight: 600; box-shadow: var(--shadow-sm); }
-.auth-form { display: flex; flex-direction: column; gap: 19px; }
+.auth-form { gap: 20px; }
 .auth-field { display: grid; gap: 8px; }
-.auth-field label { font-size: 13px; font-weight: 550; }
-.auth-field input { width: 100%; min-height: 46px; padding: 11px 13px; border: 1px solid var(--line-strong); border-radius: var(--radius-control); font-size: 14px; background: var(--bg); transition: border-color var(--duration-fast), box-shadow var(--duration-fast); }
-.auth-field input:hover:not(:disabled) { border-color: var(--accent-border); }
-.auth-field input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
-.field-hint { margin: 0; font-size: 12px; line-height: 1.7; color: var(--muted); }
-.btn-auth { min-height: 46px; margin-top: 5px; padding: 11px 16px; gap: 10px; }
+.auth-field input { width: 100%; }
+.btn-auth { margin-top: 4px; }
 .auth-notice { margin-bottom: 16px; }
-.auth-footer { display: flex; align-items: center; justify-content: center; gap: 7px; margin: 24px 0 0; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+.auth-footer { display: flex; align-items: center; justify-content: center; gap: 7px; margin: 24px 0 0; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: var(--font-caption); }
 .auth-spinner { width: 15px; height: 15px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
 @media (max-width: 880px) {
   .auth-layout { --auth-inset: 28px; column-gap: 36px; }
   .auth-brand-caption { display: none; }
 }
 @media (max-width: 680px) {
-  .auth-page { padding: 28px 20px; }
   .auth-layout { display: flex; flex-direction: column; gap: 24px; max-width: 440px; }
   .auth-intro { width: 100%; padding: 0; }
-  .auth-brand { justify-content: center; font-size: 18px; }
+  .auth-brand { justify-content: center; font-size: var(--font-heading); }
   .auth-brand-caption { display: inline; }
   .intro-copy { margin: 0; text-align: center; }
   .intro-eyebrow, .intro-description, .intro-features { display: none; }
   .intro-copy h1 { font-size: 22px; letter-spacing: -.5px; line-height: 1.7; }
   .intro-copy h1 br { display: none; }
-  .auth-card { padding: 28px 24px; }
-  .auth-card-heading h2 { font-size: 24px; }
+  .auth-card { padding: 24px; }
 }
 @media (max-width: 380px) {
-  .auth-page { padding: 24px 14px; }
   .auth-card { padding: 24px 20px; }
   .auth-brand-caption { display: none; }
   .intro-copy h1 { font-size: 20px; }

@@ -16,6 +16,7 @@ import { useConfirmation } from '../composables/useConfirmation'
 const props = defineProps<{ user: UserInfo }>()
 const emit = defineEmits<{ logout: []; userUpdated: [user: UserInfo]; accountDeleted: []; passwordChanged: [] }>()
 const MODE_KEY = `shallow_ask_deep_answer_mode_${props.user.id}`
+const PROJECT_KEY = `shallow_ask_deep_answer_project_${props.user.id}`
 // 仅刷新时恢复页面；新进入或恢复标签页时默认打开问答首页。
 const navigation = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined
 const savedMode = sessionStorage.getItem(MODE_KEY)
@@ -27,7 +28,13 @@ const sidebarCollapsed = ref(false)
 const sidebarToggle = ref<HTMLButtonElement | null>(null)
 const confirmation = useConfirmation()
 const { message: confirmationMessage } = confirmation
-const projects = useProjects(confirmation.ask)
+const projects = useProjects(confirmation.ask,
+  navigation?.type === 'reload' && mode.value === 'knowledge' ? sessionStorage.getItem(PROJECT_KEY) : null)
+// 项目列表加载成功后再恢复选择，已删除或无权访问的项目不会被重新打开。
+watch([projects.selectedId, projects.projects], ([id]) => {
+  if (id) sessionStorage.setItem(PROJECT_KEY, id)
+  else sessionStorage.removeItem(PROJECT_KEY)
+})
 const knowledge = useKnowledge(projects.selectedId, computed(() => mode.value === 'knowledge'), confirmation.ask)
 const chat = useChat(props.user.id, projects.projects, confirmation.ask, knowledge.updatingProjectId, computed(() => mode.value === 'chat'))
 const { currentId, convList, processingIds } = chat
@@ -84,7 +91,7 @@ async function logout() {
       @close="closeSidebar" @navigate="navigate" @new-conversation="newConversation"
       @select-conversation="selectConversation" @delete-conversation="chat.deleteConversation" @logout="logout" />
     <main class="main" :inert="mode === 'chat' && sidebarOpen">
-        <button v-if="mode === 'chat'" ref="sidebarToggle" class="mobile-menu" :class="{ 'desktop-visible': sidebarCollapsed }" aria-label="展开侧边栏" title="展开侧边栏" @click="openSidebar">
+        <button v-if="mode === 'chat'" ref="sidebarToggle" class="icon-button icon-button-large mobile-menu" :class="{ 'desktop-visible': sidebarCollapsed }" aria-label="展开侧边栏" title="展开侧边栏" @click="openSidebar">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m4-11 3 3-3 3"/></svg>
         </button>
       <ChatView v-if="mode === 'chat'" :chat="chat" :projects="projects" @manage="navigate('knowledge')" />
@@ -95,22 +102,20 @@ async function logout() {
   </div>
   <AppDialog v-if="confirmationMessage" title="确认操作" compact @close="confirmation.settle(false)">
     <p class="confirmation-copy">{{ confirmationMessage }}</p>
-    <div class="confirmation-actions"><button class="btn btn-secondary" autofocus @click="confirmation.settle(false)">取消</button><button class="btn btn-primary" @click="confirmation.settle(true)">确认</button></div>
+    <div class="dialog-actions"><button class="btn btn-secondary" autofocus @click="confirmation.settle(false)">取消</button><button class="btn btn-primary" @click="confirmation.settle(true)">确认</button></div>
   </AppDialog>
 </template>
 
 <style scoped>
-.confirmation-copy { font-size: 14px; line-height: 1.8; overflow-wrap: anywhere; }
-.confirmation-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
+.confirmation-copy { font-size: var(--font-body); line-height: 1.8; overflow-wrap: anywhere; }
 .layout { display: flex; height: 100vh; height: 100dvh; background: var(--canvas); }
 .main { position: relative; flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
 .mobile-menu, .sidebar-backdrop { display: none; }
-.mobile-menu { position: absolute; top: 18px; left: 20px; z-index: 10; place-items: center; width: 36px; height: 36px; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--bg); color: var(--muted); transition: background-color var(--duration-fast); }
+.mobile-menu { position: absolute; top: 18px; left: 20px; z-index: 10; place-items: center; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--bg); color: var(--muted); transition: background-color var(--duration-fast); }
 .mobile-menu.desktop-visible { display: grid; }
 .mobile-menu:hover { background: var(--hover); }
 @media (max-width: 760px) {
   .sidebar-backdrop { display: block; position: fixed; inset: 0; background: var(--overlay); backdrop-filter: blur(3px); z-index: 45; }
-  .mobile-menu { display: grid; place-items: center; left: 16px; flex-shrink: 0; }
-  .mobile-menu:hover { background: var(--hover); }
+  .mobile-menu { display: grid; top: 16px; left: 16px; }
 }
 </style>

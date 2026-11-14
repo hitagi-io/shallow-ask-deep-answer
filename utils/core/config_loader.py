@@ -89,6 +89,9 @@ def validate_embedding_config(config: dict) -> None:
     concurrency = config["embedding_concurrency"]
     if type(concurrency) is not int or not 1 <= concurrency <= 16:
         raise ValueError("embedding_concurrency 必须为 1～16 的整数")
+    reserved = config.get("embedding_query_reserved_slots")
+    if type(reserved) is not int or not 1 <= reserved < concurrency:
+        raise ValueError("embedding_query_reserved_slots 必须为小于 embedding_concurrency 的正整数")
 
 
 agent_config=load_config('agent.yaml')

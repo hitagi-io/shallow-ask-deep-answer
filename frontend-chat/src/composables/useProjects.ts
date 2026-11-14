@@ -2,7 +2,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { deleteProject, fetchProjects, saveProject, type Project } from '../api'
 import type { ConfirmAction } from './useConfirmation'
 
-export function useProjects(confirmAction: ConfirmAction) {
+export function useProjects(confirmAction: ConfirmAction, initialSelectedId: string | null = null) {
   const projects = ref<Project[]>([])
   const selectedId = ref<string | null>(null)
   const selected = computed(() => projects.value.find(project => project.id === selectedId.value) || null)
@@ -19,8 +19,10 @@ export function useProjects(confirmAction: ConfirmAction) {
     try {
       const result = await fetchProjects()
       if (disposed) return
+      const selection = selectedId.value ?? initialSelectedId
       projects.value = result
-      if (!result.some(project => project.id === selectedId.value)) selectedId.value = null
+      selectedId.value = result.some(project => project.id === selection) ? selection : null
+      initialSelectedId = null
     } catch (value) { if (!disposed) error.value = errorText(value) }
     finally { loading.value = false }
   }

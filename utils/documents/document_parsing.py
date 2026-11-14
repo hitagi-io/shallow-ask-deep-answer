@@ -15,6 +15,7 @@ from PIL import Image, ImageSequence
 from utils.documents.document_text import clean_text, document, table_documents
 from utils.documents.document_ocr import ocr_documents
 from utils.runtime.shutdown import check_shutdown, interruptible_lock
+from utils.indexing.progress import UnitProgressCallback
 
 _pdf_lock = threading.Lock()
 
@@ -61,8 +62,11 @@ def _read_utf8(path):
         raise ValueError("TXT 和 Markdown 必须使用 UTF-8 编码，请转换编码后上传") from exc
 
 
-def load_text(path):
-    return document(_read_utf8(path), path)
+def load_text(path, *, on_progress: UnitProgressCallback | None = None):
+    result = document(_read_utf8(path), path)
+    if on_progress is not None:
+        on_progress(1, 1)
+    return result
 
 
 class _HTMLText(HTMLParser):
@@ -119,7 +123,7 @@ def _inline_text(token):
     return "".join(parser.parts)
 
 
-def load_markdown(path):
+def load_markdown(path, *, on_progress: UnitProgressCallback | None = None):
     from markdown_it import MarkdownIt
 
     text = _read_utf8(path)
@@ -198,6 +202,8 @@ def load_markdown(path):
             append_part(_inline_text(token))
         index += 1
     flush(len(text.splitlines()))
+    if on_progress is not None:
+        on_progress(1, 1)
     return result
 
 
@@ -208,7 +214,7 @@ def _inside(obj, bbox):
 
 
 @_serial_pdf
-def load_pdf(path):
+def load_pdf(path, *, on_progress: UnitProgressCallback | None = None):
     import pdfplumber
     import pypdfium2 as pdfium
 
@@ -275,14 +281,17 @@ def load_pdf(path):
                 if rendered_image is not None:
                     rendered_image.close()
                 original_page.close()
+            if on_progress is not None:
+                on_progress(page_index + 1, len(pdf.pages))
     return result
 
 
-def _docx_blocks(container, path, prefix, texts, *, cell_content=False):
+def _docx_blocks(container, path, prefix, texts, *, cell_content=False, on_progress: UnitProgressCallback | None = None):
     from docx.table import Table
 
     result, preceding = [], []
-    for index, block in enumerate(container.iter_inner_content(), 1):
+    blocks = list(container.iter_inner_content())
+    for index, block in enumerate(blocks, 1):
         check_shutdown()
         locator = f"{prefix} · 内容块 {index}"
         if isinstance(block, Table):
@@ -312,6 +321,8 @@ def _docx_blocks(container, path, prefix, texts, *, cell_content=False):
             if text.strip():
                 preceding.append(text)
             result.extend(_docx_images(block._p, container.part, path, locator))
+        if on_progress is not None:
+            on_progress(index, len(blocks))
     return result
 
 
@@ -336,13 +347,13 @@ def _embedded_ocr(blob, content_type, path, locator):
         return ocr_documents(image, path, locator)
 
 
-def load_docx(path):
+def load_docx(path, *, on_progress: UnitProgressCallback | None = None):
     from docx import Document
     from utils.documents.docx_numbering import DocxNumbering
 
     _check_package(path)
     doc = Document(path)
-    result = _docx_blocks(doc, path, "正文", DocxNumbering(doc).paragraph_texts(doc))
+    parts = [(doc, "正文")]
     seen = set()
     for index, section in enumerate(doc.sections, 1):
         for name in ("header", "first_page_header", "even_page_header", "footer", "first_page_footer", "even_page_footer"):
@@ -353,8 +364,18 @@ def load_docx(path):
             if key not in seen:
                 seen.add(key)
                 variant = "首页" if name.startswith("first") else "偶数页" if name.startswith("even") else "默认"
-                texts = DocxNumbering(doc).paragraph_texts(part)
-                result.extend(_docx_blocks(part, path, f"第 {index} 节 · {variant}{'页眉' if 'header' in name else '页脚'}", texts))
+                parts.append((part, f"第 {index} 节 · {variant}{'页眉' if 'header' in name else '页脚'}"))
+    total = sum(sum(1 for _ in part.iter_inner_content()) for part, _ in parts)
+    completed = 0
+    result = []
+    for part, locator in parts:
+        def report_part(count: int, _part_total: int) -> None:
+            if on_progress is not None:
+                on_progress(completed + count, total)
+
+        texts = DocxNumbering(doc).paragraph_texts(part)
+        result.extend(_docx_blocks(part, path, locator, texts, on_progress=report_part))
+        completed += sum(1 for _ in part.iter_inner_content())
     return result
 
 
@@ -407,7 +428,7 @@ def _open_xlsx(path, *, data_only):
             ) from exc
 
 
-def load_xlsx(path):
+def load_xlsx(path, *, on_progress: UnitProgressCallback | None = None):
     from openpyxl.drawing.spreadsheet_drawing import AbsoluteAnchor
 
     _check_package(path)
@@ -421,12 +442,14 @@ def load_xlsx(path):
     try:
         if sum(sheet.max_row * sheet.max_column for sheet in book) > _settings()["max_sheet_cells"]:
             raise ValueError("工作簿单元格范围超过解析上限，请删除多余空白行列或拆分文件")
+        total = sum(sheet.max_row + len(sheet._images) for sheet in book)
+        completed = 0
         for sheet in book:
             check_shutdown()
             first = ""
             merged = {sheet.cell(area.min_row, area.min_col).coordinate: str(area)
                       for area in sheet.merged_cells.ranges}
-            for row in sheet.iter_rows():
+            for row in sheet.iter_rows(min_row=1, max_row=sheet.max_row):
                 check_shutdown()
                 values = []
                 for cell in row:
@@ -435,6 +458,9 @@ def load_xlsx(path):
                         merge = merged.get(cell.coordinate)
                         values.append(f"{merge or cell.coordinate}: {value}")
                 if not values:
+                    completed += 1
+                    if on_progress is not None:
+                        on_progress(completed, total)
                     continue
                 text = "；".join(values)
                 prefix = f"工作表: {sheet.title}\n"
@@ -444,6 +470,9 @@ def load_xlsx(path):
                     first = text
                 result.extend(document(prefix + text, path,
                                        f"工作表「{sheet.title}」 · 第 {row[0].row} 行 · {row[0].coordinate}:{row[-1].coordinate}"))
+                completed += 1
+                if on_progress is not None:
+                    on_progress(completed, total)
             # openpyxl 暂无公开图片迭代接口；图片锚点使用工作簿内的原始位置。
             for number, picture in enumerate(sheet._images, 1):
                 if isinstance(picture.anchor, AbsoluteAnchor):
@@ -453,6 +482,9 @@ def load_xlsx(path):
                     position = f"第 {anchor.row + 1} 行，第 {anchor.col + 1} 列"
                 with Image.open(BytesIO(picture._data())) as image:
                     result.extend(ocr_documents(image, path, f"工作表「{sheet.title}」 · 图片 {number}（{position}）"))
+                completed += 1
+                if on_progress is not None:
+                    on_progress(completed, total)
     finally:
         book.close()
         cached.close()
@@ -519,7 +551,7 @@ def _slide_shapes(shapes, path, locator):
     return result
 
 
-def load_pptx(path):
+def load_pptx(path, *, on_progress: UnitProgressCallback | None = None):
     from pptx import Presentation
 
     _check_package(path)
@@ -533,10 +565,12 @@ def load_pptx(path):
         result.extend(_slide_shapes(slide.shapes, path, locator))
         if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
             result.extend(document(slide.notes_slide.notes_text_frame.text, path, f"{locator} · 演讲者备注"))
+        if on_progress is not None:
+            on_progress(index, len(deck.slides))
     return result
 
 
-def load_image(path):
+def load_image(path, *, on_progress: UnitProgressCallback | None = None):
     result = []
     with Image.open(path) as image:
         if getattr(image, "n_frames", 1) > _settings()["max_pages"]:
@@ -544,6 +578,8 @@ def load_image(path):
         for index, frame in enumerate(ImageSequence.Iterator(image), 1):
             check_shutdown()
             result.extend(ocr_documents(frame, path, f"图片第 {index} 帧"))
+            if on_progress is not None:
+                on_progress(index, getattr(image, "n_frames", 1))
     if not result:
         raise ValueError("图片中未识别到文字，请上传清晰的文字图片")
     return result

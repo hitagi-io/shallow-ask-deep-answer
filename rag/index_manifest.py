@@ -14,7 +14,9 @@ from psycopg.types.json import Jsonb
 
 from utils.core.project_paths import knowledge_scope
 from utils.documents.knowledge_files import document_format
+from utils.documents.file_listing import KnowledgeFile
 from utils.retrieval.source_evidence import chunk_signature, text_digest
+from utils.indexing.progress import UnitProgressCallback
 
 
 def current_index_version(config: dict) -> str:
@@ -66,7 +68,7 @@ class IndexManifest:
         return replace(self, state="ready")
 
 
-def chunks_match(manifest: IndexManifest, rows: list[dict]) -> bool:
+def chunks_match(manifest: IndexManifest, rows: list[dict], *, on_progress: UnitProgressCallback | None = None) -> bool:
     """比较块数、唯一序号、代次和实际文本；不能只信任向量中的哈希元数据。"""
     expected = manifest.expected_chunks
     if expected <= 0 or len(manifest.chunk_hashes) != expected or len(rows) != expected:
@@ -93,6 +95,8 @@ def chunks_match(manifest: IndexManifest, rows: list[dict]) -> bool:
                 return False
         except (KeyError, TypeError, ValueError):
             return False
+        if on_progress is not None:
+            on_progress(len(seen), expected)
     return True
 
 
@@ -246,7 +250,7 @@ class ManifestStore:
         with self._connect() as conn:
             self._record_files(conn, files)
 
-    def file_statuses(self, paths: list[str], index_version: str) -> list[dict]:
+    def file_statuses(self, paths: tuple[str, ...], index_version: str) -> list[KnowledgeFile]:
         """返回已记录的入库状态；完整性由独立的深度检查报告表达。"""
         with self._connect() as conn:
             rows = conn.execute("""
@@ -261,7 +265,7 @@ class ManifestStore:
                 WHERE f.namespace = %s
             """, (self.namespace,)).fetchall()
         records = {os.path.normcase(row["source"]): row for row in rows}
-        files = []
+        files: list[KnowledgeFile] = []
         for path in paths:
             try:
                 info = os.stat(path)

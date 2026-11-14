@@ -5,6 +5,8 @@ import math
 import threading
 import time
 from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import ExitStack
+from typing import Literal
 
 from langchain_core.embeddings import Embeddings
 
@@ -12,9 +14,14 @@ from utils.core.dashscope_client import DashScopeRequestError, make_client, requ
 from utils.core.config_loader import vector_db_config, validate_embedding_config
 from utils.core.logging_config import get_logger
 from utils.runtime.shutdown import check_shutdown, interruptible_lock
+from utils.indexing.progress import UnitProgressCallback
 
 logger = get_logger(__name__)
+_TextType = Literal["document", "query"]
 _request_slots = threading.BoundedSemaphore(vector_db_config["embedding_concurrency"])
+_document_request_slots = threading.BoundedSemaphore(
+    vector_db_config["embedding_concurrency"] - vector_db_config["embedding_query_reserved_slots"]
+)
 
 
 class DashScopeEmbeddings(Embeddings):
@@ -23,6 +30,7 @@ class DashScopeEmbeddings(Embeddings):
         self.batch_size = config["embedding_batch_size"]
         validate_embedding_config(config)
         self.concurrency = config["embedding_concurrency"]
+        self.document_concurrency = self.concurrency - config["embedding_query_reserved_slots"]
         if not isinstance(self.model, str) or not self.model.strip():
             raise ValueError("embedding_model 必须为非空字符串")
         if type(self.batch_size) is not int or self.batch_size <= 0:
@@ -34,8 +42,12 @@ class DashScopeEmbeddings(Embeddings):
             "max_attempts": config["embedding_max_attempts"],
         })
 
-    def _embed_batch(self, client, batch: list[str], text_type: str, stopped: threading.Event) -> list[list[float]]:
-        with interruptible_lock(_request_slots):
+    def _embed_batch(self, client, batch: list[str], text_type: _TextType, stopped: threading.Event) -> list[list[float]]:
+        with ExitStack() as slots:
+            # 先取得入库名额，避免等待中的入库请求占用提问预留的全局名额。
+            if text_type == "document":
+                slots.enter_context(interruptible_lock(_document_request_slots))
+            slots.enter_context(interruptible_lock(_request_slots))
             if stopped.is_set():
                 raise CancelledError()
             body = request_json(client, self.request_settings, {
@@ -60,25 +72,29 @@ class DashScopeEmbeddings(Embeddings):
         except (KeyError, TypeError, ValueError) as exc:
             raise DashScopeRequestError("embedding 响应条数、索引或向量格式无效") from exc
 
-    def _embed(self, texts: list[str], text_type: str) -> list[list[float]]:
+    def _embed(self, texts: list[str], text_type: _TextType, on_progress: UnitProgressCallback | None = None) -> list[list[float]]:
         if any(not isinstance(text, str) or not text.strip() for text in texts):
             raise ValueError("嵌入文本必须为非空字符串")
         if not texts:
             return []
         check_shutdown()
+        if on_progress is not None:
+            on_progress(0, len(texts))
         started = time.monotonic()
         count = math.ceil(len(texts) / self.batch_size)
+        concurrency = self.document_concurrency if text_type == "document" else self.concurrency
         if text_type == "document":
-            logger.info("[嵌入] 开始 文本段=%s 批次=%s 并发上限=%s", len(texts), count, self.concurrency)
+            logger.info("[嵌入] 开始 文本段=%s 批次=%s 并发上限=%s", len(texts), count, concurrency)
         stopped = threading.Event()
         batches = {}
         dimension = None
+        completed = 0
         with make_client(self.request_settings) as client:
             if count == 1:
                 batches[0] = self._embed_batch(client, texts, text_type, stopped)
             else:
                 # 仅维持一个并发窗口；失败后不再发送后续批次，结果按原文本顺序归位。
-                executor = ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="embedding")
+                executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="embedding")
                 pending = {}
                 starts = iter(range(0, len(texts), self.batch_size))
 
@@ -90,7 +106,7 @@ class DashScopeEmbeddings(Embeddings):
                         pending[future] = start
 
                 try:
-                    for _ in range(min(count, self.concurrency)):
+                    for _ in range(min(count, concurrency)):
                         submit_next()
                     while pending:
                         done, _ = wait(pending, return_when=FIRST_COMPLETED)
@@ -102,6 +118,9 @@ class DashScopeEmbeddings(Embeddings):
                                 if len(vector) != dimension:
                                     raise DashScopeRequestError("embedding 向量维度不一致")
                             batches[pending.pop(future)] = batch
+                            completed += len(batch)
+                            if on_progress is not None:
+                                on_progress(completed, len(texts))
                         check_shutdown()
                         for _ in done:
                             submit_next()
@@ -111,12 +130,14 @@ class DashScopeEmbeddings(Embeddings):
         vectors = [vector for start in sorted(batches) for vector in batches[start]]
         if any(len(vector) != len(vectors[0]) for vector in vectors):
             raise DashScopeRequestError("embedding 向量维度不一致")
+        if count == 1 and on_progress is not None:
+            on_progress(len(texts), len(texts))
         if text_type == "document":
             logger.info("[嵌入] 完成 文本段=%s 批次=%s 耗时=%.1fs", len(texts), count, time.monotonic() - started)
         return vectors
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._embed(texts, "document")
+    def embed_documents(self, texts: list[str], *, on_progress: UnitProgressCallback | None = None) -> list[list[float]]:
+        return self._embed(texts, "document", on_progress)
 
     def embed_query(self, text: str) -> list[float]:
         return self._embed([text], "query")[0]

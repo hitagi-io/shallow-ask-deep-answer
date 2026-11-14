@@ -8,6 +8,7 @@ import threading
 import shutil
 import re
 import math
+import stat
 from pathlib import Path
 from uuid import UUID
 from functools import partial
@@ -26,6 +27,7 @@ from rag.vector_store import get_vector_store
 from rag.index_health import IndexHealth
 from rag.index_manifest import ManifestStore, current_index_version, project_collection_name
 from utils.documents.knowledge_files import list_supported_files
+from utils.documents.file_listing import FileFilter, FileSort, KnowledgeFile, paginate_files, summarize_files
 from utils.retrieval.source_evidence import SourceVersionChanged, read_source_passage
 from utils.core.config_loader import vector_db_config
 from utils.core.project_paths import get_knowledge_dir, get_knowledge_storage_root, scoped_knowledge_file
@@ -38,6 +40,7 @@ from utils.runtime.request_wait import wait_for_client
 from utils.runtime.shutdown import ServiceStopping, check_shutdown, request_shutdown, reset_shutdown
 from utils.core.logging_config import configure_logging, get_logger
 from utils.indexing.upload_tasks import UploadTaskStore
+from utils.indexing.progress import IndexProgress
 from auth import (
     PASSWORD_MAX_LENGTH,
     PG_CONN,
@@ -193,7 +196,7 @@ _upload_task_store = UploadTaskStore(PG_CONN)
 
 HEALTH_REPORT_TTL_SECONDS = int(os.getenv("HEALTH_REPORT_TTL_SECONDS", "120"))
 HEALTH_CHECK_TIMEOUT_SECONDS = float(os.getenv("HEALTH_CHECK_TIMEOUT_SECONDS", "60"))
-HEALTH_CHECK_MAX_CONCURRENT = int(os.getenv("HEALTH_CHECK_MAX_CONCURRENT", "4"))
+HEALTH_CHECK_MAX_CONCURRENT = int(os.getenv("HEALTH_CHECK_MAX_CONCURRENT", "2"))
 if not math.isfinite(HEALTH_CHECK_TIMEOUT_SECONDS) or HEALTH_CHECK_TIMEOUT_SECONDS < 0.5:
     raise ValueError("HEALTH_CHECK_TIMEOUT_SECONDS 必须为不小于 0.5 的有限数值")
 if HEALTH_CHECK_MAX_CONCURRENT < 1:
@@ -299,8 +302,24 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
         return report
 
 
+def _upload_progress_payload(value: object, status: str) -> dict | None:
+    if value is None:
+        return None
+    progress = IndexProgress.model_validate(value)
+    return {**progress.model_dump(), "percent": 100 if status == "success" else progress.percent}
+
+
+def _uploaded_file_exists(directory: str, filename: str) -> bool:
+    file_path = scoped_knowledge_file(directory, _safe_filename(filename))
+    try:
+        return stat.S_ISREG(os.stat(file_path).st_mode)
+    except FileNotFoundError:
+        return False
+
+
 def _upload_task_payload(task: dict) -> dict:
-    """返回任务状态，不暴露暂存文件的磁盘路径。"""
+    """保留历史任务结果，同时确认源文件当前是否仍在，不暴露磁盘路径。"""
+    directory = get_knowledge_dir(task["user_id"], task["project_id"])
     return {
         "task_id": task["id"],
         "status": task["status"],
@@ -316,6 +335,8 @@ def _upload_task_payload(task: dict) -> dict:
                 "overwritten": item["overwritten"],
                 "indexed": item["indexed"],
                 "error": item["error"],
+                "progress": _upload_progress_payload(item["progress"], item["status"]),
+                "file_exists": _uploaded_file_exists(directory, item["name"]) if item["status"] == "success" else None,
             }
             for item in task["files"]
         ],
@@ -337,6 +358,19 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
             indexed = False
             error = None
             staged_path = item["staged_path"]
+            last_progress: IndexProgress | None = None
+
+            def report_progress(progress: IndexProgress) -> None:
+                nonlocal last_progress
+                if last_progress is not None:
+                    if progress.percent < last_progress.percent:
+                        raise ValueError("入库进度不能回退")
+                    if (progress.stage == last_progress.stage and progress.percent == last_progress.percent
+                            and progress.completed != progress.total):
+                        return
+                _upload_task_store.update_item_progress(task_id, item["id"], progress)
+                last_progress = progress
+
             try:
                 with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
                     check_shutdown()
@@ -349,7 +383,7 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
                         knowledge_dir, os.path.join(knowledge_dir, item["name"])
                     )
                     result = get_vector_store(user_id, project_id).replace_and_index_file(
-                        destination, staged_path
+                        destination, staged_path, on_progress=report_progress,
                     )
                     overwritten = bool(result.get("overwritten"))
                     indexed = bool(result.get("ok"))
@@ -1056,16 +1090,37 @@ def _safe_filename(filename: str) -> str:
     return filename
 
 
+def _project_file_statuses(user_id: int, project_id: str) -> list[KnowledgeFile]:
+    directory = get_knowledge_dir(user_id, project_id)
+    paths = list_supported_files(directory, allowed_types)
+    manifests = ManifestStore({**vector_db_config, "collection_name":
+                               project_collection_name(vector_db_config, user_id, project_id)})
+    return manifests.file_statuses(paths, current_index_version(vector_db_config))
+
+
 @app.get("/api/projects/{project_id}/files")
-def list_files(project: dict = Depends(require_project)):
+def list_files(
+    limit: int = Query(10, ge=1, le=100),
+    page: int = Query(1, ge=1),
+    search: str = Query("", max_length=220),
+    status: FileFilter = Query("all"),
+    sort: FileSort = Query("uploaded_desc"),
+    project: dict = Depends(require_project),
+):
     user_id, project_id = project["user_id"], project["id"]
     with project_access(user_id, project_id) as current:
         _ensure_project(current)
-        directory = get_knowledge_dir(user_id, project_id)
-        paths = list_supported_files(directory, allowed_types)
-        manifests = ManifestStore({**vector_db_config, "collection_name":
-                                   project_collection_name(vector_db_config, user_id, project_id)})
-        return {"files": manifests.file_statuses(paths, current_index_version(vector_db_config))}
+        files = _project_file_statuses(user_id, project_id)
+        uploads = _upload_task_store.file_upload_order(user_id, project_id)
+        return paginate_files(files, uploads, limit=limit, page=page, search=search, status=status, sort=sort)
+
+
+@app.get("/api/projects/{project_id}/files/summary")
+def file_summary(project: dict = Depends(require_project)):
+    user_id, project_id = project["user_id"], project["id"]
+    with project_access(user_id, project_id) as current:
+        _ensure_project(current)
+        return summarize_files(_project_file_statuses(user_id, project_id))
 
 
 @app.get("/api/projects/{project_id}/sources/{filename}")

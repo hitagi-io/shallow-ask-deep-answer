@@ -3,12 +3,33 @@ from __future__ import annotations
 
 import hashlib
 import os
+from datetime import datetime
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from utils.indexing.progress import IndexProgress
 
 
 _TASK_PROJECT_LOCK_NAMESPACE = "knowledge-upload-queue"
+
+
+class FileUploadOrder(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    name: str = Field(min_length=1, max_length=220)
+    created_at: datetime
+    sequence: int = Field(gt=0)
+    position: int = Field(ge=0)
+
+    @field_validator("created_at")
+    @classmethod
+    def check_database_time(cls, value: datetime) -> datetime:
+        if value.tzinfo is not None:
+            raise ValueError("上传时间须与数据库 TIMESTAMP 格式一致")
+        return value
 
 
 def _project_queue_lock_key(user_id: int, project_id: str) -> int:
@@ -68,10 +89,13 @@ class UploadTaskStore:
                 overwritten  BOOLEAN,
                 indexed      BOOLEAN,
                 error        TEXT,
+                progress     JSONB,
                 updated_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (task_id, position)
             );
         """)
+        # 已有任务没有阶段记录时保留 NULL，不推测其历史进度。
+        cur.execute("ALTER TABLE upload_task_items ADD COLUMN IF NOT EXISTS progress JSONB")
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_upload_tasks_queue "
             "ON upload_tasks (sequence) WHERE status IN ('queued', 'running')"
@@ -123,7 +147,7 @@ class UploadTaskStore:
                 return None
             items = conn.execute(
                 """
-                SELECT position, name, status, overwritten, indexed, error
+                SELECT position, name, status, overwritten, indexed, error, progress
                 FROM upload_task_items
                 WHERE task_id = %s
                 ORDER BY position
@@ -180,14 +204,14 @@ class UploadTaskStore:
                 SELECT * FROM upload_tasks WHERE user_id = %s AND project_id = %s
                   AND (status IN ('queued', 'running') OR id IN (
                       SELECT id FROM upload_tasks WHERE user_id = %s AND project_id = %s
-                      ORDER BY sequence DESC LIMIT 20))
-                ORDER BY sequence
+                      ORDER BY created_at DESC, sequence DESC LIMIT 7))
+                ORDER BY created_at DESC, sequence DESC
             """, (user_id, project_id, user_id, project_id)).fetchall()
             if not tasks:
                 return []
             grouped = {task["id"]: [] for task in tasks}
             for item in conn.execute("""
-                SELECT task_id, position, name, status, overwritten, indexed, error
+                SELECT task_id, position, name, status, overwritten, indexed, error, progress
                 FROM upload_task_items WHERE task_id = ANY(%s) ORDER BY position
             """, (list(grouped),)).fetchall():
                 grouped[item.pop("task_id")].append(item)
@@ -205,6 +229,20 @@ class UploadTaskStore:
                 (task_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def file_upload_order(self, user_id: int, project_id: str) -> list[FileUploadOrder]:
+        """查询每个文件最近一次上传，覆盖全部资料，不受最近七条展示限制。"""
+        with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
+            rows = conn.execute("""
+                SELECT name, created_at, sequence, position FROM (
+                    SELECT DISTINCT ON (i.name) i.name, t.created_at, t.sequence, i.position
+                    FROM upload_tasks t JOIN upload_task_items i ON i.task_id = t.id
+                    WHERE t.user_id = %s AND t.project_id = %s
+                    ORDER BY i.name, t.created_at DESC, t.sequence DESC, i.position DESC
+                ) latest
+                ORDER BY created_at DESC, sequence DESC, position
+            """, (user_id, project_id)).fetchall()
+        return [FileUploadOrder.model_validate(row) for row in rows]
 
     def has_active(self, user_id: int, project_id: str) -> bool:
         with psycopg.connect(self.conninfo) as conn:
@@ -229,6 +267,19 @@ class UploadTaskStore:
             )
             conn.commit()
 
+    def update_item_progress(self, task_id: str, item_id: int, progress: IndexProgress) -> None:
+        with psycopg.connect(self.conninfo) as conn:
+            result = conn.execute(
+                """
+                UPDATE upload_task_items SET progress = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE task_id = %s AND id = %s AND status = 'running'
+                """,
+                (Jsonb(progress.model_dump()), task_id, item_id),
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("上传任务已不在运行，无法更新入库进度")
+            conn.commit()
+
     def finish_item(self, task_id: str, item_id: int, *, status: str,
                     overwritten: bool | None, indexed: bool | None,
                     error: str | None) -> None:
@@ -237,10 +288,12 @@ class UploadTaskStore:
                 """
                 UPDATE upload_task_items
                 SET status = %s, overwritten = %s, indexed = %s,
-                    error = %s, updated_at = CURRENT_TIMESTAMP
+                    error = %s, progress = CASE WHEN %s = 'success' THEN %s ELSE progress END,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s AND task_id = %s
                 """,
-                (status, overwritten, indexed, error, item_id, task_id),
+                (status, overwritten, indexed, error, status,
+                 Jsonb(IndexProgress(stage="finalizing", completed=1, total=1).model_dump()), item_id, task_id),
             )
             conn.execute(
                 """

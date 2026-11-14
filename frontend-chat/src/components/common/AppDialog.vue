@@ -29,16 +29,14 @@ onBeforeUnmount(() => { dialog.value?.close(); if (previousFocus?.isConnected) p
 </template>
 
 <style scoped>
-dialog { border: 1px solid var(--line); border-radius: var(--radius-panel); padding: 28px; width: min(720px, calc(100vw - 40px)); max-height: calc(100dvh - 64px); overflow-y: auto; overscroll-behavior: contain; color: var(--text); background: var(--bg); box-shadow: var(--shadow-lg); }
+dialog { border: 1px solid var(--line); border-radius: var(--radius-panel); padding: 24px; width: min(720px, calc(100vw - 40px)); max-height: calc(100dvh - 64px); overflow-y: auto; overscroll-behavior: contain; color: var(--text); background: var(--bg); box-shadow: var(--shadow-lg); }
 dialog::backdrop { background: var(--overlay); backdrop-filter: blur(3px); }
-dialog.compact { width: min(440px, calc(100vw - 40px)); padding: 24px; }
-header { display: flex; align-items: center; gap: 16px; margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
-h2 { flex: 1; margin: 0; font-size: 18px; line-height: 1.5; font-weight: 600; letter-spacing: -.3px; overflow-wrap: anywhere; }
-header .icon-button { width: 34px; height: 34px; margin: -4px -4px -4px 0; background: var(--surface); border-radius: var(--radius-control); }
+dialog.compact { width: min(440px, calc(100vw - 40px)); }
+header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+h2 { flex: 1; margin: 0; font-size: var(--font-heading); line-height: 1.5; font-weight: 600; letter-spacing: -.3px; overflow-wrap: anywhere; }
+header .icon-button { background: var(--surface); }
 header .icon-button:hover { background: var(--hover); }
 @media (max-width: 520px) {
-  dialog, dialog.compact { width: calc(100vw - 28px); max-height: calc(100dvh - 32px); padding: 20px; border-radius: var(--radius-card); }
-  header { margin-bottom: 18px; padding-bottom: 14px; }
-  h2 { font-size: 17px; }
+  dialog, dialog.compact { width: calc(100vw - 28px); max-height: calc(100dvh - 32px); padding: 16px; }
 }
 </style>

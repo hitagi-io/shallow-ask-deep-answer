@@ -64,10 +64,10 @@ onBeforeUnmount(() => { const request = controller; controller = null; request?.
 </template>
 
 <style scoped>
-.source-navigation { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; color: var(--muted); font-size: 13px; }
+.source-navigation { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; color: var(--muted); font-size: var(--font-small); }
 .source-name { margin: 0 0 8px; font-weight: 600; overflow-wrap: anywhere; }
-.source-location { color: var(--accent); margin: 0 0 12px; font-size: 13px; }
-.source-hint { color: var(--muted); font-size: 12px; line-height: 1.7; }
+.source-location { color: var(--accent); margin: 0 0 12px; font-size: var(--font-small); }
+.source-hint { color: var(--muted); font-size: var(--font-caption); line-height: 1.7; }
 .source-content { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.9; padding: 18px; border: 1px solid var(--line); border-radius: var(--radius-control); }
 mark { color: var(--text); background: var(--accent-soft); box-decoration-break: clone; border-bottom: 2px solid var(--accent); }
 .source-error { color: var(--danger); }

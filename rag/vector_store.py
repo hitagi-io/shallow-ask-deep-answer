@@ -5,6 +5,7 @@ import os
 import threading
 import uuid
 from collections import OrderedDict
+from functools import partial
 
 from langchain_core.runnables import RunnableLambda
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -19,6 +20,7 @@ from utils.documents.knowledge_files import list_supported_files, compute_file_s
 from utils.retrieval.source_evidence import SOURCE_FIELDS, chunk_signature, split_located_documents, text_digest
 from utils.core.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
 from utils.core.logging_config import get_logger
+from utils.indexing.progress import IndexProgress, IndexStage, ProgressCallback
 from utils.runtime.shutdown import ServiceStopping, check_shutdown, interruptible_lock
 
 logger = get_logger(__name__)
@@ -43,6 +45,7 @@ def get_vector_store(user_id: int, project_id: str) -> "VectorStore":
 
 class VectorStore:
     _ITER_BATCH_SIZE = 1000
+    _INSERT_BATCH_SIZE = 1000
 
     def __init__(self, user_id: int, project_id: str):
         self.user_id, self.project_id = knowledge_scope(user_id, project_id)
@@ -50,9 +53,10 @@ class VectorStore:
         collection_name = project_collection_name(vector_db_config, self.user_id, self.project_id)
         self.manifests = ManifestStore({**vector_db_config, "collection_name": collection_name})
         self.index_version = current_index_version(vector_db_config)
+        self.embeddings = DashScopeEmbeddings(vector_db_config)
         self.vector_store = Milvus(
             collection_name=collection_name,
-            embedding_function=DashScopeEmbeddings(vector_db_config),
+            embedding_function=self.embeddings,
             vector_field=["vector", "sparse"],
             builtin_function=BM25BuiltInFunction(
                 input_field_names="text", output_field_names="sparse",
@@ -159,7 +163,8 @@ class VectorStore:
                     failures.append({"file": path, "error": _INDEX_FAIL_GENERIC})
         return failures
 
-    def index_file(self, file_path: str, *, force: bool = False) -> dict:
+    def index_file(self, file_path: str, *, force: bool = False,
+                   on_progress: ProgressCallback | None = None) -> dict:
         """写入独立代次 → 验证每块实际文本 → 提交清单 → 删除旧代次。
 
         新内容先保存 building 清单，中断与部分写入仍可被健康检查发现。
@@ -168,7 +173,13 @@ class VectorStore:
         """
         file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
         result = {"file": file_path, "chunks": None, "ok": False, "error": _INDEX_FAIL_GENERIC}
+
+        def report(stage: IndexStage, completed: int, total: int) -> None:
+            if on_progress is not None:
+                on_progress(IndexProgress(stage=stage, completed=completed, total=total))
+
         with interruptible_lock(self._store_lock):
+            report("preparing", 0, 1)
             sha256 = compute_file_sha256(file_path)
             if sha256 is None:
                 return {**result, "error": "SHA-256 计算失败"}
@@ -179,10 +190,14 @@ class VectorStore:
             identity = (sha256, document_format(file_path))
             old = self.manifests.all().get(identity)
             if not force and old and self.manifest_is_current(old):
+                report("finalizing", 0, 1)
                 self.manifests.publish_existing_file(file_path, sha256)
                 return {**result, "chunks": old.expected_chunks, "ok": True, "error": None}
             try:
-                documents = split_located_documents(loader(file_path), self.splitter)
+                report("parsing", 0, 1)
+                parsed = loader(file_path, on_progress=partial(report, "parsing"))
+                report("splitting", 0, max(1, len(parsed)))
+                documents = split_located_documents(parsed, self.splitter, on_progress=partial(report, "splitting"))
                 check_shutdown()
             except ServiceStopping as exc:
                 return {**result, "error": str(exc)}
@@ -204,7 +219,7 @@ class VectorStore:
             texts = [doc.page_content for doc in documents]
             try:
                 # 每批请求由嵌入适配器有限重试。
-                embeddings = self.vector_store.embedding_func.embed_documents(texts)
+                embeddings = self.embeddings.embed_documents(texts, on_progress=partial(report, "embedding"))
                 check_shutdown()
             except ServiceStopping as exc:
                 return {**result, "error": str(exc)}
@@ -220,20 +235,29 @@ class VectorStore:
                     "chunk_index": ordinal, "chunk_sha256": text_digest(doc.page_content),
                 })
             try:
+                report("writing", 0, len(documents))
                 if not self.vector_store.client.has_collection(collection_name=self.vector_store.collection_name):
                     # 集合被外部删除后，LangChain 的 collection view 仍可能缓存旧对象。
                     self.vector_store.col = None
                     self.vector_store.fields = []
                 # Milvus SDK 负责请求级重试；不要因参数或完整性错误重跑整次写入。
-                self.vector_store.add_embeddings(
-                    texts=texts, embeddings=embeddings,
-                    metadatas=[doc.metadata for doc in documents], ids=ids,
-                )
+                # 沿用 SDK 的 1000 条批大小，只在实际写入成功后推进进度。
+                for start in range(0, len(documents), self._INSERT_BATCH_SIZE):
+                    check_shutdown()
+                    end = min(start + self._INSERT_BATCH_SIZE, len(documents))
+                    self.vector_store.add_embeddings(
+                        texts=texts[start:end], embeddings=embeddings[start:end],
+                        metadatas=[doc.metadata for doc in documents[start:end]], ids=ids[start:end],
+                    )
+                    report("writing", end, len(documents))
+                report("verifying", 0, len(documents))
                 rows = self.chunk_rows(f"index_id == {json.dumps(manifest.index_id)}")
-                if not chunks_match(manifest, rows):
+                if not chunks_match(manifest, rows, on_progress=partial(report, "verifying")):
                     raise RuntimeError("写入后的分块数、序号或内容哈希校验失败")
                 if compute_file_sha256(file_path) != sha256:
                     raise RuntimeError("入库期间源文件发生变化")
+                # 提交后不再调用可能失败的进度写入，避免错误触发源文件回滚。
+                report("finalizing", 0, 1)
                 self.manifests.put(manifest.ready())
             except Exception:
                 logger.exception("[向量库] 入库失败 file=%s", file_path)
@@ -308,7 +332,8 @@ class VectorStore:
             self.manifests.forget_file(file_path)
             self._retire_source_versions(file_path)
 
-    def replace_and_index_file(self, file_path: str, tmp_path: str) -> dict:
+    def replace_and_index_file(self, file_path: str, tmp_path: str, *,
+                               on_progress: ProgressCallback | None = None) -> dict:
         """覆盖失败回滚源文件；提交新清单前始终保留旧向量和清单。"""
         file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
         tmp_path = scoped_knowledge_file(self.knowledge_dir, tmp_path)
@@ -324,7 +349,7 @@ class VectorStore:
                     os.replace(backup, file_path)
                 raise
             try:
-                result = self.index_file(file_path)
+                result = self.index_file(file_path, on_progress=on_progress)
             except ServiceStopping as exc:
                 result = {"file": file_path, "chunks": None, "ok": False, "error": str(exc)}
             except Exception:

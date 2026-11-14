@@ -14,7 +14,10 @@ let sessionRevision = 0
 
 function endSession(error = '', success = '') {
   sessionRevision += 1
-  if (user.value) sessionStorage.removeItem(`shallow_ask_deep_answer_mode_${user.value.id}`)
+  if (user.value) {
+    sessionStorage.removeItem(`shallow_ask_deep_answer_mode_${user.value.id}`)
+    sessionStorage.removeItem(`shallow_ask_deep_answer_project_${user.value.id}`)
+  }
   clearAuth()
   user.value = null
   checkingAuth.value = false
@@ -25,6 +28,7 @@ function endSession(error = '', success = '') {
 function onAuthenticated(authenticatedUser: UserInfo) {
   sessionRevision += 1
   sessionStorage.removeItem(`shallow_ask_deep_answer_mode_${authenticatedUser.id}`)
+  sessionStorage.removeItem(`shallow_ask_deep_answer_project_${authenticatedUser.id}`)
   user.value = authenticatedUser
   checkingAuth.value = false
   serviceUnavailable.value = false

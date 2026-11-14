@@ -100,7 +100,7 @@ async function confirmDeletion() {
     <div class="account-summary"><span class="account-avatar" aria-hidden="true">{{ user.username.slice(0, 1).toLocaleUpperCase() }}</span><div><h2>{{ user.username }}</h2><p>我的私有知识空间</p></div></div>
     <section class="account-panel" aria-labelledby="name-title">
       <div class="panel-description"><h2 id="name-title">名字</h2><p>这个名字也用于登录。修改后，你的项目和对话仍会保留。</p></div>
-      <form @submit.prevent="saveName" :aria-busy="saving === 'name'">
+      <form class="form-stack" @submit.prevent="saveName" :aria-busy="saving === 'name'">
         <AppNotice v-if="nameError" tone="error">{{ nameError }}</AppNotice>
         <AppNotice v-if="nameSuccess" tone="success">{{ nameSuccess }}</AppNotice>
         <label for="profile-name">用户名</label>
@@ -111,7 +111,7 @@ async function confirmDeletion() {
     </section>
     <section class="account-panel" aria-labelledby="password-title">
       <div class="panel-description"><h2 id="password-title">登录密码</h2><p>先验证当前密码，再设置新密码。修改后，包括当前页面在内的所有登录会话都需要使用新密码重新登录。</p></div>
-      <form @submit.prevent="savePassword" :aria-busy="saving === 'password'">
+      <form class="form-stack" @submit.prevent="savePassword" :aria-busy="saving === 'password'">
         <AppNotice v-if="passwordError" tone="error">{{ passwordError }}</AppNotice>
         <label for="current-password">当前密码</label>
         <input id="current-password" v-model="currentPassword" class="filter-input" type="password" autocomplete="current-password" maxlength="128" required :disabled="busy" />
@@ -141,13 +141,13 @@ async function confirmDeletion() {
         <label class="acknowledgement"><input v-model="acknowledged" type="checkbox" /><span>我已了解删除范围，并已保存需要保留的内容。</span></label>
         <div class="dialog-actions"><button class="btn btn-secondary" autofocus @click="closeDeletion">保留账号</button><button class="btn btn-primary" :disabled="!acknowledged" @click="moveStep(2)">下一步</button></div>
       </div>
-      <form v-else-if="deleteStep === 2" class="delete-form" @submit.prevent="verifyDeletion">
+      <form v-else-if="deleteStep === 2" class="form-stack delete-form" @submit.prevent="verifyDeletion">
         <p>请输入 <strong>{{ user.username }}</strong> 的当前密码以验证身份。此步骤不会删除数据。</p>
         <label for="delete-password">当前密码</label>
         <input id="delete-password" v-model="deletePassword" class="filter-input" type="password" autocomplete="current-password" maxlength="128" required :disabled="busy" />
         <div class="dialog-actions"><button type="button" class="btn btn-secondary" :disabled="busy" @click="closeDeletion">取消</button><button type="submit" class="btn btn-primary" :disabled="busy">{{ saving === 'verify' ? '验证中…' : '验证并继续' }}</button></div>
       </form>
-      <form v-else class="delete-form" @submit.prevent="confirmDeletion">
+      <form v-else class="form-stack delete-form" @submit.prevent="confirmDeletion">
         <AppNotice tone="warning">这是最后一步。点击下方删除按钮后，账号及数据将立即删除，无法恢复。</AppNotice>
         <label for="delete-confirmation">请输入「{{ requiredText }}」</label>
         <input id="delete-confirmation" v-model="confirmationText" class="filter-input" autocomplete="off" spellcheck="false" maxlength="60" required :disabled="busy" aria-describedby="delete-hint" />
@@ -161,34 +161,30 @@ async function confirmDeletion() {
 </template>
 
 <style scoped>
-.account-summary { display: flex; align-items: center; gap: 16px; margin-bottom: 28px; }
-.account-avatar { display: grid; place-items: center; width: 56px; height: 56px; flex-shrink: 0; border: 1px solid var(--accent-border); border-radius: 18px; background: var(--accent-soft); font-size: 22px; font-weight: 600; }
-.account-summary h2 { margin: 0 0 4px; font-size: 18px; overflow-wrap: anywhere; }
-.account-summary p { margin: 0; font-size: 12px; color: var(--muted); }
-.account-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr); gap: 40px; padding: 28px; margin-bottom: 20px; border: 1px solid var(--line); border-radius: var(--radius-panel); background: var(--bg); }
-.panel-description h2 { margin: 0 0 10px; font-size: 16px; font-weight: 600; }
-.panel-description p, .deletion-entry p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.85; }
-form { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-label { font-size: 13px; font-weight: 550; }
+.account-summary { display: flex; align-items: center; gap: 16px; margin-bottom: var(--section-gap); }
+.account-avatar { display: grid; place-items: center; width: 56px; height: 56px; flex-shrink: 0; border: 1px solid var(--accent-border); border-radius: var(--radius-panel); background: var(--accent-soft); font-size: 22px; font-weight: 600; }
+.account-summary h2 { margin: 0 0 4px; font-size: var(--font-heading); overflow-wrap: anywhere; }
+.account-summary p { margin: 0; font-size: var(--font-caption); color: var(--muted); }
+.account-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr); gap: 32px; padding: var(--panel-padding); margin-bottom: var(--section-gap); border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--bg); }
+.panel-description h2 { margin: 0 0 10px; font-size: var(--font-subheading); font-weight: 600; }
+.panel-description p, .deletion-entry p { margin: 0; color: var(--muted); font-size: var(--font-small); line-height: 1.85; }
 input.filter-input { width: 100%; }
 form > label:not(:first-child) { margin-top: 4px; }
-.field-hint { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.7; }
 form > .btn { align-self: flex-start; margin-top: 10px; }
 .danger-panel { border-color: var(--danger-border); }
 .danger-panel h2 { color: var(--danger); }
 .deletion-entry .btn { margin-top: 18px; }
-.deletion-steps { display: flex; justify-content: space-between; list-style: none; padding: 0; margin: 0 0 24px; gap: 10px; color: var(--muted); font-size: 11px; }
-.deletion-steps li[aria-current] { color: var(--text); font-weight: 650; }
-.delete-copy, .delete-form { font-size: 13px; line-height: 1.85; overflow-wrap: anywhere; }
-.delete-copy h3 { margin: 0 0 12px; font-size: 17px; font-weight: 600; }
+.deletion-steps { display: flex; justify-content: space-between; list-style: none; padding: 0; margin: 0 0 24px; gap: 10px; color: var(--muted); font-size: var(--font-caption); }
+.deletion-steps li[aria-current] { color: var(--text); font-weight: 600; }
+.delete-copy, .delete-form { font-size: var(--font-small); line-height: 1.85; overflow-wrap: anywhere; }
+.delete-copy h3 { margin: 0 0 12px; font-size: var(--font-heading); font-weight: 600; }
 .delete-copy ul { padding-left: 20px; }
 .delete-form p { margin: 0 0 8px; }
 .acknowledgement { display: flex; align-items: flex-start; gap: 9px; padding: 12px; background: var(--surface); border-radius: var(--radius-control); font-weight: 400; }
 .acknowledgement input { margin-top: 6px; flex-shrink: 0; }
-.dialog-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 22px; }
 .delete-submit { background: var(--danger); color: var(--on-accent); }
 .delete-submit:hover:not(:disabled) { filter: brightness(.9); }
 .delete-notice { margin-bottom: 16px; }
 .delete-form .text-action { align-self: flex-start; }
-@media (max-width: 680px) { .account-panel { grid-template-columns: 1fr; gap: 22px; padding: 22px; } }
+@media (max-width: 760px) { .account-panel { grid-template-columns: 1fr; gap: 24px; } }
 </style>

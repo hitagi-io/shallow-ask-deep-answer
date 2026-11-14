@@ -16,7 +16,7 @@ class ProjectGoneError(Exception):
 
 
 class HealthScanRunner:
-    def __init__(self, timeout_seconds: float = 60, max_concurrent: int = 4):
+    def __init__(self, timeout_seconds: float = 60, max_concurrent: int = 2):
         self.timeout_seconds = timeout_seconds
         self._slots = asyncio.Semaphore(max_concurrent)
 

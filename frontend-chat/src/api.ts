@@ -1,3 +1,8 @@
+import { parseUploadTasks, type UploadTask } from './utils/uploadProgress'
+export type { UploadTask } from './utils/uploadProgress'
+import { FILE_PAGE_SIZE, parseFilePage, parseFileSummary, type FileFilter, type FileSort, type FilePage, type FileSummary } from './utils/knowledgeFiles'
+export type { FileItem, FileSummary } from './utils/knowledgeFiles'
+
 export type MessageStatus = 'streaming' | 'completed' | 'error' | 'cancelled'
 
 export interface Message {
@@ -47,13 +52,6 @@ export interface Project {
   name: string
   created_at: string
   updated_at: string
-}
-
-export interface FileItem {
-  name: string
-  path: string
-  /** 只有当前有效且已发布的入库记录才为 true；完整性另见检查报告。 */
-  indexed: boolean
 }
 
 export interface SourcePassage {
@@ -485,12 +483,31 @@ export async function deleteProject(id: string): Promise<void> {
   if (!res.ok) throw new Error(await errorMessage(res, '删除项目失败'))
 }
 
-export async function fetchFiles(projectId: string, options: KnowledgeRequestOptions = {}): Promise<FileItem[]> {
-  const data = await fetchKnowledgeJson<{ files: FileItem[] }>(`${projectPath(projectId)}/files`, '获取文件列表失败', options)
-  return data.files
+export interface FileRequestOptions extends KnowledgeRequestOptions {
+  page?: number
+  search?: string
+  status?: FileFilter
+  sort?: FileSort
+}
+export async function fetchFiles(projectId: string, options: FileRequestOptions = {}): Promise<FilePage> {
+  const query = new URLSearchParams({ limit: String(FILE_PAGE_SIZE), page: String(options.page ?? 1) })
+  if (options.search) query.set('search', options.search)
+  if (options.status) query.set('status', options.status)
+  if (options.sort) query.set('sort', options.sort)
+  return parseFilePage(await fetchKnowledgeJson<unknown>(`${projectPath(projectId)}/files?${query}`, '获取文件列表失败', options))
 }
 
-export async function uploadFiles(projectId: string, files: File[], onUploaded?: () => void, signal?: AbortSignal): Promise<{
+export async function fetchFileSummary(projectId: string, options: KnowledgeRequestOptions = {}): Promise<FileSummary> {
+  return parseFileSummary(await fetchKnowledgeJson<unknown>(`${projectPath(projectId)}/files/summary`, '读取项目资料统计失败', options))
+}
+
+export interface UploadRequestOptions {
+  onProgress?: (percent: number | null) => void
+  onUploaded?: () => void
+  signal?: AbortSignal
+}
+
+export async function uploadFiles(projectId: string, files: File[], { onProgress, onUploaded, signal }: UploadRequestOptions = {}): Promise<{
   task_id: string | null
   errors: { name: string; error: string }[]
 }> {
@@ -502,6 +519,8 @@ export async function uploadFiles(projectId: string, files: File[], onUploaded?:
     xhr.open('POST', `${projectPath(projectId)}/files/upload`)
     for (const [key, value] of Object.entries(authHeaders())) xhr.setRequestHeader(key, value)
     const abort = () => xhr.abort()
+    xhr.upload.onprogress = event => onProgress?.(event.lengthComputable && event.total > 0
+      ? Math.floor(event.loaded / event.total * 100) : null)
     xhr.upload.onload = () => onUploaded?.()
     xhr.onload = () => {
       if (xhr.status === 401 && getToken() === token) { clearAuth(); unauthorizedHandler?.() }
@@ -518,26 +537,9 @@ export async function uploadFiles(projectId: string, files: File[], onUploaded?:
   return res.json()
 }
 
-export interface UploadTask {
-  task_id: string
-  status: 'queued' | 'running' | 'completed' | 'failed'
-  total: number
-  completed: number
-  succeeded: number
-  failed: number
-  error: string | null
-  files: {
-    name: string
-    status: 'queued' | 'running' | 'success' | 'error'
-    overwritten: boolean | null
-    indexed: boolean | null
-    error: string | null
-  }[]
-}
-
 export async function fetchUploadTasks(projectId: string, options: KnowledgeRequestOptions = {}): Promise<UploadTask[]> {
-  const result = await fetchKnowledgeJson<{ tasks: UploadTask[] }>(`${projectPath(projectId)}/upload-tasks`, '读取上传进度失败，将自动重试', options)
-  return result.tasks
+  const result = await fetchKnowledgeJson<unknown>(`${projectPath(projectId)}/upload-tasks`, '读取上传进度失败，将自动重试', options)
+  return parseUploadTasks(result)
 }
 
 export async function deleteFile(projectId: string, name: string): Promise<void> {

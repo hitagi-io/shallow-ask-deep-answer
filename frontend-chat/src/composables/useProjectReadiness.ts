@@ -1,5 +1,5 @@
 import { computed, onUnmounted, ref, watch, type Ref } from 'vue'
-import { fetchFiles, fetchUploadTasks } from '../api'
+import { fetchFileSummary, fetchUploadTasks } from '../api'
 
 type Readiness = 'checking' | 'updating' | 'empty' | 'partial' | 'ready' | 'error'
 
@@ -36,11 +36,11 @@ export function useProjectReadiness(projectId: Readonly<Ref<string | null>>, upd
     const options = { signal: controller.signal }
     pending = (async () => {
       try {
-        const [tasks, files] = await Promise.all([fetchUploadTasks(id, options), fetchFiles(id, options)])
+        const [tasks, summary] = await Promise.all([fetchUploadTasks(id, options), fetchFileSummary(id, options)])
         if (disposed || requestVersion !== version) return false
         remoteStatus.value = tasks.some(task => task.status === 'queued' || task.status === 'running') ? 'updating'
-          : !files.some(file => file.indexed) ? 'empty'
-          : files.some(file => !file.indexed) ? 'partial' : 'ready'
+          : summary.indexed === 0 ? 'empty'
+          : summary.indexed < summary.total ? 'partial' : 'ready'
         return !blocked.value
       } catch (reason) {
         if (disposed || requestVersion !== version) return false

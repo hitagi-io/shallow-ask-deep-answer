@@ -19,8 +19,10 @@ separators: ["\n\n", "\n", "? ", "! ", "。", "？", "！", "; ", "；", ": ", "
 
 # 单次 embedding 请求最多提交的块数，每批独立重试。
 embedding_batch_size: 20
-# 单进程所有文档共享请求并发上限，避免多个上传任务叠加冲击模型接口。
-embedding_concurrency: 4
+# 单进程所有项目的提问与入库共享请求并发上限。
+embedding_concurrency: 16
+# 为提问向量化预留的名额；入库最多使用总上限减去此值，提问可用全部名额。
+embedding_query_reserved_slots: 4
 embedding_connect_timeout_seconds: 5
 embedding_timeout_seconds: 20
 # 包括首次请求，避免上游网络故障时使用 SDK 的长时间等待。

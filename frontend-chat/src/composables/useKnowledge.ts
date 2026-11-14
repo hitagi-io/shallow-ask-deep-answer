@@ -4,20 +4,47 @@ import { useNotice } from './useNotice'
 import { useHealthReport } from './useHealthReport'
 import type { ConfirmAction } from './useConfirmation'
 import { knowledgeFileTypes, supportsKnowledgeFile } from '../utils/knowledgeFormats'
+import { fileProgressStageCount, transferredPercent, taskFileDetail, taskFilePercent } from '../utils/uploadProgress'
+import type { FileFilter, FileSort, FileSummary } from '../utils/knowledgeFiles'
 
 type Operation = '' | 'loading' | 'uploading' | 'building' | 'checking' | 'repairing' | 'deleting'
-interface UploadResult { name: string; status: 'waiting' | 'uploading' | 'queued' | 'error'; detail: string }
+interface UploadResult {
+  id: number
+  taskId: string | null
+  name: string
+  status: 'waiting' | 'uploading' | 'saving' | 'queued' | 'error'
+  detail: string
+  percent: number
+}
+interface UploadProgressFile {
+  name: string
+  status: UploadResult['status'] | UploadTask['files'][number]['status']
+  detail: string
+  percent: number
+}
+interface UploadProgressGroup { id: string; files: UploadProgressFile[]; error: string | null }
 
 export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Readonly<Ref<boolean>>, confirmAction: ConfirmAction) {
   let disposed = false
   const uploadAbort = new AbortController()
   let readAbort = new AbortController()
+  let filesAbort = new AbortController()
+  let filterTimer: ReturnType<typeof setTimeout> | undefined
   let viewVersion = 0
   let filesRequestVersion = 0
   let tasksRequestVersion = 0
   let lastFullRefresh = 0
+  let nextUploadId = 0
+  let tasksBeforeUpload = new Set<string>()
   let pollTimer: ReturnType<typeof setTimeout> | undefined
   const files = ref<FileItem[]>([])
+  const fileSummary = ref<FileSummary | null>(null)
+  const fileTotal = computed(() => fileSummary.value?.total ?? 0)
+  const indexedTotal = computed(() => fileSummary.value?.indexed ?? 0)
+  const matchedFiles = ref(0)
+  const filePage = ref(1)
+  const filePageCount = ref(0)
+  const filesLoading = ref(false)
   const healthState = useHealthReport()
   const { health, healthNotice, indexStatus } = healthState
   const operation = ref<Operation>('')
@@ -26,20 +53,35 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   const dragOver = ref(false)
   const fileInput = ref<HTMLInputElement | null>(null)
   const search = ref('')
-  const statusFilter = ref<'all' | 'indexed' | 'pending'>('all')
+  const statusFilter = ref<FileFilter>('all')
+  const fileSort = ref<FileSort>('uploaded_desc')
   const uploadResults = ref<UploadResult[]>([])
   const uploadTasks = ref<UploadTask[]>([])
   const taskLoadError = ref('')
   const indexing = computed(() => uploadTasks.value.some(task => task.status === 'queued' || task.status === 'running'))
-  const taskCompleted = computed(() => uploadTasks.value.reduce((sum, task) => sum + task.completed, 0))
-  const taskTotal = computed(() => uploadTasks.value.reduce((sum, task) => sum + task.total, 0))
-  function taskFileDetail(file: UploadTask['files'][number]) {
-    if (file.error) return file.error
-    return { queued: '排队等待入库', running: '正在解析和索引', success: file.overwritten ? '已覆盖并入库' : '已入库', error: '入库失败，请重新上传' }[file.status]
-  }
-  const uploadProgress = computed(() => uploadResults.value.filter(result =>
-    result.status === 'waiting' || result.status === 'uploading'))
-  const uploadCompleted = computed(() => uploadResults.value.length - uploadProgress.value.length)
+  const uploadProgress = computed<UploadProgressGroup[]>(() => {
+    // 接收响应前可能已经轮询到新任务；等 taskId 返回后在原条目中接续，避免重复显示。
+    const visibleTasks = uploadTasks.value.filter(task => operation.value !== 'uploading'
+      || tasksBeforeUpload.has(task.task_id) || uploadResults.value.some(row => row.taskId === task.task_id))
+    const localIds = new Map(uploadResults.value.filter(row => row.taskId !== null)
+      .map(row => [row.taskId, `upload-${row.id}`]))
+    // 已接收的任务沿用服务端的上传时间倒序；本地条目接续时保留原来的 id。
+    const groups = visibleTasks.map(task => ({
+      id: localIds.get(task.task_id) ?? `task-${task.task_id}`,
+      files: task.files.map(file => ({ name: file.name, status: file.status, detail: taskFileDetail(file), percent: taskFilePercent(file) })),
+      error: task.error,
+    }))
+    const taskIds = new Set(visibleTasks.map(task => task.task_id))
+    // 尚未出现在服务端快照中的本地上传置顶，后加入的文件排在前面。
+    const pending = uploadResults.value.filter(row => row.taskId === null || !taskIds.has(row.taskId)).reverse()
+    const pendingGroups = pending.map(result => ({
+      id: `upload-${result.id}`, error: null, files: [{
+        name: result.name, status: result.status, detail: result.detail,
+        percent: result.percent,
+      }],
+    }))
+    return [...pendingGroups, ...groups]
+  })
   const loadError = ref('')
   const { message: knowledgeMsg, type: knowledgeMsgType, show, clear: clearNotice } = useNotice(5000)
   const knowledgeBusy = computed(() => operation.value !== '')
@@ -51,22 +93,26 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   const healthIssueCount = computed(() => health.value?.issues.length || 0)
   const documentStatus = computed(() => {
     if (loadError.value) return { label: '状态未知', tone: 'warning' }
-    if (knowledgeLoading.value) return { label: '加载中', tone: 'neutral' }
-    if (!files.value.length) return { label: '暂无资料', tone: 'neutral' }
-    const indexed = files.value.filter(file => file.indexed).length
-    if (!indexed) return { label: '待入库', tone: 'warning' }
-    return indexed === files.value.length
+    if (!fileSummary.value) return { label: filesLoading.value ? '加载中' : '状态未知', tone: 'neutral' }
+    if (!fileTotal.value) return { label: '暂无资料', tone: 'neutral' }
+    if (!indexedTotal.value) return { label: '待入库', tone: 'warning' }
+    return indexedTotal.value === fileTotal.value
       ? { label: '已入库', tone: 'success' } : { label: '部分入库', tone: 'warning' }
   })
-  const filteredFiles = computed(() => files.value.filter(file =>
-    file.name.toLocaleLowerCase().includes(search.value.trim().toLocaleLowerCase()) &&
-    (statusFilter.value === 'all' || file.indexed === (statusFilter.value === 'indexed'))))
   const errorText = (error: unknown) => error instanceof Error ? error.message : '操作失败，请稍后重试'
 
+  function cancelFileReads() {
+    filesAbort.abort()
+    filesAbort = new AbortController()
+    filesRequestVersion++
+    filesLoading.value = false
+  }
   function cancelReads() {
+    clearTimeout(filterTimer)
+    filterTimer = undefined
     readAbort.abort()
     readAbort = new AbortController()
-    filesRequestVersion++
+    cancelFileReads()
     tasksRequestVersion++
   }
 
@@ -90,15 +136,36 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   }
   async function refreshFiles(id: string) {
     if (disposed || projectId.value !== id) return
+    cancelFileReads()
     const request = ++filesRequestVersion
-    const signal = readAbort.signal
+    const options = { signal: filesAbort.signal, page: filePage.value, search: search.value.trim(), status: statusFilter.value, sort: fileSort.value }
+    filesLoading.value = true
     try {
-      const result = await fetchFiles(id, { signal })
-      if (!disposed && request === filesRequestVersion && projectId.value === id) { files.value = result; loadError.value = '' }
+      const page = await fetchFiles(id, options)
+      if (!disposed && request === filesRequestVersion && projectId.value === id) {
+        files.value = page.files
+        filePage.value = page.page
+        filePageCount.value = page.total_pages
+        matchedFiles.value = page.matched_total
+        fileSummary.value = page.summary
+        loadError.value = ''
+      }
     } catch (error) {
       if (!isRequestCancelled(error) && !disposed && request === filesRequestVersion && projectId.value === id) loadError.value = errorText(error)
       throw error
+    } finally {
+      if (request === filesRequestVersion) filesLoading.value = false
     }
+  }
+  async function goToFilePage(page: number) {
+    const id = projectId.value
+    if (disposed || !id || knowledgeBusy.value || filesLoading.value || !Number.isInteger(page)
+        || page < 1 || page > filePageCount.value || page === filePage.value) return
+    filePage.value = page
+    files.value = []
+    loadError.value = ''
+    try { await refreshFiles(id) }
+    catch { /* 读取失败已显示在资料列表中，重新加载会重试当前页。 */ }
   }
   async function refreshHealth(id: string, refresh = false) {
     if (disposed || projectId.value !== id) return false
@@ -114,10 +181,15 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   async function refreshTasks(id: string) {
     if (disposed || projectId.value !== id) return
     const request = ++tasksRequestVersion
+    const submittedBeforeRequest = new Set(uploadResults.value.map(row => row.taskId))
     try {
       const result = await fetchUploadTasks(id, { signal: readAbort.signal })
       if (!disposed && request === tasksRequestVersion && projectId.value === id) {
         uploadTasks.value = result
+        // 仅清理请求前已确认的历史任务；请求期间新提交的任务可能尚未进入这次快照。
+        const taskIds = new Set(result.map(task => task.task_id))
+        uploadResults.value = uploadResults.value.filter(row => row.taskId === null
+          || !submittedBeforeRequest.has(row.taskId) || taskIds.has(row.taskId))
         taskLoadError.value = ''
       }
     } catch (error) {
@@ -136,7 +208,8 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   async function handleUpload(fileList: FileList | File[]) {
     if (!fileList.length) return
     await run('uploading', async id => {
-      uploadResults.value = Array.from(fileList).map(file => ({ name: file.name, status: 'waiting', detail: '等待上传' }))
+      tasksBeforeUpload = new Set(uploadTasks.value.map(task => task.task_id))
+      uploadResults.value = Array.from(fileList).map(file => ({ id: nextUploadId++, taskId: null, name: file.name, status: 'waiting', detail: '等待上传', percent: 0 }))
       const rows = uploadResults.value
       const picked = Array.from(fileList)
       let next = 0
@@ -156,11 +229,16 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
           try {
             await previous
             if (disposed) return
-            row.status = 'uploading'; row.detail = '正在上传'
-            const result = await uploadFiles(id, [file], () => { row.detail = '传输完成，正在保存' }, uploadAbort.signal)
+            row.status = 'uploading'; row.detail = '正在传输'; row.percent = 0
+            const result = await uploadFiles(id, [file], {
+              signal: uploadAbort.signal,
+              onProgress: percent => { if (percent !== null) row.percent = Math.floor(percent / fileProgressStageCount) },
+              onUploaded: () => { row.status = 'saving'; row.detail = '正在保存'; row.percent = transferredPercent },
+            })
             const error = result.errors[0]?.error
             row.status = result.task_id && !error ? 'queued' : 'error'
-            row.detail = error || (result.task_id ? '已保存，等待后台入库' : '上传未被接受')
+            row.taskId = result.task_id
+            row.detail = error || (result.task_id ? '排队等待入库' : '上传未被接受')
           } catch (error) { row.status = 'error'; row.detail = errorText(error) }
           finally {
             release()
@@ -176,7 +254,6 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
           ? `已提交 ${succeeded} 个文件，上传失败 ${failures.length} 个`
           : `已保存 ${succeeded} 个文件，后台将自动入库`
         const details = failures.map(result => `${result.name}：${result.detail}`)
-        uploadResults.value = []
         if (projectId.value === id) healthState.reset()
         // 刷新异常与上传结果合并，避免覆盖具体文件的失败原因。
         try { await refreshAll(id) }
@@ -241,25 +318,41 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     if (disposed) return
     try {
       const id = projectId.value
-      if (active.value && id && !knowledgeBusy.value) {
+      if (active.value && id && (!knowledgeBusy.value || knowledgeUploading.value)) {
         const before = uploadTasks.value.map(task => `${task.task_id}:${task.status}:${task.completed}`).join('|')
         await refreshTasks(id)
         const after = uploadTasks.value.map(task => `${task.task_id}:${task.status}:${task.completed}`).join('|')
-        if (before !== after || Date.now() - lastFullRefresh > 60_000) {
+        if (!knowledgeBusy.value && !filesLoading.value
+            && (before !== after || Date.now() - lastFullRefresh > 60_000)) {
           await Promise.allSettled([refreshFiles(id), refreshHealth(id)])
           lastFullRefresh = Date.now()
         }
       }
     } catch { /* 读取失败由各自的状态提示展示；主动取消不提示。 */ }
     finally {
-      if (!disposed) pollTimer = setTimeout(poll, indexing.value ? 2_000 : 5_000)
+      if (!disposed) pollTimer = setTimeout(poll, indexing.value || knowledgeUploading.value ? 2_000 : 5_000)
     }
   }
   watch(projectId, () => {
     viewVersion++; cancelReads()
-    files.value = []; uploadTasks.value = []; uploadResults.value = []; taskLoadError.value = ''; lastFullRefresh = 0; healthState.reset(); search.value = ''; statusFilter.value = 'all'; loadError.value = ''; clearNotice()
+    fileSummary.value = null; filePage.value = 1; filePageCount.value = 0; matchedFiles.value = 0
+    files.value = []; uploadTasks.value = []; uploadResults.value = []; taskLoadError.value = ''; lastFullRefresh = 0; healthState.reset(); search.value = ''; statusFilter.value = 'all'; fileSort.value = 'uploaded_desc'; loadError.value = ''; clearNotice()
     if (active.value) void loadKnowledgeState()
   }, { flush: 'sync' })
+  watch([search, statusFilter, fileSort], () => {
+    if (knowledgeBusy.value) return
+    clearTimeout(filterTimer)
+    filterTimer = undefined
+    cancelFileReads()
+    files.value = []; filePage.value = 1; filePageCount.value = 0; matchedFiles.value = 0; loadError.value = ''
+    const id = projectId.value
+    if (!active.value || !id) return
+    filesLoading.value = true
+    filterTimer = setTimeout(() => {
+      filterTimer = undefined
+      void refreshFiles(id).catch(() => { /* 读取失败已显示在资料列表中。 */ })
+    }, 200)
+  })
   watch(active, visible => {
     viewVersion++
     if (visible) void loadKnowledgeState()
@@ -269,7 +362,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   onUnmounted(() => { disposed = true; cancelReads(); clearTimeout(pollTimer); uploadAbort.abort() })
   function formatHealthTime(iso: string | null) { return iso ? new Date(iso).toLocaleString() : '从未' }
 
-  return { updatingProjectId, uploadTasks, indexing, taskLoadError, taskCompleted, taskTotal, taskFileDetail, files, filteredFiles, search, statusFilter, uploadProgress, uploadCompleted, loadError, selectFiles, clearNotice,
+  return { updatingProjectId, uploadTasks, indexing, taskLoadError, files, fileTotal, indexedTotal, matchedFiles, filePage, filePageCount, filesLoading, goToFilePage, search, statusFilter, fileSort, uploadProgress, loadError, selectFiles, clearNotice,
     knowledgeLoading, knowledgeBuilding, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput,
     deletingName, health, healthNotice, documentStatus, indexStatus, healthChecking, healthRepairing, healthIssueCount, knowledgeBusy, loadKnowledgeState, onFileSelect,
     onDrop, handleDeleteFile, handleBuild, handleHealthCheck, handleHealthRepair, formatHealthTime }

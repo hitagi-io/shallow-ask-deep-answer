@@ -1,6 +1,6 @@
 <script setup lang="ts">
 withDefaults(defineProps<{
-  name: 'close' | 'plus' | 'arrow-up' | 'arrow-up-right' | 'upload' | 'success' | 'error' | 'folder' | 'book' | 'file'
+  name: 'close' | 'plus' | 'arrow-up' | 'arrow-up-right' | 'arrow-left' | 'arrow-right' | 'chevron-right' | 'filter' | 'check' | 'upload' | 'success' | 'error' | 'folder' | 'book' | 'file'
   size?: number
 }>(), { size: 18 })
 </script>
@@ -11,6 +11,11 @@ withDefaults(defineProps<{
     <path v-else-if="name === 'plus'" d="M12 5v14M5 12h14" />
     <path v-else-if="name === 'arrow-up'" d="M12 19V5m-6 6 6-6 6 6" />
     <path v-else-if="name === 'arrow-up-right'" d="M7 17 17 7M7 7h10v10" />
+    <path v-else-if="name === 'arrow-left'" d="M19 12H5m7-7-7 7 7 7" />
+    <path v-else-if="name === 'arrow-right'" d="M5 12h14m-7-7 7 7-7 7" />
+    <path v-else-if="name === 'chevron-right'" d="m9 5 7 7-7 7" />
+    <path v-else-if="name === 'filter'" d="M4 5h16l-6 7v6l-4 2v-8L4 5Z" />
+    <path v-else-if="name === 'check'" d="m5 12 4 4L19 6" />
     <path v-else-if="name === 'upload'" d="M12 16V3m-5 5 5-5 5 5M4 16v5h16v-5" />
     <path v-else-if="name === 'folder'" d="M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z" />
     <path v-else-if="name === 'book'" d="M12 5v15M3 4h5a4 4 0 0 1 4 2 4 4 0 0 1 4-2h5v15h-5a4 4 0 0 0-4 2 4 4 0 0 0-4-2H3V4Z" />

@@ -12,6 +12,7 @@ from utils.documents.document_ocr import document_ocr_progress
 from utils.core.project_paths import resolve_project_path
 from utils.core.logging_config import get_logger
 from utils.runtime.shutdown import check_shutdown
+from utils.indexing.progress import UnitProgressCallback
 
 logger = get_logger(__name__)
 _parsed_cache = OrderedDict()
@@ -64,9 +65,11 @@ def list_supported_files(dir_path,allowed_types:tuple[str]):
             files.append(path)
     return tuple(sorted(files))
 
-def load_documents(file_path):
+def load_documents(file_path, *, on_progress: UnitProgressCallback | None = None):
     """缓存有界且按绝对路径和文件摘要隔离，引用回看无需反复执行 OCR。"""
     check_shutdown()
+    if on_progress is not None:
+        on_progress(0, 1)
     path = os.path.abspath(file_path)
     digest = compute_file_sha256(path)
     if digest is None:
@@ -78,7 +81,7 @@ def load_documents(file_path):
             _parsed_cache.move_to_end(key)
     if cached is None:
         with document_ocr_progress(path):
-            cached = LOADERS[os.path.splitext(path)[1].lower()](path)
+            cached = LOADERS[os.path.splitext(path)[1].lower()](path, on_progress=on_progress)
             check_shutdown()
         if compute_file_sha256(path) != digest:
             raise ValueError("解析期间源文件发生变化，请重试")
@@ -96,6 +99,8 @@ def load_documents(file_path):
                 ) > _CACHE_CHARACTERS:
                     _parsed_cache.popitem(last=False)
     check_shutdown()
+    if on_progress is not None:
+        on_progress(1, 1)
     return [Document(page_content=doc.page_content, metadata=dict(doc.metadata)) for doc in cached]
 
 def get_document_loader(file_path):

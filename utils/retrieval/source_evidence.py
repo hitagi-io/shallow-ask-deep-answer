@@ -6,6 +6,7 @@ import os
 import re
 from bisect import bisect_left, bisect_right
 from urllib.parse import quote, urlencode
+from utils.indexing.progress import UnitProgressCallback
 
 
 def text_digest(text: str) -> str:
@@ -60,7 +61,7 @@ def source_location(text: str, start: int, end: int, page: int, *, locator: str,
     return f"{prefix}第 {numbers} 段（{kind}）"
 
 
-def split_located_documents(documents, splitter):
+def split_located_documents(documents, splitter, *, on_progress: UnitProgressCallback | None = None):
     """使用 splitter 的真实字符偏移，保留页面/文档单元，拒绝猜测位置。"""
     chunks = []
     for unit, document in enumerate(documents):
@@ -80,6 +81,8 @@ def split_located_documents(documents, splitter):
                     locator=document.metadata["locator"], extraction=document.metadata["extraction"]),
             })
             chunks.append(chunk)
+        if on_progress is not None:
+            on_progress(unit + 1, len(documents))
     return chunks
 
 
