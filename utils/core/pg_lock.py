@@ -16,6 +16,7 @@ import time
 import psycopg
 
 from utils.core.logging_config import get_logger
+from utils.observability.tracing import span
 
 logger = get_logger(__name__)
 
@@ -29,6 +30,11 @@ def project_index_lock_key(user_id: int, project_id: str) -> int:
     return int.from_bytes(hashlib.sha256(scope.encode()).digest()[:8], "big", signed=True)
 
 
+def conversation_execution_lock_key(thread_id: str) -> int:
+    """生成线程退出前不允许新尝试同时修改同一会话的检查点。"""
+    return int.from_bytes(hashlib.sha256(f"chat-execution:{thread_id}".encode()).digest()[:8], "big", signed=True)
+
+
 @contextmanager
 def _lock_section(conninfo: str, lock_key: int, timeout_seconds: float | None, *, shared: bool,
                   cancel_check: Callable[[], None] | None = None):
@@ -39,7 +45,7 @@ def _lock_section(conninfo: str, lock_key: int, timeout_seconds: float | None, *
         cancel_check()
     conn = psycopg.connect(conninfo, autocommit=True)
     try:
-        with conn.cursor() as cur:
+        with span("lock.wait", mode="shared" if shared else "exclusive"), conn.cursor() as cur:
             if cancel_check:
                 # 后台线程不能靠取消 asyncio Future 停止，等锁期间也需检查关闭信号。
                 try_sql = "SELECT pg_try_advisory_lock_shared(%s)" if shared else "SELECT pg_try_advisory_lock(%s)"

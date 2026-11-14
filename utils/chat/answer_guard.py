@@ -25,6 +25,8 @@ from utils.retrieval.retrieval_protocol import (
 )
 from utils.core.logging_config import get_logger
 from utils.retrieval.citations import cited_evidence_ids, render_citations
+from utils.chat.outcome import AnswerOutcome
+from utils.observability.tracing import span
 
 logger = get_logger(__name__)
 
@@ -53,6 +55,7 @@ class AnswerGuard:
     """
 
     def __init__(self) -> None:
+        self.outcome = AnswerOutcome(result_kind="answer_rejected", error_code="missing_answer")
         self.terminated = False
         self._buffer: list[str] = []
         self._reports: list[dict] = []
@@ -178,6 +181,7 @@ class AnswerGuard:
 
         if self._clarification is not None and not self._task_seen:
             self._buffer.clear()
+            self.outcome = AnswerOutcome(result_kind="clarification")
             return ("replace", self._clarification)
 
         if self._buffer_text().strip():
@@ -202,13 +206,22 @@ class AnswerGuard:
             result = render_citations(text, evidence)
         except ValueError as exc:
             return self._terminate("unverified", str(exc))
+        with span("answer.citations") as citations:
+            used_ids = cited_evidence_ids(text, evidence)
+            citations.attributes["citation_ids"] = sorted(used_ids)
         self._buffer.clear()
+        self.outcome = AnswerOutcome(result_kind="answered")
         return ("replace", result)
 
     def _buffer_text(self) -> str:
         return "".join(self._buffer)
 
     def _terminate(self, winner: str, reason: str) -> tuple[str, str]:
+        self.outcome = {
+            "kb_down": AnswerOutcome(result_kind="dependency_failed", error_code="retrieval_unavailable"),
+            "kb_miss": AnswerOutcome(result_kind="no_evidence"),
+            "unverified": AnswerOutcome(result_kind="answer_rejected", error_code="answer_validation_failed"),
+        }[winner]
         dropped = len(self._buffer_text())
         self._buffer.clear()
         self.terminated = True
@@ -237,6 +250,7 @@ def _is_answer_message(chunk: BaseMessage, metadata: dict) -> bool:
 
 def _general_stream(raw_stream, phase_event: Callable[[str], dict[str, str] | None], should_stop=None):
     """通用模式：只透传回答文本，过滤工具与内部摘要，按工具调用下发阶段提示。"""
+    has_text = False
     for chunk, metadata in raw_stream:
         if should_stop is not None and should_stop():
             return
@@ -256,11 +270,15 @@ def _general_stream(raw_stream, phase_event: Callable[[str], dict[str, str] | No
 
         text = chunk.text
         if text:
+            has_text = has_text or bool(text.strip())
             yield text
         if next_phase:
             event = phase_event(next_phase)
             if event:
                 yield event
+    if should_stop is None or not should_stop():
+        yield AnswerOutcome(result_kind="answered") if has_text else AnswerOutcome(
+            result_kind="answer_rejected", error_code="missing_answer")
 
 
 def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
@@ -340,8 +358,13 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
 
         if should_stop is not None and should_stop():
             return
-        action, text = guard.finish()
+        with span("answer.validate") as validation:
+            action, text = guard.finish()
+            validation.attributes["result_kind"] = guard.outcome.result_kind
+            if guard.outcome.error_code is not None:
+                validation.fail(guard.outcome.error_code)
         if action == "none" or not text:
+            yield guard.outcome
             return
 
         emitted_text = "".join(emitted)
@@ -350,6 +373,7 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
         elif emitted_text != text:
             # 已下发内容与最终校验结果不一致（引用越界、降级文案等），整段替换
             yield {"type": "replace", "content": text}
+        yield guard.outcome
     finally:
         try:
             raw_stream.close()

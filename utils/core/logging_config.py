@@ -8,10 +8,25 @@ from __future__ import annotations
 
 import logging
 import os
+import json
+from datetime import datetime, timezone
+from utils.observability.context import current_context
 
 
 LOGGER_NAME = "shallow_ask_deep_answer"
 _CONFIGURED = False
+
+
+class ContextFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        context = current_context.get()
+        data = {"time": datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
+                "level": record.levelname, "logger": record.name, "message": record.getMessage(),
+                "request_id": context.http_request_id, "trace_id": context.trace_id,
+                "span_id": context.span_id, "generation_id": context.generation_id, "attempt_id": context.attempt_id}
+        if record.exc_info:
+            data["exception"] = self.formatException(record.exc_info)
+        return json.dumps(data, ensure_ascii=False)
 
 
 def get_logger(module_name: str) -> logging.Logger:
@@ -32,10 +47,7 @@ def configure_logging() -> None:
     if level_name not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         raise ValueError(f"无效的 LOG_LEVEL: {level_name}")
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s — %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+    handler.setFormatter(ContextFormatter())
     root = logging.getLogger(LOGGER_NAME)
     root.setLevel(level_name)
     root.handlers.clear()

@@ -1,7 +1,7 @@
 import { computed, onUnmounted, ref, watch, type Ref } from 'vue'
 import { fetchFileSummary, fetchUploadTasks } from '../api'
 
-type Readiness = 'checking' | 'updating' | 'empty' | 'partial' | 'ready' | 'error'
+type Readiness = 'checking' | 'updating' | 'recovery' | 'empty' | 'partial' | 'ready' | 'error'
 
 // 只读取文件入库记录和后台任务，不触发索引检查或检索。
 export function useProjectReadiness(projectId: Readonly<Ref<string | null>>, updatingProjectId: Readonly<Ref<string | null>>) {
@@ -13,6 +13,7 @@ export function useProjectReadiness(projectId: Readonly<Ref<string | null>>, upd
     switch (status.value) {
       case 'checking': return '正在读取资料状态…'
       case 'updating': return '资料上传或入库中，完成后可发送'
+      case 'recovery': return '上传结果待确认，请在知识库执行“修复与补建”'
       case 'empty': return '暂无已入库资料，请在知识库查看'
       case 'partial': return '部分资料未入库，仅使用已入库文件回答'
       case 'error': return '资料状态读取失败'
@@ -38,7 +39,8 @@ export function useProjectReadiness(projectId: Readonly<Ref<string | null>>, upd
       try {
         const [tasks, summary] = await Promise.all([fetchUploadTasks(id, options), fetchFileSummary(id, options)])
         if (disposed || requestVersion !== version) return false
-        remoteStatus.value = tasks.some(task => task.status === 'queued' || task.status === 'running') ? 'updating'
+        remoteStatus.value = tasks.some(task => task.recovery_required) ? 'recovery'
+          : tasks.some(task => task.status === 'queued' || task.status === 'running') ? 'updating'
           : summary.indexed === 0 ? 'empty'
           : summary.indexed < summary.total ? 'partial' : 'ready'
         return !blocked.value

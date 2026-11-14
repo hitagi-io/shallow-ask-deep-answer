@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
-import { apiMe, clearAuth, getStoredUser, setUnauthorizedHandler, type UserInfo } from './api'
+import { apiMe, clearAuth, hasAuthToken, setUnauthorizedHandler, type UserInfo } from './api'
 import AuthView from './views/AuthView.vue'
 import WorkspaceView from './views/WorkspaceView.vue'
 
 const user = ref<UserInfo | null>(null)
-const checkingAuth = ref(!!getStoredUser())
+const checkingAuth = ref(hasAuthToken())
 const serviceUnavailable = ref(false)
 const validatingSession = ref(false)
 const authError = ref('')
@@ -39,7 +39,7 @@ setUnauthorizedHandler(() => endSession('登录已过期，请重新登录'))
 let sessionTimer: ReturnType<typeof setInterval> | undefined
 async function validateSession() {
   if (validatingSession.value || (!checkingAuth.value && document.visibilityState !== 'visible')) return
-  if (!getStoredUser()) {
+  if (!hasAuthToken()) {
     if (user.value || serviceUnavailable.value) endSession('登录状态已变更，请重新登录')
     checkingAuth.value = false
     return
@@ -55,7 +55,7 @@ async function validateSession() {
   } catch (error) {
     if (revision !== sessionRevision) return
     // 只有 401 清除凭证；初次复核连接失败时等待恢复，不误显示登录页。
-    if (getStoredUser()) {
+    if (hasAuthToken()) {
       if (!user.value) serviceUnavailable.value = true
       console.warn('[登录状态] 复核失败', error)
     }
@@ -66,7 +66,7 @@ async function validateSession() {
   }
 }
 function syncLogout(event: StorageEvent) {
-  if (event.storageArea === localStorage && (user.value || checkingAuth.value || serviceUnavailable.value) && !getStoredUser()) {
+  if (event.storageArea === localStorage && (user.value || checkingAuth.value || serviceUnavailable.value) && !hasAuthToken()) {
     endSession('登录状态已变更，请重新登录')
   }
 }

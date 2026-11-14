@@ -187,6 +187,7 @@ onUnmounted(() => document.removeEventListener('click', onDocumentClick))
               管理知识库
               <span v-if="healthIssueCount > 0" class="badge menu-badge">{{ healthIssueCount }}</span>
             </button>
+            <button @click="navigateTo('audit')">操作记录</button>
             <button @click="navigateTo('account')">编辑信息</button>
             <button @click="navigateTo('about')">关于</button>
             <button class="btn-danger" @click="showGearMenu = false; emit('logout')">退出登录</button>

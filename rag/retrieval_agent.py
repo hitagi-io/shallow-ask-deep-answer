@@ -19,8 +19,10 @@ from utils.retrieval.retrieval_protocol import (
 )
 from utils.chat.prompt_loader import render_retrieval_agent_prompt
 from rag.vector_store import get_vector_store
-from utils.core.config_loader import agent_config, get_kb_subagent_max_retrieval_calls
+from utils.core.config_loader import agent_config
 from utils.core.logging_config import get_logger
+from utils.observability.tracing import span, traced, fingerprint
+from utils.observability.context import remaining_seconds, ExecutionStopped, ExecutionDeadlineExceeded
 from utils.core.pg_lock import project_index_lock_key, shared_section
 from utils.core.project_paths import knowledge_scope
 from utils.retrieval.source_evidence import make_source_evidence
@@ -43,7 +45,7 @@ _summary_model = init_chat_model(
 def build_retrieval_subagent(user_id: int, project_id: str):
     """把服务端选定的账号和项目绑定到工具闭包；模型无法更改检索范围。"""
     user_id, project_id = knowledge_scope(user_id, project_id)
-    max_retrieval_calls = get_kb_subagent_max_retrieval_calls()
+    max_retrieval_calls = agent_config["kb_subagent_max_retrieval_calls"]
 
     @tool(response_format="content_and_artifact")
     def do_retrieval(query: str):
@@ -67,16 +69,24 @@ def build_retrieval_subagent(user_id: int, project_id: str):
         if not query.strip():
             raise ValueError("检索 query 必须为非空字符串")
         try:
-            with shared_section(
+            with span("retrieval.execute"), shared_section(
                 os.getenv("PG_CONNECTION_STRING", "postgresql://postgres:postgres@localhost:5432/shallow_ask_deep_answer"),
                 project_index_lock_key(user_id, project_id),
                 timeout_seconds=float(os.getenv("INDEX_READ_LOCK_TIMEOUT_SECONDS", "30")),
             ):
+                remaining_seconds()
                 retriever = get_vector_store(user_id, project_id).get_retriever()
                 docs = retriever.invoke(query)
             chunks = []
             for doc in docs:
-                chunks.append(make_source_evidence(doc, project_id))
+                evidence = make_source_evidence(doc, project_id)
+                chunks.append(evidence)
+                with span("retrieval.evidence", citation_id=evidence["citation_id"],
+                          content_hash=doc.metadata["content_sha256"], index_id=doc.metadata["index_id"],
+                          index_version=doc.metadata["index_version"]):
+                    pass
+        except (ExecutionStopped, ExecutionDeadlineExceeded):
+            raise
         except Exception:
             logger.exception("[知识库检索] 检索请求失败，已向子代理返回故障标记")
             return build_retrieval_content(STATUS_ERROR, []), build_retrieval_artifact(STATUS_ERROR, query, [])
@@ -102,9 +112,11 @@ def build_retrieval_subagent(user_id: int, project_id: str):
         ],
     )
 
+    @traced("subagent.retrieval")
     def _invoke_with_report(state):
         """运行子代理，并由代码生成结构化检索报告。"""
-        result = dict(retrieval_agent.invoke(state))
+        with span("retrieval.report", prompt_hash=fingerprint(render_retrieval_agent_prompt())):
+            result = dict(retrieval_agent.invoke(state))
         result["structured_response"] = RetrievalReport(
             **build_report_from_messages(result["messages"])
         )

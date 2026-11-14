@@ -1,7 +1,7 @@
 import os
 from string import Template
 
-from utils.core.config_loader import get_kb_subagent_max_retrieval_calls
+from utils.core.config_loader import agent_config
 from utils.chat.answer_guard import (
     COPY_KB_DOWN,
     COPY_KB_MISS,
@@ -22,15 +22,13 @@ from utils.retrieval.retrieval_protocol import (
 from utils.core.project_paths import resolve_project_path
 from utils.chat.search_results import SEARCH_MAX_CALLS
 
-def load_prompt(prompt_name):
+def load_prompt(prompt_name: str) -> str:
     """读取单个提示词文件，返回尚未渲染的文本。"""
     abs_path = resolve_project_path(os.path.join('prompts', prompt_name))
     try:
         with open(abs_path, 'r', encoding='utf-8') as f:
             return f.read()
-    except FileNotFoundError as e:
-        raise RuntimeError(f"提示词文件不存在: {abs_path}") from e
-    except Exception as e:
+    except (OSError, UnicodeError) as e:
         raise RuntimeError(f"加载提示词失败 ({abs_path})：{e}") from e
 
 def _render(prompt_name, **values):
@@ -45,7 +43,7 @@ def render_kb_agent_prompt():
     """
     return _render(
         'kb_agent_prompt.txt',
-        kb_subagent_max_retrieval_calls=get_kb_subagent_max_retrieval_calls(),
+        kb_subagent_max_retrieval_calls=agent_config["kb_subagent_max_retrieval_calls"],
         report_protocol=REPORT_PROTOCOL,
         status_ok=STATUS_OK,
         status_empty=STATUS_EMPTY,
@@ -61,7 +59,7 @@ def render_retrieval_agent_prompt():
     """渲染检索子代理提示词，并注入协议标记和固定文案。"""
     return _render(
         'retrieval_agent_prompt.txt',
-        kb_subagent_max_retrieval_calls=get_kb_subagent_max_retrieval_calls(),
+        kb_subagent_max_retrieval_calls=agent_config["kb_subagent_max_retrieval_calls"],
         sentinel_kb_down=SENTINEL_KB_DOWN,
         sentinel_kb_miss=SENTINEL_KB_MISS,
     )

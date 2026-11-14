@@ -33,6 +33,11 @@ from utils.core.config_loader import vector_db_config
 from utils.core.project_paths import get_knowledge_dir, get_knowledge_storage_root, scoped_knowledge_file
 from utils.core.pg_lock import SingleInstanceGuard, exclusive_section, shared_section, project_index_lock_key
 from utils.chat.generation_runner import run_generation
+from utils.observability.context import ExecutionContext, bind_context, current_context
+from utils.observability.tracing import span, start_tracing, stop_tracing
+from utils.observability.audit import audit_operation, resource_digest, configure_audit
+from utils.observability.queries import generation_trace, audit_page, prune_observability
+from utils.indexing.recovery import PublicationUncertain
 from utils.indexing.health_report_cache import HealthReportCache, HealthReportInvalidated
 from utils.indexing.health_scan import HealthScanRunner, ProjectGoneError
 from utils.runtime.readiness import check_readiness
@@ -61,6 +66,7 @@ from auth import (
     cancel_generation,
     save_generation_progress,
     finish_generation,
+    reap_stale_generations,
     delete_conversation_guarded,
     acquire_chat_slot,
     bind_chat_slot_generation,
@@ -117,7 +123,7 @@ if not math.isfinite(READINESS_TIMEOUT_SECONDS) or READINESS_TIMEOUT_SECONDS < 0
 
 def _warn_connection_budget() -> None:
     """启动时核算 PG 连接需求，超出上限时明确告警（多 worker 时最容易踩）。"""
-    per_worker = PG_CHECKPOINT_POOL_MAX + PG_POOL_MAX
+    per_worker = PG_CHECKPOINT_POOL_MAX + PG_POOL_MAX + 1
     need = UVICORN_WORKERS * per_worker
     try:
         with psycopg.connect(PG_CONN) as conn, conn.cursor() as cur:
@@ -126,13 +132,14 @@ def _warn_connection_budget() -> None:
     except Exception as e:
         logger.warning(f"[启动] 无法读取 PostgreSQL 的 max_connections，跳过连接预算检查：{e}")
         return
-    detail = f"workers={UVICORN_WORKERS} × (检查点池 {PG_CHECKPOINT_POOL_MAX} + 业务池 {PG_POOL_MAX}) = {need}"
+    detail = f"workers={UVICORN_WORKERS} × (检查点池 {PG_CHECKPOINT_POOL_MAX} + 业务池 {PG_POOL_MAX} + Trace 写入 1) = {need}"
     if need > max_conn - 5:
         state = "超出" if need > max_conn else "接近"
         logger.warning(f"[启动] PostgreSQL 预计连接占用约 {need}，已{state}连接上限（max_connections={max_conn}；{detail}）。"
               "建议提高 max_connections，或降低连接池上限。")
     else:
-        logger.info(f"[启动] PostgreSQL 连接容量充足：预计占用 {need}，连接上限 {max_conn}（{detail}）")
+        logger.info(f"[启动] PostgreSQL 池与 Trace 预算 {need}，连接上限 {max_conn}（{detail}）；"
+                    "还需为并发生成锁、索引、审计与扫描连接预留容量")
 
 
 @asynccontextmanager
@@ -146,6 +153,9 @@ async def lifespan(_app: FastAPI):
         # 导入模块时不建池；正常退出和启动中途失败都由生命周期释放资源。
         resources.callback(close_db_pool)
         init_db()
+        configure_audit(PG_CONN)
+        start_tracing(PG_CONN)
+        resources.callback(stop_tracing)
         agent = ChatAgent()
         resources.callback(agent.close)
         _warn_connection_budget()
@@ -155,6 +165,8 @@ async def lifespan(_app: FastAPI):
         )
         task = asyncio.create_task(_scheduled_health_loop(background_stop), name="scheduled-health")
         task.add_done_callback(_background_task_done)
+        recovery_task = asyncio.create_task(_recovery_loop(background_stop), name="generation-recovery")
+        recovery_task.add_done_callback(_background_task_done)
         upload_workers = [asyncio.create_task(_upload_worker_loop(i, background_stop, upload_executor),
                                              name=f"upload-index-{i}") for i in range(UPLOAD_WORKERS)]
         try:
@@ -167,7 +179,7 @@ async def lifespan(_app: FastAPI):
             for generation_task in generation_tasks:
                 generation_task.cancel()
             # 不取消健康检查的 asyncio 等待，确保底层线程退出后再关闭连接池。
-            await asyncio.gather(task, *generation_tasks, return_exceptions=True)
+            await asyncio.gather(task, recovery_task, *generation_tasks, return_exceptions=True)
             # 线程在解析/嵌入边界响应停止；等待回滚、状态写回和已提交写入的收尾。
             await asyncio.gather(*upload_workers, return_exceptions=True)
     logger.info("[关闭] PostgreSQL 连接池已释放")
@@ -180,6 +192,28 @@ app = FastAPI(
     redoc_url="/redoc" if ENABLE_API_DOCS else None,
     openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
 )
+
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    request_id = uuid.uuid4().hex
+    with bind_context(ExecutionContext(http_request_id=request_id)):
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
+async def _recovery_loop(stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(reap_stale_generations, CHAT_GENERATION_STALE_SECONDS)
+            await asyncio.to_thread(prune_observability, PG_CONN)
+        except Exception:
+            logger.exception("[恢复] 扫描失联生成任务失败")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=15)
+        except TimeoutError:
+            pass
 
 # 仅在 lifespan 启动时创建，避免脚本入口和 Uvicorn 导入分别创建连接池。
 agent: ChatAgent
@@ -277,6 +311,7 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
         check_shutdown()
         if project is None:
             return None
+        _resolve_pending_uploads(user_id, project_id)
         if _upload_task_store.has_active(user_id, project_id):
             return None
         index_health = IndexHealth(user_id, project_id)
@@ -290,7 +325,10 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
                 logger.warning("[索引自动修复] 存储不可用，本轮暂不执行修复")
                 break
             try:
-                report = index_health.repair()
+                with audit_operation(user_id, "index.repair", "project", project_id,
+                                     project_id=project_id, system=True) as operation:
+                    report = index_health.repair()
+                    operation.result = "succeeded" if report["healthy"] else "partial"
                 repair = report["repair"]
                 logger.info(f"[索引自动修复] 本轮修复完成：{_format_repair_summary(repair)}")
             except ServiceStopping:
@@ -328,6 +366,7 @@ def _upload_task_payload(task: dict) -> dict:
         "succeeded": task["succeeded"],
         "failed": task["failed"],
         "error": task["error"],
+        "recovery_required": task["recovery_required"],
         "files": [
             {
                 "name": item["name"],
@@ -343,15 +382,17 @@ def _upload_task_payload(task: dict) -> dict:
     }
 
 
-def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
+def _process_upload_task(task: dict, lease: psycopg.Connection) -> bool:
     """执行一个上传任务的索引操作；数据库队列保证同一项目内按顺序执行。"""
     task_id = task["id"]
     user_id, project_id = task["user_id"], task["project_id"]
+    succeeded = True
     try:
         for item in _upload_task_store.items(task_id):
             if item["status"] != "queued":
                 continue
             check_shutdown()
+            journal = _upload_task_store.journal(task, item)
             _upload_task_store.mark_item_running(task_id, item["id"])
             status = "error"
             overwritten = None
@@ -377,21 +418,24 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
                     # 检查队列租约连接，数据库断连导致租约丢失时停止处理。
                     lease.execute("SELECT 1")
                     _ensure_project(current)
+                    _resolve_pending_uploads(user_id, project_id)
                     knowledge_dir = get_knowledge_dir(user_id, project_id)
                     staged_path = scoped_knowledge_file(knowledge_dir, staged_path)
                     destination = scoped_knowledge_file(
                         knowledge_dir, os.path.join(knowledge_dir, item["name"])
                     )
                     result = get_vector_store(user_id, project_id).replace_and_index_file(
-                        destination, staged_path, on_progress=report_progress,
+                        destination, staged_path, on_progress=report_progress, journal=journal,
                     )
-                    overwritten = bool(result.get("overwritten"))
-                    indexed = bool(result.get("ok"))
-                    error = result.get("error")
+                    overwritten = result["overwritten"]
+                    indexed = result["committed"]
+                    error = result["error"]
                     status = "success" if indexed and not error else "error"
                 _invalidate_health(user_id, project_id)
             except ServiceStopping:
                 raise
+            except PublicationUncertain as exc:
+                error = str(exc)
             except TimeoutError:
                 error = "索引正被其他操作占用，请稍后重试"
             except HTTPException as exc:
@@ -401,7 +445,8 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
                 error = "后台入库失败，请稍后重试"
             finally:
                 try:
-                    _remove_staged_upload(user_id, project_id, staged_path)
+                    if not journal.pending:
+                        _remove_staged_upload(user_id, project_id, staged_path)
                 except (OSError, ValueError):
                     logger.exception("[知识库] 临时上传文件清理失败 file=%s", staged_path)
             _upload_task_store.finish_item(
@@ -409,8 +454,12 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
                 indexed=indexed, error=error,
             )
             if error:
+                succeeded = False
                 check_shutdown()
+                if journal.pending:
+                    raise PublicationUncertain(error)
         _upload_task_store.finish(task_id)
+        return succeeded
     except Exception as exc:
         if isinstance(exc, ServiceStopping):
             logger.info("[知识库] 后台上传任务已停止 task_id=%s", task_id)
@@ -422,6 +471,7 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> None:
             _upload_task_store.fail(task_id, error)
         except Exception:
             logger.exception("[知识库] 后台上传任务状态写回失败 task_id=%s", task_id)
+        return False
 
 
 def _run_next_upload() -> bool:
@@ -431,22 +481,50 @@ def _run_next_upload() -> bool:
         return False
     task, lease = claimed
     try:
-        if task["status"] == "running":
-            # 只有原工作进程的会话租约已消失，运行中的任务才会进入此分支。
-            # 崩溃前可能已移动暂存文件，不能盲目重做覆盖，
-            # 也不能将中断的任务报告为入库成功。
-            with _index_write_section(task["user_id"], task["project_id"]):
-                _upload_task_store.fail(task["id"], "后台任务中断，请检查文档状态或重新上传")
-                for item in _upload_task_store.items(task["id"]):
-                    _remove_staged_upload(task["user_id"], task["project_id"], item["staged_path"])
-                _invalidate_health(task["user_id"], task["project_id"])
-        else:
-            _process_upload_task(task, lease)
+        with bind_context(ExecutionContext(trace_id=task["trace_id"],
+                          user_id=task["user_id"], project_id=task["project_id"])), span("upload.execute") as execution:
+            if task["status"] == "running":
+                # 领取成功证明原队列会话锁已经释放；项目写锁防止仍在收尾的索引操作并发。
+                with _index_write_section(task["user_id"], task["project_id"]), \
+                        project_access(task["user_id"], task["project_id"]) as project:
+                    _ensure_project(project)
+                    for item in _upload_task_store.items(task["id"]):
+                        if item["status"] == "running":
+                            journal = _upload_task_store.journal(task, item)
+                            result = get_vector_store(task["user_id"], task["project_id"]).recover_upload(journal) if journal.record is not None else {
+                                "ok": False, "committed": False, "overwritten": None,
+                                "error": "更新前任务缺少恢复记录，请检查文档状态或重新上传",
+                            }
+                            _upload_task_store.finish_item(task["id"], item["id"], status="success" if result["ok"] else "error",
+                                indexed=result["committed"], overwritten=result["overwritten"], error=result["error"])
+                            if not result["ok"]:
+                                execution.fail("upload_interrupted")
+            if not _process_upload_task(task, lease):
+                execution.fail("upload_failed")
             for item in _upload_task_store.items(task["id"]):
-                _remove_staged_upload(task["user_id"], task["project_id"], item["staged_path"])
+                if not _upload_task_store.journal(task, item).pending:
+                    _remove_staged_upload(task["user_id"], task["project_id"], item["staged_path"])
         return True
+    except Exception:
+        _upload_task_store.fail(task["id"], "上传恢复未完成，请执行索引修复")
+        raise
     finally:
         lease.close()
+
+
+def _resolve_pending_uploads(user_id: int, project_id: str) -> None:
+    """调用方持项目写锁；仅核对已结束任务，运行中的队列由原 worker 处理。"""
+    for item in _upload_task_store.pending_recoveries(user_id, project_id):
+        task = {"id": item["task_id"], "user_id": user_id, "project_id": project_id}
+        journal = _upload_task_store.journal(task, item)
+        with audit_operation(user_id, "upload.recover", "upload_item", str(item["id"]),
+                             project_id=project_id, system=True) as operation:
+            result = get_vector_store(user_id, project_id).recover_upload(journal)
+            _upload_task_store.finish_item(task["id"], item["id"], status="success" if result["ok"] else "error",
+                indexed=result["committed"], overwritten=result["overwritten"], error=result["error"])
+            operation.result = "succeeded" if result["ok"] else "partial"
+        _upload_task_store.finish(task["id"])
+        _remove_staged_upload(user_id, project_id, item["staged_path"])
 
 
 def _remove_staged_upload(user_id: int, project_id: str, path: str) -> None:
@@ -527,6 +605,7 @@ class ChatRequest(BaseModel):
     request_id: str = Field(pattern=r"^[0-9a-zA-Z_-]{8,64}$")
     kb_only: bool = True
     project_id: str | None = None
+    retry_of: int | None = Field(default=None, gt=0)
 
     @field_validator("project_id")
     @classmethod
@@ -630,24 +709,28 @@ async def readiness(request: Request):
 
 @app.post("/api/auth/register")
 def api_register(req: RegisterRequest, request: Request):
-    client_ip = request.client.host if request.client else None
-    result = register(req.username, req.password, client_ip)
-    if not result["ok"]:
-        raise HTTPException(
-            status_code=429 if result.get("rate_limited") else 400, detail=result["error"]
-        )
-    return {"message": "注册成功"}
+    with audit_operation(None, "account.register", "account", resource_digest(req.username), transactional=True) as operation:
+        client_ip = request.client.host if request.client else None
+        result = register(req.username, req.password, client_ip)
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=429 if result.get("rate_limited") else 400, detail=result["error"]
+            )
+        return {"message": "注册成功"}
 
 
 @app.post("/api/auth/login")
 def api_login(req: LoginRequest, request: Request):
-    client_ip = request.client.host if request.client else None
-    result = login(req.username, req.password, client_ip)
-    if not result["ok"]:
-        raise HTTPException(
-            status_code=429 if result.get("rate_limited") else 401, detail=result["error"]
-        )
-    return {"token": result["token"], "user": result["user"]}
+    with audit_operation(None, "auth.login", "account", resource_digest(req.username)) as operation:
+        client_ip = request.client.host if request.client else None
+        result = login(req.username, req.password, client_ip)
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=429 if result.get("rate_limited") else 401, detail=result["error"]
+            )
+        operation.user_id = result["user"]["id"]
+        operation.resource_id = str(operation.user_id)
+        return {"token": result["token"], "user": result["user"]}
 
 
 @app.get("/api/auth/me")
@@ -657,54 +740,57 @@ def api_me(user: dict = Depends(get_current_user)):
 
 @app.patch("/api/auth/me")
 def api_update_account(req: UpdateAccountRequest, user: dict = Depends(get_current_user)):
-    try:
-        return update_account(user["user_id"], user["auth_version"], **req.model_dump())
-    except AccountError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    with audit_operation(user["user_id"], "account.update", "account", str(user["user_id"]), transactional=True) as operation:
+        try:
+            return update_account(user["user_id"], user["auth_version"], **req.model_dump())
+        except AccountError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
 @app.post("/api/auth/deletion-verification")
 def api_prepare_deletion(req: DeletionVerificationRequest, user: dict = Depends(get_current_user)):
-    try:
-        return prepare_deletion(user["user_id"], user["auth_version"], req.password)
-    except AccountError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    with audit_operation(user["user_id"], "account.verify_deletion", "account", str(user["user_id"])) as operation:
+        try:
+            return prepare_deletion(user["user_id"], user["auth_version"], req.password)
+        except AccountError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
 @app.delete("/api/auth/me")
 def api_delete_account(req: DeleteAccountRequest, user: dict = Depends(get_current_user)):
-    user_id = user["user_id"]
+    with audit_operation(user["user_id"], "account.delete", "account", str(user["user_id"]), transactional=True) as operation:
+        user_id = user["user_id"]
 
-    def cleanup(project_ids, conversation_ids):
-        for conv_id in conversation_ids:
-            _purge_thread_checkpoints(f"{user_id}:{conv_id}")
-        for project_id in project_ids:
-            try:
-                get_vector_store(user_id, project_id).drop_project_index()
-                _remove_project_files(user_id, project_id)
-                agent.forget_project(user_id, project_id)
-            finally:
-                _invalidate_health(user_id, project_id)
-        # 仅删除清理后已为空的账号目录，不递归删除未经校验的子目录。
-        root = Path(get_knowledge_storage_root()).resolve()
-        account_dir = root / str(user_id)
-        if account_dir.resolve() != account_dir or account_dir.parent != root:
-            raise RuntimeError("无效的账号文件目录")
-        if account_dir.exists():
-            account_dir.rmdir()
+        def cleanup(project_ids, conversation_ids):
+            for conv_id in conversation_ids:
+                _purge_thread_checkpoints(f"{user_id}:{conv_id}")
+            for project_id in project_ids:
+                try:
+                    get_vector_store(user_id, project_id).drop_project_index()
+                    _remove_project_files(user_id, project_id)
+                    agent.forget_project(user_id, project_id)
+                finally:
+                    _invalidate_health(user_id, project_id)
+            # 仅删除清理后已为空的账号目录，不递归删除未经校验的子目录。
+            root = Path(get_knowledge_storage_root()).resolve()
+            account_dir = root / str(user_id)
+            if account_dir.resolve() != account_dir or account_dir.parent != root:
+                raise RuntimeError("无效的账号文件目录")
+            if account_dir.exists():
+                account_dir.rmdir()
 
-    try:
-        delete_account(user_id, user["auth_version"], req.confirmation_token, req.confirmation_text,
-                       cleanup=cleanup,
-                       stale_seconds=CHAT_GENERATION_STALE_SECONDS, slot_max_age=CHAT_SLOT_MAX_AGE_SECONDS)
-        return {"message": "账号及其项目、文档、索引和对话已注销删除"}
-    except AccountError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-    except (TimeoutError, psycopg.errors.LockNotAvailable) as exc:
-        raise HTTPException(status_code=409, detail="账号资料正在处理其他操作，请稍后重试注销") from exc
-    except Exception as exc:
-        logger.exception("[账号] 注销清理未完成 user_id=%s", user_id)
-        raise HTTPException(status_code=503, detail="注销清理未完成，部分数据可能已删除。账号仍保留，请重试注销。") from exc
+        try:
+            delete_account(user_id, user["auth_version"], req.confirmation_token, req.confirmation_text,
+                           cleanup=cleanup,
+                           stale_seconds=CHAT_GENERATION_STALE_SECONDS, slot_max_age=CHAT_SLOT_MAX_AGE_SECONDS)
+            return {"message": "账号及其项目、文档、索引和对话已注销删除"}
+        except AccountError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except (TimeoutError, psycopg.errors.LockNotAvailable) as exc:
+            raise HTTPException(status_code=409, detail="账号资料正在处理其他操作，请稍后重试注销") from exc
+        except Exception as exc:
+            logger.exception("[账号] 注销清理未完成 user_id=%s", user_id)
+            raise HTTPException(status_code=503, detail="注销清理未完成，部分数据可能已删除。账号仍保留，请重试注销。") from exc
 
 
 
@@ -852,17 +938,22 @@ def _background_task_done(task: asyncio.Task) -> None:
 
 async def _run_generation(req: ChatRequest, user_id: int, generation_id: int, slot: str):
     try:
-        await run_generation(
-            lambda should_stop: agent.stream_answer(
-                req.message, f"{user_id}:{req.thread_id}", kb_only=req.kb_only, should_stop=should_stop,
-                user_id=user_id, project_id=req.project_id,
-            ),
-            partial(save_generation_progress, generation_id),
-            partial(finish_generation, generation_id),
-            deadline=CHAT_STREAM_DEADLINE_SECONDS,
-            save_interval=CHAT_GENERATION_SAVE_SECONDS,
-            on_bridge=lambda bridge: _bind_chat_slot_cancel(slot, bridge.stop),
-        )
+        with span("generation.execute", kb_only=req.kb_only) as execution:
+            status = await run_generation(
+                lambda should_stop: agent.stream_answer(
+                    req.message, f"{user_id}:{req.thread_id}", kb_only=req.kb_only, should_stop=should_stop,
+                    user_id=user_id, project_id=req.project_id,
+                ),
+                partial(save_generation_progress, generation_id),
+                partial(finish_generation, generation_id),
+                deadline=CHAT_STREAM_DEADLINE_SECONDS,
+                save_interval=CHAT_GENERATION_SAVE_SECONDS,
+                on_bridge=lambda bridge: _bind_chat_slot_cancel(slot, bridge.stop),
+            )
+            if status == "failed":
+                execution.fail("generation_failed")
+            elif status == "cancelled":
+                execution.status = "cancelled"
     finally:
         await _release_chat_slot(user_id, slot)
 
@@ -880,6 +971,7 @@ async def _generation_events(user_id: int, conv_id: str, request_id: str, auth_v
         if generation is None:
             yield _sse({"type": "error", "status": "error", "error": "未找到这次回答，请刷新页面后重试。"})
             return
+        generation.pop("user_content")
         # elapsed_seconds 每次读取都会变；仅内容、阶段或状态改变时推送完整快照。
         signature = {k: v for k, v in generation.items() if k != "elapsed_seconds"}
         if signature != previous:
@@ -926,11 +1018,13 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
             raise HTTPException(status_code=410, detail="项目已删除，历史对话仅供查看，无法继续提问")
         if existing["kb_only"] != req.kb_only or existing["project_id"] != req.project_id:
             raise HTTPException(status_code=409, detail="请求编号已用于其他模式或项目，请重新发送")
+        if existing["user_content"] != req.message or existing["retry_of"] != req.retry_of:
+            raise HTTPException(status_code=409, detail="请求编号已用于不同的问题或重试，请使用新的请求编号")
         # 幂等重放和恢复只订阅已有任务，不消耗新的并发槽位或发送额度。
         return StreamingResponse(_generation_events(user["user_id"], req.thread_id, req.request_id, user["auth_version"]),
                                  media_type="text/event-stream", headers=SSE_HEADERS)
     if req.kb_only and await asyncio.to_thread(_upload_task_store.has_active, user["user_id"], req.project_id):
-        raise HTTPException(status_code=409, detail="项目资料正在入库，请等待完成后再提问；新文件显示“已入库”后才能用于回答")
+        raise HTTPException(status_code=409, detail="资料正在入库或仍需恢复，请查看“最近上传”；已中断的任务请执行“修复与补建”")
     if not await asyncio.to_thread(
         consume_rate_limit, "chat", str(user["user_id"]), CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_SECONDS
     ):
@@ -957,6 +1051,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
             CHAT_GENERATION_STALE_SECONDS,
             req.kb_only,
             req.project_id,
+            req.retry_of,
         )
     except Exception as e:
         await _release_chat_slot(user["user_id"], slot)
@@ -979,6 +1074,8 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=409, detail="此会话的问答模式已固定，请开启新对话后切换模式")
 
     project_errors = {
+        "content_conflict": (409, "请求编号已用于不同的问题，请使用新的请求编号"),
+        "invalid_retry": (409, "只能重新生成当前会话中已失败或已取消的原问题"),
         "project_required": (400, "请先选择知识库项目"),
         "project_not_found": (404, "项目不存在或已被删除"),
         "project_deleted": (410, "项目已删除，历史对话仅供查看，无法继续提问"),
@@ -994,10 +1091,13 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         await _release_chat_slot(user["user_id"], slot)
     else:
         # 在返回响应前启动独立任务；断开 SSE 只结束订阅。
-        generation_task = asyncio.create_task(
-            _run_generation(req, user["user_id"], begun["generation_id"], slot),
-            name=f"generation-{begun['generation_id']}",
-        )
+        with bind_context(ExecutionContext(http_request_id=current_context.get().http_request_id,
+                          trace_id=begun["trace_id"], user_id=user["user_id"], project_id=req.project_id,
+                          generation_id=begun["generation_id"], attempt_id=begun["attempt_id"])):
+            generation_task = asyncio.create_task(
+                _run_generation(req, user["user_id"], begun["generation_id"], slot),
+                name=f"generation-{begun['generation_id']}",
+            )
         _generation_tasks.add(generation_task)
         generation_task.add_done_callback(_background_task_done)
         try:
@@ -1015,17 +1115,33 @@ def api_list_projects(user: dict = Depends(get_current_user)):
     return {"projects": list_projects(user["user_id"])}
 
 
+@app.get("/api/generations/{generation_id}/trace")
+def get_generation_trace(generation_id: int, user: dict = Depends(get_current_user)):
+    result = generation_trace(PG_CONN, user["user_id"], generation_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="生成任务不存在")
+    return result
+
+
+@app.get("/api/audit-events")
+def get_audit_events(before: int | None = Query(None, gt=0), limit: int = Query(30, ge=1, le=100),
+                     user: dict = Depends(get_current_user)):
+    return audit_page(PG_CONN, user["user_id"], before, limit)
+
+
 @app.post("/api/projects", status_code=201)
 def api_create_project(req: ProjectRequest, user: dict = Depends(get_current_user)):
-    return {"project": create_project(user["user_id"], req.name)}
+    with audit_operation(user["user_id"], "project.create", "project", "new", transactional=True) as operation:
+        return {"project": create_project(user["user_id"], req.name)}
 
 
 @app.patch("/api/projects/{project_id}")
 def api_update_project(req: ProjectRequest, project: dict = Depends(require_project)):
-    updated = update_project(project["user_id"], project["id"], req.name)
-    if updated is None:
-        raise HTTPException(status_code=404, detail="项目不存在或已被删除")
-    return {"project": updated}
+    with audit_operation(project["user_id"], "project.rename", "project", project["id"], project_id=project["id"], transactional=True) as operation:
+        updated = update_project(project["user_id"], project["id"], req.name)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="项目不存在或已被删除")
+        return {"project": updated}
 
 
 def _remove_project_files(user_id: int, project_id: str) -> None:
@@ -1040,34 +1156,35 @@ def _remove_project_files(user_id: int, project_id: str) -> None:
 
 @app.delete("/api/projects/{project_id}")
 def api_delete_project(project: dict = Depends(require_project)):
-    user_id, project_id = project["user_id"], project["id"]
+    with audit_operation(project["user_id"], "project.delete", "project", project["id"], project_id=project["id"], transactional=True) as operation:
+        user_id, project_id = project["user_id"], project["id"]
 
-    def cleanup(conversation_ids):
-        for conv_id in conversation_ids:
-            _purge_thread_checkpoints(f"{user_id}:{conv_id}")
-        store = get_vector_store(user_id, project_id)
-        store.drop_project_index()
-        _remove_project_files(user_id, project_id)
-        agent.forget_project(user_id, project_id)
+        def cleanup(conversation_ids):
+            for conv_id in conversation_ids:
+                _purge_thread_checkpoints(f"{user_id}:{conv_id}")
+            store = get_vector_store(user_id, project_id)
+            store.drop_project_index()
+            _remove_project_files(user_id, project_id)
+            agent.forget_project(user_id, project_id)
 
-    try:
-        with _index_write_section(user_id, project_id):
-            result = delete_project(user_id, project_id, CHAT_GENERATION_STALE_SECONDS, cleanup)
-        if result["status"] == "not_found":
-            raise HTTPException(status_code=404, detail="项目不存在或已被删除")
-        if result["status"] == "busy":
-            raise HTTPException(status_code=409, detail="项目中有回答正在生成，请停止或等待完成后再删除")
-        _invalidate_health(user_id, project_id)
-        return {"message": "项目文档和索引已删除，历史对话已保留，仅供查看"}
-    except HTTPException:
-        raise
-    except TimeoutError:
-        raise HTTPException(status_code=503, detail="项目正在处理其他操作，请稍后重试")
-    except Exception:
-        logger.exception("[项目] 删除失败 project_id=%s", project_id)
-        raise HTTPException(status_code=503, detail="项目清理未完成，请重试删除")
-    finally:
-        _invalidate_health(user_id, project_id)
+        try:
+            with _index_write_section(user_id, project_id):
+                result = delete_project(user_id, project_id, CHAT_GENERATION_STALE_SECONDS, cleanup)
+            if result["status"] == "not_found":
+                raise HTTPException(status_code=404, detail="项目不存在或已被删除")
+            if result["status"] == "busy":
+                raise HTTPException(status_code=409, detail="项目中有回答正在生成，请停止或等待完成后再删除")
+            _invalidate_health(user_id, project_id)
+            return {"message": "项目文档和索引已删除，历史对话已保留，仅供查看"}
+        except HTTPException:
+            raise
+        except TimeoutError:
+            raise HTTPException(status_code=503, detail="项目正在处理其他操作，请稍后重试")
+        except Exception:
+            logger.exception("[项目] 删除失败 project_id=%s", project_id)
+            raise HTTPException(status_code=503, detail="项目清理未完成，请重试删除")
+        finally:
+            _invalidate_health(user_id, project_id)
 
 
 def _ensure_project(project):
@@ -1077,7 +1194,7 @@ def _ensure_project(project):
 
 def _ensure_no_uploads(user_id: int, project_id: str) -> None:
     if _upload_task_store.has_active(user_id, project_id):
-        raise HTTPException(status_code=409, detail="项目有上传任务等待或正在入库，请完成后重试")
+        raise HTTPException(status_code=409, detail="资料正在入库或仍需恢复，请查看“最近上传”；已中断的任务请执行“修复与补建”")
 
 
 def _safe_filename(filename: str) -> str:
@@ -1132,28 +1249,29 @@ def get_source_passage(
     project: dict = Depends(require_project),
 ):
     """按账号鉴权后重新读取原文；历史引用不能悄悄落到覆盖后的新版本。"""
-    user_id, project_id = project["user_id"], project["id"]
-    try:
-        filename = _safe_filename(filename)
-        file_path = scoped_knowledge_file(get_knowledge_dir(user_id, project_id), filename)
-        with shared_section(PG_CONN, project_index_lock_key(user_id, project_id), timeout_seconds=10), \
-                project_access(user_id, project_id) as current:
-            _ensure_project(current)
-            passage = read_source_passage(file_path, version, unit, start, end, digest)
-        return JSONResponse(passage, headers={"Cache-Control": "no-store"})
-    except HTTPException:
-        raise
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except SourceVersionChanged as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except TimeoutError:
-        raise HTTPException(status_code=503, detail="原文件正在更新，请稍后重试")
-    except Exception:
-        logger.exception("[原文引用] 读取失败 project_id=%s file=%s", project_id, filename)
-        raise HTTPException(status_code=503, detail="暂时无法读取原文，请稍后重试")
+    with audit_operation(project["user_id"], "source.read", "file", resource_digest(filename), project_id=project["id"]) as operation:
+        user_id, project_id = project["user_id"], project["id"]
+        try:
+            filename = _safe_filename(filename)
+            file_path = scoped_knowledge_file(get_knowledge_dir(user_id, project_id), filename)
+            with shared_section(PG_CONN, project_index_lock_key(user_id, project_id), timeout_seconds=10), \
+                    project_access(user_id, project_id) as current:
+                _ensure_project(current)
+                passage = read_source_passage(file_path, version, unit, start, end, digest)
+            return JSONResponse(passage, headers={"Cache-Control": "no-store"})
+        except HTTPException:
+            raise
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except SourceVersionChanged as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except TimeoutError:
+            raise HTTPException(status_code=503, detail="原文件正在更新，请稍后重试")
+        except Exception:
+            logger.exception("[原文引用] 读取失败 project_id=%s file=%s", project_id, filename)
+            raise HTTPException(status_code=503, detail="暂时无法读取原文，请稍后重试")
 
 
 def _write_upload_to(file: UploadFile, tmp_path: str) -> None:
@@ -1173,45 +1291,47 @@ def _write_upload_to(file: UploadFile, tmp_path: str) -> None:
 
 @app.post("/api/projects/{project_id}/files/upload", status_code=202)
 def upload_files(files: list[UploadFile] = File(...), project: dict = Depends(require_project)):
-    started = time.monotonic()
-    user_id, project_id = project["user_id"], project["id"]
-    staged, errors = [], []
-    # 项目共享锁防止暂存期间项目被删除；此处不持有索引锁，
-    # 即使嵌入请求缓慢，也不会阻塞上传保存。
-    with project_access(user_id, project_id) as current:
-        _ensure_project(current)
-        knowledge_dir = get_knowledge_dir(user_id, project_id)
-        os.makedirs(knowledge_dir, exist_ok=True)
-        try:
-            for file in files:
-                name = file.filename or ""
-                staged_path = scoped_knowledge_file(knowledge_dir, os.path.join(knowledge_dir, f".upload_{uuid.uuid4().hex}"))
-                accepted = False
-                try:
-                    name = _safe_filename(name)
-                    if os.path.splitext(name)[1].lower() not in allowed_types:
-                        raise ValueError("支持的文件类型：" + "、".join(ext.lstrip(".").upper() for ext in allowed_types))
-                    _write_upload_to(file, staged_path)
-                    staged.append({"name": name, "staged_path": staged_path})
-                    accepted = True
-                except ValueError as exc:
-                    errors.append({"name": name or "(无名文件)", "error": str(exc)})
-                except Exception:
-                    logger.exception("[知识库] 上传落盘失败 file=%s project_id=%s", name, project_id)
-                    errors.append({"name": name, "error": "上传失败，请稍后重试"})
-                finally:
-                    if not accepted:
-                        _remove_staged_upload(user_id, project_id, staged_path)
-            if not staged:
-                return {"task_id": None, "errors": errors}
-            task_id = _upload_task_store.create(user_id, project_id, staged)
-        except BaseException:
-            for item in staged:
-                _remove_staged_upload(user_id, project_id, item["staged_path"])
-            raise
-    logger.info("[上传] 已保存并排队 task_id=%s 文件=%s 保存耗时=%.3fs",
-                task_id, len(staged), time.monotonic() - started)
-    return {"task_id": task_id, "errors": errors}
+    with audit_operation(project["user_id"], "file.upload", "project", project["id"], project_id=project["id"], transactional=True) as operation:
+        started = time.monotonic()
+        user_id, project_id = project["user_id"], project["id"]
+        staged, errors = [], []
+        # 项目共享锁防止暂存期间项目被删除；此处不持有索引锁，
+        # 即使嵌入请求缓慢，也不会阻塞上传保存。
+        with project_access(user_id, project_id) as current:
+            _ensure_project(current)
+            knowledge_dir = get_knowledge_dir(user_id, project_id)
+            os.makedirs(knowledge_dir, exist_ok=True)
+            try:
+                for file in files:
+                    name = file.filename or ""
+                    staged_path = scoped_knowledge_file(knowledge_dir, os.path.join(knowledge_dir, f".upload_{uuid.uuid4().hex}"))
+                    accepted = False
+                    try:
+                        name = _safe_filename(name)
+                        if os.path.splitext(name)[1].lower() not in allowed_types:
+                            raise ValueError("支持的文件类型：" + "、".join(ext.lstrip(".").upper() for ext in allowed_types))
+                        _write_upload_to(file, staged_path)
+                        staged.append({"name": name, "staged_path": staged_path})
+                        accepted = True
+                    except ValueError as exc:
+                        errors.append({"name": name or "(无名文件)", "error": str(exc)})
+                    except Exception:
+                        logger.exception("[知识库] 上传落盘失败 file=%s project_id=%s", name, project_id)
+                        errors.append({"name": name, "error": "上传失败，请稍后重试"})
+                    finally:
+                        if not accepted:
+                            _remove_staged_upload(user_id, project_id, staged_path)
+                if not staged:
+                    operation.record("denied", "upload_rejected")
+                    return {"task_id": None, "errors": errors}
+                task_id = _upload_task_store.create(user_id, project_id, staged)
+            except BaseException:
+                for item in staged:
+                    _remove_staged_upload(user_id, project_id, item["staged_path"])
+                raise
+        logger.info("[上传] 已保存并排队 task_id=%s 文件=%s 保存耗时=%.3fs",
+                    task_id, len(staged), time.monotonic() - started)
+        return {"task_id": task_id, "errors": errors}
 
 
 @app.get("/api/projects/{project_id}/upload-tasks")
@@ -1230,54 +1350,57 @@ def get_upload_task(task_id: UUID, project: dict = Depends(require_project)):
 
 @app.delete("/api/projects/{project_id}/files/{filename}")
 def delete_file(filename: str, project: dict = Depends(require_project)):
-    user_id, project_id = project["user_id"], project["id"]
-    _ensure_no_uploads(user_id, project_id)
-    try:
-        filename = _safe_filename(filename)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    directory = get_knowledge_dir(user_id, project_id)
-    file_path = scoped_knowledge_file(directory, os.path.join(directory, filename))
-    try:
-        with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
-            _ensure_project(current)
-            _ensure_no_uploads(user_id, project_id)
-            if not os.path.isfile(file_path):
-                raise HTTPException(status_code=404, detail="文件不存在")
-            os.remove(file_path)
-            _invalidate_health(user_id, project_id)
-            get_vector_store(user_id, project_id).delete_file_index(file_path)
-        return {"message": f"已删除: {filename}"}
-    except HTTPException:
-        raise
-    except TimeoutError:
-        raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
-    except Exception:
-        logger.exception("[知识库] 删除失败 file=%s project_id=%s", filename, project_id)
-        detail = "删除文件失败，请稍后重试" if os.path.exists(file_path) else "文件已删除，但索引清理失败，请执行索引修复"
-        raise HTTPException(status_code=500, detail=detail)
+    with audit_operation(project["user_id"], "file.delete", "file", resource_digest(filename), project_id=project["id"]) as operation:
+        user_id, project_id = project["user_id"], project["id"]
+        _ensure_no_uploads(user_id, project_id)
+        try:
+            filename = _safe_filename(filename)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        directory = get_knowledge_dir(user_id, project_id)
+        file_path = scoped_knowledge_file(directory, os.path.join(directory, filename))
+        try:
+            with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
+                _ensure_project(current)
+                _ensure_no_uploads(user_id, project_id)
+                if not os.path.isfile(file_path):
+                    raise HTTPException(status_code=404, detail="文件不存在")
+                os.remove(file_path)
+                _invalidate_health(user_id, project_id)
+                get_vector_store(user_id, project_id).delete_file_index(file_path)
+            return {"message": f"已删除: {filename}"}
+        except HTTPException:
+            raise
+        except TimeoutError:
+            raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
+        except Exception:
+            logger.exception("[知识库] 删除失败 file=%s project_id=%s", filename, project_id)
+            detail = "删除文件失败，请稍后重试" if os.path.exists(file_path) else "文件已删除，但索引清理失败，请执行索引修复"
+            raise HTTPException(status_code=500, detail=detail)
 
 
 @app.post("/api/projects/{project_id}/vector/build")
 def build_knowledge_index(project: dict = Depends(require_project)):
-    user_id, project_id = project["user_id"], project["id"]
-    _ensure_no_uploads(user_id, project_id)
-    try:
-        with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
-            _ensure_project(current)
-            _ensure_no_uploads(user_id, project_id)
-            failures = get_vector_store(user_id, project_id).index_pending_files()
-            _invalidate_health(user_id, project_id)
-        # API只暴露用户可理解的文件名，绝对存储路径保留在后端。
-        failures = [{**item, "file": os.path.basename(item["file"])} for item in failures]
-        return {"message": f"构建完成，但有 {len(failures)} 个文件失败" if failures else "构建完成", "failures": failures}
-    except HTTPException:
-        raise
-    except TimeoutError:
-        raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
-    except Exception:
-        logger.exception("[知识库] 构建失败 project_id=%s", project_id)
-        raise HTTPException(status_code=500, detail="构建失败，请稍后重试")
+    with audit_operation(project["user_id"], "index.build", "project", project["id"], project_id=project["id"]) as operation:
+        user_id, project_id = project["user_id"], project["id"]
+        _ensure_no_uploads(user_id, project_id)
+        try:
+            with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
+                _ensure_project(current)
+                _ensure_no_uploads(user_id, project_id)
+                failures = get_vector_store(user_id, project_id).index_pending_files()
+                _invalidate_health(user_id, project_id)
+            # API只暴露用户可理解的文件名，绝对存储路径保留在后端。
+            failures = [{**item, "file": os.path.basename(item["file"])} for item in failures]
+            operation.result = "partial" if failures else "succeeded"
+            return {"message": f"构建完成，但有 {len(failures)} 个文件失败" if failures else "构建完成", "failures": failures}
+        except HTTPException:
+            raise
+        except TimeoutError:
+            raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
+        except Exception:
+            logger.exception("[知识库] 构建失败 project_id=%s", project_id)
+            raise HTTPException(status_code=500, detail="构建失败，请稍后重试")
 
 
 @app.get("/api/projects/{project_id}/index/health")
@@ -1292,22 +1415,24 @@ async def get_index_health(request: Request, refresh: bool = False, project: dic
 
 @app.post("/api/projects/{project_id}/index/health/repair")
 def repair_index_health(project: dict = Depends(require_project)):
-    user_id, project_id = project["user_id"], project["id"]
-    _ensure_no_uploads(user_id, project_id)
-    try:
-        with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
-            _ensure_project(current)
-            _ensure_no_uploads(user_id, project_id)
-            report = IndexHealth(user_id, project_id).repair(include_pending=True)
-            _health_cache(user_id, project_id).set({"report": report})
-        return report
-    except HTTPException:
-        raise
-    except TimeoutError:
-        raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
-    except Exception:
-        logger.exception("[索引健康检查] 修复与补建失败 project_id=%s", project_id)
-        raise HTTPException(status_code=500, detail="修复与补建失败，请稍后重试")
+    with audit_operation(project["user_id"], "index.repair", "project", project["id"], project_id=project["id"]) as operation:
+        user_id, project_id = project["user_id"], project["id"]
+        try:
+            with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
+                _ensure_project(current)
+                _resolve_pending_uploads(user_id, project_id)
+                _ensure_no_uploads(user_id, project_id)
+                report = IndexHealth(user_id, project_id).repair(include_pending=True)
+                _health_cache(user_id, project_id).set({"report": report})
+            operation.result = "succeeded" if report["healthy"] else "partial"
+            return report
+        except HTTPException:
+            raise
+        except TimeoutError:
+            raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
+        except Exception:
+            logger.exception("[索引健康检查] 修复与补建失败 project_id=%s", project_id)
+            raise HTTPException(status_code=500, detail="修复与补建失败，请稍后重试")
 
 
 if __name__ == "__main__":

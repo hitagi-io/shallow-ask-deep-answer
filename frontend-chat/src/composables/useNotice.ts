@@ -1,7 +1,7 @@
 import { onUnmounted, ref } from 'vue'
 
-/** 每个调用方只保留一条可替换的提示；旧计时器不能关闭新提示。 */
-export function useNotice(duration = 4000) {
+/** 每个调用方只保留一条可替换的提示；错误默认保留，临时警报可指定收起时间。 */
+export function useNotice(duration = 4000, options: { errorDuration?: number } = {}) {
   const message = ref('')
   const type = ref<'success' | 'error' | ''>('')
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -16,7 +16,8 @@ export function useNotice(duration = 4000) {
     clear()
     message.value = text
     type.value = kind
-    if (duration > 0 && kind !== 'error') timer = setTimeout(clear, duration)
+    const timeout = kind === 'error' ? options.errorDuration ?? 0 : duration
+    if (timeout > 0) timer = setTimeout(clear, timeout)
   }
   onUnmounted(() => { disposed = true; clear() })
   return { message, type, show, clear }

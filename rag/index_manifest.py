@@ -224,6 +224,20 @@ class ManifestStore:
             """, (self.namespace, index_version)).fetchall()
         return [row["index_id"] for row in rows]
 
+    def is_published(self, source: str, digest: str, index_id: str) -> bool:
+        """先等待同一清单的未决事务结束，再核对发布映射，处理提交回执丢失。"""
+        with self._connect() as conn:
+            conn.execute("SET LOCAL lock_timeout='5s'")
+            conn.execute("SET LOCAL statement_timeout='5s'")
+            record = conn.execute("SELECT state,index_id FROM index_manifests "
+                                  "WHERE namespace=%s AND content_sha256=%s AND source_format=%s FOR UPDATE",
+                                  (self.namespace,digest,document_format(source))).fetchone()
+            if record is None or record["state"] != "ready" or record["index_id"] != index_id:
+                return False
+            return conn.execute("SELECT 1 FROM published_source_files WHERE namespace=%s AND source=%s "
+                                "AND content_sha256=%s AND source_format=%s",
+                                (self.namespace,source,digest,document_format(source))).fetchone() is not None
+
     def published_files(self) -> dict[str, str]:
         with self._connect() as conn:
             rows = conn.execute("""

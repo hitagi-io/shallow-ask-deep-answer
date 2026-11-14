@@ -2,6 +2,7 @@
 
 import os
 import threading
+import json
 from collections import OrderedDict
 from datetime import date
 from string import Template
@@ -18,13 +19,16 @@ from psycopg_pool import ConnectionPool
 from utils.chat.answer_guard import SEARCH_ERROR_MARKER, guarded_stream
 from utils.retrieval.retrieval_protocol import build_clarification_content
 from utils.core.config_loader import agent_config
-from utils.core.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
+from utils.core.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section, conversation_execution_lock_key
 from utils.chat.prompt_loader import (
     load_conversation_summary_prompt,
     render_general_prompt,
     render_kb_agent_prompt,
 )
 from utils.core.logging_config import get_logger
+from utils.observability.tracing import span, fingerprint
+from utils.observability.callbacks import AgentTraceCallback
+from utils.observability.context import remaining_seconds, ExecutionStopped, ExecutionDeadlineExceeded
 from utils.chat.search_results import SEARCH_CONTENT_LIMIT, SEARCH_MAX_CALLS, SEARCH_RESULT_LIMIT, format_search_response
 from rag.retrieval_agent import build_retrieval_subagent
 from utils.core.project_paths import knowledge_scope
@@ -103,7 +107,11 @@ def tavily_search(query: str) -> str:
             __SEARCH_EMPTY__。仅整条结果精确等于标记时按失败处理。
     """
     try:
-        resp = _get_tavily().invoke(query)
+        with span("tool.tavily_search"):
+            remaining_seconds()
+            resp = _get_tavily().invoke(query)
+    except (ExecutionStopped, ExecutionDeadlineExceeded):
+        raise
     except Exception as e:
         logger.error(f"[联网搜索] 搜索请求失败，已向模型返回故障标记：{e}")
         return SEARCH_ERROR_MARKER
@@ -249,9 +257,21 @@ class ChatAgent:
             agent = self._get_kb_agent(user_id, project_id)
         else:
             agent = self._general_agent
-        raw_stream = agent.stream(
-            {"messages": [{"role": "human", "content": query}]},
-            config={"configurable": {"thread_id": thread_id}},
-            stream_mode="messages",
-        )
-        yield from guarded_stream(raw_stream, kb_only=kb_only, should_stop=should_stop)
+        def check_execution() -> None:
+            remaining_seconds()
+
+        with exclusive_section(_PG_CONNECTION_STRING, conversation_execution_lock_key(thread_id),
+                               remaining_seconds(), cancel_check=check_execution), \
+                span("agent.execute", prompt_hash=fingerprint(self.kb_only_prompt if kb_only else self.general_prompt),
+                  config_hash=fingerprint(json.dumps(agent_config, sort_keys=True)), date=date.today().isoformat()):
+            callback = AgentTraceCallback(os.getenv("MAIN_AGENT_MODEL") or agent_config["main_agent_model"])
+            try:
+                remaining_seconds()
+                raw_stream = agent.stream(
+                    {"messages": [{"role": "human", "content": query}]},
+                    config={"configurable": {"thread_id": thread_id}, "callbacks": [callback]},
+                    stream_mode="messages",
+                )
+                yield from guarded_stream(raw_stream, kb_only=kb_only, should_stop=should_stop)
+            finally:
+                callback.close()

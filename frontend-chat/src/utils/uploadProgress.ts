@@ -21,6 +21,7 @@ export interface UploadTask {
   succeeded: number
   failed: number
   error: string | null
+  recovery_required: boolean
   files: {
     name: string
     status: 'queued' | 'running' | 'success' | 'error'
@@ -79,7 +80,7 @@ export function parseUploadTasks(value: unknown): UploadTask[] {
     if (!isRecord(task) || typeof task.task_id !== 'string'
         || (task.status !== 'queued' && task.status !== 'running' && task.status !== 'completed' && task.status !== 'failed')
         || !isCount(task.total) || !isCount(task.completed) || !isCount(task.succeeded) || !isCount(task.failed)
-        || !isNullableText(task.error) || !Array.isArray(task.files)) return invalidProgress()
+        || !isNullableText(task.error) || typeof task.recovery_required !== 'boolean' || !Array.isArray(task.files)) return invalidProgress()
     const files = task.files.map((file: unknown): UploadTask['files'][number] => {
       if (!isRecord(file) || typeof file.name !== 'string'
           || (file.status !== 'queued' && file.status !== 'running' && file.status !== 'success' && file.status !== 'error')
@@ -90,6 +91,6 @@ export function parseUploadTasks(value: unknown): UploadTask[] {
         error: file.error, progress: parseProgress(file.progress), file_exists: file.file_exists }
     })
     return { task_id: task.task_id, status: task.status, total: task.total, completed: task.completed,
-      succeeded: task.succeeded, failed: task.failed, error: task.error, files }
+      succeeded: task.succeeded, failed: task.failed, error: task.error, recovery_required: task.recovery_required, files }
   })
 }

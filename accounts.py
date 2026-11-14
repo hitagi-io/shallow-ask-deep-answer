@@ -7,6 +7,7 @@ from psycopg.rows import dict_row
 
 import auth
 from utils.core.pg_lock import project_index_lock_key
+from utils.observability.audit import append_audit
 
 
 class AccountError(ValueError):
@@ -57,6 +58,10 @@ def update_account(user_id: int, version: int, *, username: str | None = None,
                 if username is not None:
                     cur.execute("UPDATE users SET username = %s WHERE id = %s", (username, user_id))
                     user["username"] = username
+                append_audit(cur, user_id=user_id, action="account.update", resource_type="account",
+                             resource_id=str(user_id), result="succeeded",
+                             details={"fields": (["username"] if username is not None else []) +
+                                      (["password"] if new_password is not None else [])})
             conn.commit()
     except UniqueViolation as exc:
         raise AccountError("用户名已存在，请换一个名字", 409) from exc
@@ -127,5 +132,7 @@ def delete_account(user_id: int, version: int, token: str, confirmation: str, *,
             if cur.fetchone() is not None:
                 raise AccountError("有对话请求正在启动，请稍后重试注销", 409)
             cleanup(project_ids, conversation_ids)
+            append_audit(cur, user_id=user_id, action="account.delete", resource_type="account",
+                         resource_id=str(user_id), result="succeeded")
             cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
         conn.commit()

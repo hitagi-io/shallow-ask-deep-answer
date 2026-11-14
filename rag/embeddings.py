@@ -60,6 +60,7 @@ class DashScopeEmbeddings(Embeddings):
             if not isinstance(items, list) or len(items) != len(batch):
                 raise ValueError("返回条数不符")
             indexed = {}
+            dimension = None
             for item in items:
                 index, vector = item["text_index"], item["embedding"]
                 if type(index) is not int or not 0 <= index < len(batch) or index in indexed:
@@ -67,6 +68,10 @@ class DashScopeEmbeddings(Embeddings):
                 if (not isinstance(vector, list) or not vector
                         or any(type(v) not in (int, float) or not math.isfinite(v) for v in vector)):
                     raise ValueError("向量内容无效")
+                if dimension is None:
+                    dimension = len(vector)
+                elif len(vector) != dimension:
+                    raise DashScopeRequestError("embedding 向量维度不一致")
                 indexed[index] = vector
             return [indexed[i] for i in range(len(batch))]
         except (KeyError, TypeError, ValueError) as exc:
@@ -112,11 +117,11 @@ class DashScopeEmbeddings(Embeddings):
                         done, _ = wait(pending, return_when=FIRST_COMPLETED)
                         for future in done:
                             batch = future.result()
-                            for vector in batch:
-                                if dimension is None:
-                                    dimension = len(vector)
-                                if len(vector) != dimension:
-                                    raise DashScopeRequestError("embedding 向量维度不一致")
+                            # 每批响应已校验内部维度，只需比较批次之间的维度。
+                            if dimension is None:
+                                dimension = len(batch[0])
+                            elif len(batch[0]) != dimension:
+                                raise DashScopeRequestError("embedding 向量维度不一致")
                             batches[pending.pop(future)] = batch
                             completed += len(batch)
                             if on_progress is not None:
@@ -128,8 +133,6 @@ class DashScopeEmbeddings(Embeddings):
                     stopped.set()
                     executor.shutdown(wait=True, cancel_futures=True)
         vectors = [vector for start in sorted(batches) for vector in batches[start]]
-        if any(len(vector) != len(vectors[0]) for vector in vectors):
-            raise DashScopeRequestError("embedding 向量维度不一致")
         if count == 1 and on_progress is not None:
             on_progress(len(texts), len(texts))
         if text_type == "document":

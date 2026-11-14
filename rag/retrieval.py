@@ -4,18 +4,24 @@ from __future__ import annotations
 import json
 import math
 import time
+from typing import TYPE_CHECKING
+
+from langchain_core.documents import Document
 
 from utils.core.config_loader import load_config
 from utils.retrieval.source_evidence import text_digest
 from utils.core.dashscope_client import DashScopeRequestError, make_client, request_json, validate_request_settings
 from utils.core.logging_config import get_logger
+from utils.observability.tracing import span, fingerprint
+from utils.observability.context import remaining_seconds
+
+if TYPE_CHECKING:
+    from rag.vector_store import VectorStore
 
 logger = get_logger(__name__)
 
 
 def validate_settings(config: dict) -> dict:
-    if not isinstance(config, dict):
-        raise ValueError("retrieval.yaml 必须为键值映射")
     for name, high in (("top_k", 250), ("candidate_k", 250), ("rrf_k", 16383)):
         value = config.get(name)
         if type(value) is not int or not 1 <= value <= high:
@@ -88,11 +94,10 @@ def rerank_documents(query: str, candidates, top_k: int, config: dict):
 
 
 class HybridRetriever:
-    def __init__(self, store, settings=None):
+    def __init__(self, store: VectorStore):
         self.store = store
-        self.settings = validate_settings(SETTINGS if settings is None else settings)
 
-    def search(self, query: str):
+    def search(self, query: str) -> list[Document]:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("检索 query 必须为非空字符串")
         started = time.perf_counter()
@@ -105,28 +110,41 @@ class HybridRetriever:
         expression = f"index_id in {json.dumps(index_ids)}"
         self.store.ensure_search_ready()
         vector_store = self.store.vector_store
-        if not vector_store.fields:
-            return []
         if not {"vector", "sparse"}.issubset(vector_store.fields):
             raise RuntimeError("当前集合缺少混合检索字段，需从源文件重建混合索引")
         params = dict(zip(vector_store._vector_field, vector_store.search_params))
-        vector = vector_store.embedding_func.embed_query(query)
+        with span("retrieval.embedding"):
+            remaining_seconds()
+            vector = vector_store.embedding_func.embed_query(query)
 
         def search_field(field, value):
+            remaining = remaining_seconds()
+            timeout = SETTINGS["search_timeout_seconds"]
             raw = vector_store.client.search(
                 collection_name=vector_store.collection_name, data=[value], anns_field=field,
                 filter=expression,
-                search_params=params[field], limit=self.settings["candidate_k"],
+                search_params=params[field], limit=SETTINGS["candidate_k"],
                 output_fields=vector_store._get_output_fields(), consistency_level="Strong",
-                timeout=self.settings["search_timeout_seconds"],
+                timeout=min(timeout, remaining) if remaining is not None else timeout,
             )
             return [vector_store._parse_document(dict(hit["entity"])) for hit in raw[0]]
 
-        dense = search_field("vector", vector)
-        sparse = search_field("sparse", query)
+        with span("retrieval.dense") as dense_span:
+            remaining_seconds()
+            dense = search_field("vector", vector)
+            dense_span.attributes["count"] = len(dense)
+        with span("retrieval.bm25") as sparse_span:
+            remaining_seconds()
+            sparse = search_field("sparse", query)
+            sparse_span.attributes["count"] = len(sparse)
         # 保留两路候选的完整并集（最多 40），不能先截成 Top5 再精排。
-        candidates = fuse_rrf([dense, sparse], self.settings["rrf_k"])
-        documents = rerank_documents(query, candidates, self.settings["top_k"], self.settings["rerank"])
+        with span("retrieval.fusion", config_hash=fingerprint(json.dumps(SETTINGS, sort_keys=True))) as fusion:
+            candidates = fuse_rrf([dense, sparse], SETTINGS["rrf_k"])
+            fusion.attributes["count"] = len(candidates)
+        with span("retrieval.rerank", model=SETTINGS["rerank"]["model"]) as rerank:
+            remaining_seconds()
+            documents = rerank_documents(query, candidates, SETTINGS["top_k"], SETTINGS["rerank"])
+            rerank.attributes["count"] = len(documents)
         logger.info("[混合检索] 向量=%s BM25=%s 融合候选=%s 返回=%s 耗时=%.0fms",
                     len(dense), len(sparse), len(candidates), len(documents),
                     (time.perf_counter() - started) * 1000)

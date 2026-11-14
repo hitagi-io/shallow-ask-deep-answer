@@ -125,7 +125,7 @@ async function confirmDeletion() {
     </section>
     <section class="account-panel danger-panel" aria-labelledby="delete-title">
       <div class="panel-description"><h2 id="delete-title">注销账号</h2><p>完成多步骤确认后立即删除账号及其数据。此操作无法撤销。</p></div>
-      <div class="deletion-entry"><p>账号下的项目、上传文档、知识索引和全部对话都会被删除。建议先自行保存需要保留的内容。</p><button class="btn btn-secondary btn-danger" :disabled="busy" @click="moveStep(1)">申请注销账号</button></div>
+      <div class="deletion-entry"><p>账号下的项目、上传文档、知识索引和全部对话都会被删除。建议先自行保存需要保留的内容。操作审计保留编号、操作类型及结果，90 天后自动删除。</p><button class="btn btn-secondary btn-danger" :disabled="busy" @click="moveStep(1)">申请注销账号</button></div>
     </section>
   </SettingsPage>
 

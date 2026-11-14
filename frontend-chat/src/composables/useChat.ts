@@ -17,7 +17,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     })
   }
 
-  const { message: persistNotice, show: showNotice, clear: clearNotice } = useNotice(5000)
+  const { message: persistNotice, show: showNotice, clear: clearNotice } = useNotice(5000, { errorDuration: 8000 })
   function handlePersistError(op: string, e: unknown) {
     if (disposed) return
     console.error(`[操作失败] ${op}:`, e)
@@ -34,7 +34,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   const nextCursor = ref<string | null>(null)
   const loadingMore = ref(false)
   const conversationBusy = ref(false)
-  const failedAttempts = ref<Record<string, { text: string; mode: boolean; projectId: string | null; requestId: string }>>({})
+  const failedAttempts = ref<Record<string, { text: string; mode: boolean; projectId: string | null; requestId: string; retryOf?: number }>>({})
   const canRetrySend = computed(() => {
     const attempt = failedAttempts.value[currentId.value]
     return !!attempt && attempt.mode === kbOnly.value && attempt.projectId === projectId.value && projectReady.value
@@ -76,6 +76,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   const selectedProject = computed(() => projects.value.find(project => project.id === projectId.value))
   const projectDeleted = computed(() => !!conversations.value[currentId.value]?.project_deleted)
   const projectReady = computed(() => !projectDeleted.value && (!kbOnly.value || !!selectedProject.value))
+  watch([currentId, kbOnly, projectId, active], clearNotice, { flush: 'sync' })
   const knowledgeReadiness = useProjectReadiness(computed(() => active.value && kbOnly.value && projectReady.value ? projectId.value : null), updatingProjectId)
   const { blocked: knowledgeBlocked, notice: knowledgeNotice, status: knowledgeStatus, refresh: refreshKnowledgeReadiness } = knowledgeReadiness
   const checkingSend = ref(false)
@@ -300,11 +301,12 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   }
   function retryMessage(index: number) {
     const question = current.value?.messages.slice(0, index).reverse().find(m => m.role === 'user')
-    if (question && !isProcessing.value) void sendMessage(question.content, current.value?.messages[index].kbOnly ?? kbOnly.value)
+    if (question && !isProcessing.value) void sendMessage(question.content, current.value?.messages[index].kbOnly ?? kbOnly.value,
+      undefined, current.value?.messages[index].generation_id ?? undefined)
   }
   function retryFailedSend() {
     const attempt = failedAttempts.value[currentId.value]
-    if (attempt && canRetrySend.value) return sendMessage(attempt.text, attempt.mode, attempt.requestId)
+    if (attempt && canRetrySend.value) return sendMessage(attempt.text, attempt.mode, attempt.requestId, attempt.retryOf)
   }
 
   async function requestStop(id: string, run: GenerationRun) {
@@ -328,7 +330,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   }
 
   async function observeGeneration(id: string, requestId: string, submission?: {
-    text: string; mode: boolean; projectId: string | null; user: Message; assistant: Message; hadMessages: boolean
+    text: string; mode: boolean; projectId: string | null; user: Message; assistant: Message; hadMessages: boolean; retryOf?: number
   }) {
     const conv = conversations.value[id]
     if (!conv || runs.value[id] || disposed) return
@@ -353,6 +355,10 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
           if (!conv.messages.includes(assistant)) conv.messages.push(assistant)
         }
         assistant.id = snapshot.assistant_message_id
+        assistant.generation_id = snapshot.generation_id
+        assistant.trace_id = snapshot.trace_id
+        assistant.result_kind = snapshot.result_kind
+        assistant.error_code = snapshot.error_code
         assistant.content = snapshot.assistant_content || ''
         assistant.kbOnly = snapshot.kb_only
         conv.kbOnly = snapshot.kb_only
@@ -370,12 +376,12 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
         run.thinking = snapshot.status === 'running' && !assistant.content
         if (run.stopping && snapshot.status === 'running') void requestStop(id, run)
         if (currentId.value === id) scrollToBottom()
-      }, value => { run.reconnecting = value }, ac.signal, submission ? { message: submission.text, kbOnly: submission.mode, projectId: submission.projectId } : undefined)
+      }, value => { run.reconnecting = value }, ac.signal, submission ? { message: submission.text, kbOnly: submission.mode, projectId: submission.projectId, retryOf: submission.retryOf } : undefined)
       if (disposed) return
       if (!outcome.started && submission) {
         conv.messages = conv.messages.filter(m => m !== submission.user && m !== submission.assistant)
         conv.hasMessages = submission.hadMessages
-        failedAttempts.value[id] = { text: submission.text, mode: submission.mode, projectId: submission.projectId, requestId }
+        failedAttempts.value[id] = { text: submission.text, mode: submission.mode, projectId: submission.projectId, requestId, retryOf: submission.retryOf }
         handlePersistError('发送消息', new Error(outcome.error || '未能确认是否发送成功，请重试'))
       } else {
         delete failedAttempts.value[id]
@@ -393,12 +399,13 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     }
   }
 
-  async function sendMessage(retryText?: string, answerMode = kbOnly.value, previousRequestId?: string) {
+  async function sendMessage(retryText?: string, answerMode = kbOnly.value, previousRequestId?: string, retryOf?: number) {
     const text = (retryText ?? input.value).trim()
     if (!text || isProcessing.value || conversationBusy.value || loading.value || checkingSend.value || !active.value) return
     const convId = currentId.value
     const conv = conversations.value[convId]
     if (!conv || answerMode !== kbOnly.value || !conv.messagesLoaded || conv.messagesLoading) return
+    clearNotice()
     if (!projectReady.value) {
       showNotice(projectDeleted.value ? PROJECT_DELETED_NOTICE : PROJECT_REQUIRED_NOTICE, 'error')
       return
@@ -429,7 +436,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     }
     if (retryText == null) { input.value = ''; resetInputHeight() }
     jumpToLatest()
-    await observeGeneration(convId, previousRequestId || newRequestId(), { text, mode: answerMode, projectId: answerMode ? conv.project_id : null, user, assistant, hadMessages })
+    await observeGeneration(convId, previousRequestId || newRequestId(), { text, mode: answerMode, projectId: answerMode ? conv.project_id : null, user, assistant, hadMessages, retryOf })
   }
 
   function onKeydown(e: KeyboardEvent) {

@@ -10,6 +10,8 @@ import httpx
 
 from utils.core.logging_config import get_logger
 from utils.runtime.shutdown import check_shutdown
+from utils.observability.context import remaining_seconds, ExecutionDeadlineExceeded
+from utils.observability.tracing import span
 
 logger = get_logger(__name__)
 _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
@@ -39,7 +41,7 @@ def validate_request_settings(config: dict) -> dict:
 
 
 def make_client(config: dict) -> httpx.Client:
-    validate_request_settings(config)
+    """使用嵌入适配器或检索模块初始化时已校验的请求配置。"""
     return httpx.Client(
         timeout=httpx.Timeout(config["timeout_seconds"], connect=config["connect_timeout_seconds"]),
         trust_env=False,
@@ -53,9 +55,16 @@ def request_json(client: httpx.Client, config: dict, payload: dict, operation: s
     attempts = config["max_attempts"]
     for attempt in range(1, attempts + 1):
         check_shutdown()
+        remaining = remaining_seconds()
+        request_timeout = config["timeout_seconds"] if remaining is None else min(config["timeout_seconds"], remaining)
         try:
-            response = client.post(config["endpoint"], json=payload,
-                                   headers={"Authorization": "Bearer " + api_key})
+            with span("provider.request", operation=operation, attempt=attempt) as request_span:
+                response = client.post(config["endpoint"], json=payload,
+                                       headers={"Authorization": "Bearer " + api_key},
+                                       timeout=httpx.Timeout(request_timeout, connect=min(config["connect_timeout_seconds"], request_timeout)))
+                request_span.attributes["http_status"] = response.status_code
+                if not response.is_success:
+                    request_span.fail(f"http_{response.status_code}")
         except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
             reason = type(exc).__name__
             if attempt == attempts:
@@ -74,5 +83,14 @@ def request_json(client: httpx.Client, config: dict, payload: dict, operation: s
                 raise DashScopeRequestError(f"{operation} 返回 {reason}，已尝试 {attempt} 次")
         check_shutdown()
         logger.warning("[模型请求] %s 第 %s/%s 次失败（%s），稍后重试", operation, attempt, attempts, reason)
-        time.sleep(min(2 ** (attempt - 1), 8))
+        delay = min(2 ** (attempt - 1), 8)
+        remaining = remaining_seconds()
+        if remaining is not None and delay >= remaining:
+            raise ExecutionDeadlineExceeded("剩余生成时间不足以重试")
+        # 退避期间也响应停止；不在上层重新执行整个 Agent 或上传任务。
+        until = time.monotonic() + delay
+        while time.monotonic() < until:
+            check_shutdown()
+            remaining_seconds()
+            time.sleep(min(0.1, max(0, until - time.monotonic())))
     raise DashScopeRequestError(f"{operation} 未返回结果")

@@ -1,4 +1,7 @@
 import { parseUploadTasks, type UploadTask } from './utils/uploadProgress'
+import { parseGeneration, parseTrace, parseAuditPage, parseMessageHistory, type GenerationSnapshot, type ResultKind } from './utils/generation'
+import { isRecord } from './utils/validation'
+export type { GenerationSnapshot } from './utils/generation'
 export type { UploadTask } from './utils/uploadProgress'
 import { FILE_PAGE_SIZE, parseFilePage, parseFileSummary, type FileFilter, type FileSort, type FilePage, type FileSummary } from './utils/knowledgeFiles'
 export type { FileItem, FileSummary } from './utils/knowledgeFiles'
@@ -13,6 +16,10 @@ export interface Message {
   thinkingTime?: number
   status?: MessageStatus
   kbOnly?: boolean
+  generation_id?: number | null
+  trace_id?: string | null
+  result_kind?: ResultKind | null
+  error_code?: string | null
 }
 
 export interface MessageHistory {
@@ -88,26 +95,14 @@ function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)
 }
 
-/** 读取本地登录快照；当前身份和权限仍需通过 apiMe 向服务端验证。 */
-export function getStoredUser(): UserInfo | null {
-  const raw = localStorage.getItem(USER_KEY)
-  if (!raw) return null
-  try {
-    return JSON.parse(raw) as UserInfo
-  } catch {
-    // localStorage 被写坏时不能让应用初始化整体报错（会白屏）：清掉坏值按未登录处理
-    localStorage.removeItem(USER_KEY)
-    return null
-  }
-}
-
-function saveAuth(token: string, user: UserInfo) {
-  localStorage.setItem(TOKEN_KEY, token)
-  localStorage.setItem(USER_KEY, JSON.stringify(user))
+/** 是否有待服务端验证的令牌；用户信息由 apiMe 获取。 */
+export function hasAuthToken(): boolean {
+  return !!getToken()
 }
 
 export function clearAuth() {
   localStorage.removeItem(TOKEN_KEY)
+  // 同时清除旧版存储的用户副本；它不再参与登录状态判断。
   localStorage.removeItem(USER_KEY)
 }
 
@@ -174,7 +169,7 @@ export async function apiLogin(username: string, password: string): Promise<User
     throw new Error(await errorMessage(res, '登录失败'))
   }
   const data = await res.json()
-  saveAuth(data.token, data.user)
+  localStorage.setItem(TOKEN_KEY, data.token)
   return data.user
 }
 
@@ -187,7 +182,6 @@ export async function apiMe(): Promise<UserInfo> {
     if (!res.ok) throw new Error(await errorMessage(res, '验证登录状态失败，请稍后重试'))
     const data = await res.json()
     if (!token || token !== getToken()) throw new Error('登录状态已变更')
-    localStorage.setItem(USER_KEY, JSON.stringify(data.user))
     return data.user
   } finally {
     clearTimeout(timeout)
@@ -206,7 +200,7 @@ export async function apiUpdateAccount(changes: { username?: string; current_pas
     if (!res.ok) throw new Error(await errorMessage(res, '保存失败，请重试'))
     const data = await res.json()
     if (changes.new_password !== undefined || data.reauthenticate) clearAuth()
-    else saveAuth(data.token, data.user)
+    else localStorage.setItem(TOKEN_KEY, data.token)
     return data.user
   } finally { credentialChange = null; settle() }
 }
@@ -248,7 +242,7 @@ export async function fetchMessages(id: string, before?: number | null): Promise
   if (before != null) query.set('before', String(before))
   const res = await apiFetch(`/api/conversations/${encodeURIComponent(id)}/messages?${query}`, { headers: authHeaders() })
   if (!res.ok) throw new Error(await errorMessage(res, '获取消息失败'))
-  return res.json()
+  return parseMessageHistory(await res.json())
 }
 
 export async function createConversationApi(title: string): Promise<Conversation> {
@@ -289,19 +283,17 @@ export function newRequestId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
 }
 
-export interface GenerationSnapshot {
-  request_id: string
-  status: 'running' | 'completed' | 'failed' | 'cancelled'
-  assistant_content: string | null
-  assistant_message_id: number
-  user_message_id: number
-  kb_only: boolean
-  project_id: string | null
-  project_name: string | null
-  project_deleted: boolean
-  elapsed_seconds: number
-  phase: string
-  error: string | null
+export async function apiGenerationTrace(generationId: number) {
+  const res = await apiFetch(`/api/generations/${generationId}/trace`, { headers: authHeaders() })
+  if (!res.ok) throw new Error(await errorMessage(res, '无法读取执行记录'))
+  return parseTrace(await res.json())
+}
+
+export async function apiAuditEvents(before: number | null = null) {
+  const query = before === null ? '' : `?before=${before}`
+  const res = await apiFetch(`/api/audit-events${query}`, { headers: authHeaders() })
+  if (!res.ok) throw new Error(await errorMessage(res, '无法读取操作记录'))
+  return parseAuditPage(await res.json())
 }
 
 export interface StreamOutcome {
@@ -342,7 +334,7 @@ export async function streamChat(
   onSnapshot: (snapshot: GenerationSnapshot) => void,
   onConnection: (reconnecting: boolean) => void,
   signal: AbortSignal,
-  submission?: { message: string; kbOnly: boolean; projectId: string | null },
+  submission?: { message: string; kbOnly: boolean; projectId: string | null; retryOf?: number },
 ): Promise<StreamOutcome> {
   let started = !submission
   let submit = submission
@@ -356,7 +348,7 @@ export async function streamChat(
       const res = await apiFetch(initial ? '/api/chat/stream' : `${generationPath(conversationId, requestId)}/stream`, {
         method: initial ? 'POST' : 'GET',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: initial ? JSON.stringify({ message: initial.message, thread_id: conversationId, request_id: requestId, kb_only: initial.kbOnly, project_id: initial.projectId }) : undefined,
+        body: initial ? JSON.stringify({ message: initial.message, thread_id: conversationId, request_id: requestId, kb_only: initial.kbOnly, project_id: initial.projectId, retry_of: initial.retryOf ?? null }) : undefined,
         signal,
       }).catch(error => { throw new StreamConnectionError('连接回答服务失败', error) })
       if (!res.ok) {
@@ -372,14 +364,16 @@ export async function streamChat(
       let buffer = ''
       const handleLine = (line: string): StreamOutcome | null => {
         if (!line.startsWith('data: ')) return null
-        const data = JSON.parse(line.slice(6))
-        if (data.type === 'error') return { status: 'error', started, error: data.error }
-        if (data.type !== 'snapshot') return null
+        const event: unknown = JSON.parse(line.slice(6))
+        if (!isRecord(event)) throw new Error('回答事件格式无效')
+        if (event.type === 'error' && typeof event.error === 'string') return { status: 'error', started, error: event.error }
+        if (event.type !== 'snapshot') throw new Error('未知的回答事件')
+        const data = parseGeneration(event)
         onConnection(false)
-        onSnapshot(data as GenerationSnapshot)
+        onSnapshot(data)
         reconnectAttempts = 0
         if (data.status === 'running') return null
-        return { status: data.status === 'completed' ? 'completed' : data.status === 'cancelled' ? 'cancelled' : 'error', started, error: data.error }
+        return { status: data.status === 'completed' ? 'completed' : data.status === 'cancelled' ? 'cancelled' : 'error', started, error: data.error ?? undefined }
       }
       while (!signal.aborted) {
         const { done, value } = await reader.read().catch(error => {

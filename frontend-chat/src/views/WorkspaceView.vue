@@ -8,6 +8,7 @@ import { useProjects } from '../composables/useProjects'
 import WorkspaceSidebar from '../components/layout/WorkspaceSidebar.vue'
 import ChatView from './ChatView.vue'
 import KnowledgeView from './KnowledgeView.vue'
+import AuditView from './AuditView.vue'
 import AccountView from './AccountView.vue'
 import AboutView from './AboutView.vue'
 import AppDialog from '../components/common/AppDialog.vue'
@@ -20,7 +21,9 @@ const PROJECT_KEY = `shallow_ask_deep_answer_project_${props.user.id}`
 // 仅刷新时恢复页面；新进入或恢复标签页时默认打开问答首页。
 const navigation = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined
 const savedMode = sessionStorage.getItem(MODE_KEY)
-const mode = ref<AppMode>(navigation?.type === 'reload' && ['knowledge', 'account', 'about'].includes(savedMode || '') ? savedMode as AppMode : 'chat')
+const mode = ref<AppMode>(navigation?.type === 'reload'
+  && (savedMode === 'knowledge' || savedMode === 'audit' || savedMode === 'account' || savedMode === 'about')
+  ? savedMode : 'chat')
 localStorage.removeItem(MODE_KEY)
 watch(mode, value => sessionStorage.setItem(MODE_KEY, value), { immediate: true })
 const sidebarOpen = ref(false)
@@ -96,6 +99,7 @@ async function logout() {
         </button>
       <ChatView v-if="mode === 'chat'" :chat="chat" :projects="projects" @manage="navigate('knowledge')" />
       <KnowledgeView v-else-if="mode === 'knowledge'" :knowledge="knowledge" :projects="projects" @back="navigate('chat')" @ask="askProject" @deleted="chat.markProjectDeleted" />
+      <AuditView v-else-if="mode === 'audit'" @back="navigate('chat')" />
       <AccountView v-else-if="mode === 'account'" :user="user" @back="navigate('chat')" @updated="emit('userUpdated', $event)" @deleted="emit('accountDeleted')" @password-changed="emit('passwordChanged')" />
       <AboutView v-else @back="navigate('chat')" @knowledge="navigate('knowledge')" />
     </main>

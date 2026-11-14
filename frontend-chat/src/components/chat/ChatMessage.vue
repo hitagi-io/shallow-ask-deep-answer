@@ -9,6 +9,7 @@ import { copyText } from '../../utils/clipboard'
 import { useNotice } from '../../composables/useNotice'
 import { useStreamingText } from '../../composables/useStreamingText'
 import SourcePassageDialog from './SourcePassageDialog.vue'
+import ExecutionDialog from './ExecutionDialog.vue'
 import { formatSourceReferences, stripInternalCitations } from '../../utils/sourceReferences'
 
 const props = defineProps<{
@@ -28,6 +29,7 @@ function toggleFeedback(value: 'like' | 'dislike') {
 const { message: copyNotice, show } = useNotice(2500)
 const body = ref<HTMLElement | null>(null)
 const sourceUrls = ref<string[]>([])
+const showExecution = ref(false)
 async function copy(text: string) {
   try { await copyText(text); show('已复制', 'success') }
   catch { show('复制失败，请手动选择文本复制', 'error') }
@@ -77,6 +79,7 @@ const html = computed(() => {
 </script>
 
 <template>
+  <ExecutionDialog v-if="showExecution && message.generation_id" :generation-id="message.generation_id" @close="showExecution = false" />
   <SourcePassageDialog v-if="sourceUrls.length" :urls="sourceUrls" :project-deleted="projectDeleted" @close="sourceUrls = []" />
   <div class="message" :class="message.role">
     <div v-if="message.role === 'assistant'" class="avatar">
@@ -92,6 +95,7 @@ const html = computed(() => {
       </div>
       <div v-if="message.role === 'assistant' && !(thinking && !message.content)" ref="body" class="bubble markdown-body" @click="copyCode" v-html="html"></div>
       <div v-if="message.role === 'assistant' && !thinking && !streaming" class="message-actions">
+        <button v-if="message.generation_id && message.trace_id" class="text-action" @click="showExecution = true">执行过程</button>
         <button v-if="message.content" class="icon-button" aria-label="复制回答" title="复制回答" @click="copy(message.content)">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
         </button>

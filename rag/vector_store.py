@@ -5,7 +5,9 @@ import os
 import threading
 import uuid
 from collections import OrderedDict
+from collections.abc import Callable
 from functools import partial
+from typing import NotRequired, TypedDict
 
 from langchain_core.runnables import RunnableLambda
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -21,6 +23,8 @@ from utils.retrieval.source_evidence import SOURCE_FIELDS, chunk_signature, spli
 from utils.core.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
 from utils.core.logging_config import get_logger
 from utils.indexing.progress import IndexProgress, IndexStage, ProgressCallback
+from utils.indexing.recovery import UploadJournal, PublicationUncertain, UploadRecoveryResult
+from utils.observability.tracing import span, traced
 from utils.runtime.shutdown import ServiceStopping, check_shutdown, interruptible_lock
 
 logger = get_logger(__name__)
@@ -30,6 +34,19 @@ _vector_stores: OrderedDict[tuple[int, str], VectorStore] = OrderedDict()
 _lock = threading.Lock()
 _MAX_CACHED_PROJECTS = 128
 _INDEX_FAIL_GENERIC = "入库失败，详见服务端日志"
+
+
+class IndexResult(TypedDict):
+    file: str
+    chunks: int | None
+    ok: bool
+    committed: bool
+    error: str | None
+    content_sha256: NotRequired[str]
+
+
+class UploadedFileResult(IndexResult):
+    overwritten: bool
 
 
 def get_vector_store(user_id: int, project_id: str) -> "VectorStore":
@@ -160,8 +177,9 @@ class VectorStore:
                     failures.append({"file": path, "error": _INDEX_FAIL_GENERIC})
         return failures
 
+    @traced("index.file")
     def index_file(self, file_path: str, *, force: bool = False,
-                   on_progress: ProgressCallback | None = None) -> dict:
+                   on_progress: ProgressCallback | None = None, journal: UploadJournal | None = None) -> IndexResult:
         """写入独立代次 → 验证每块实际文本 → 提交清单 → 删除旧代次。
 
         新内容先保存 building 清单，中断与部分写入仍可被健康检查发现。
@@ -169,7 +187,7 @@ class VectorStore:
         调用方须持有 API 层的 PostgreSQL 索引写锁。
         """
         file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
-        result = {"file": file_path, "chunks": None, "ok": False, "error": _INDEX_FAIL_GENERIC}
+        result: IndexResult = {"file": file_path, "chunks": None, "ok": False, "committed": False, "error": _INDEX_FAIL_GENERIC}
 
         def report(stage: IndexStage, completed: int, total: int) -> None:
             if on_progress is not None:
@@ -188,8 +206,13 @@ class VectorStore:
             old = self.manifests.all().get(identity)
             if not force and old and self.manifest_is_current(old):
                 report("finalizing", 0, 1)
-                self.manifests.publish_existing_file(file_path, sha256)
-                return {**result, "chunks": old.expected_chunks, "ok": True, "error": None}
+                if journal is not None:
+                    journal.advance("publishing", index_id=old.index_id)
+                self._confirm_publication(file_path, sha256, old.index_id,
+                                          lambda: self.manifests.publish_existing_file(file_path, sha256))
+                if journal is not None:
+                    self._record_published(journal)
+                return {**result, "chunks": old.expected_chunks, "ok": True, "error": None, "committed": True}
             try:
                 report("parsing", 0, 1)
                 parsed = loader(file_path, on_progress=partial(report, "parsing"))
@@ -211,6 +234,8 @@ class VectorStore:
             hashes = tuple(chunk_signature(doc.page_content, doc.metadata) for doc in documents)
             manifest = IndexManifest(sha256, file_path, identity[1], self.index_version,
                                      uuid.uuid4().hex, len(documents), hashes, "building")
+            if journal is not None:
+                journal.advance("indexing", index_id=manifest.index_id)
             if old is None or old.state != "ready":
                 self.manifests.put(manifest)
             texts = [doc.page_content for doc in documents]
@@ -233,6 +258,8 @@ class VectorStore:
                 })
             try:
                 report("writing", 0, len(documents))
+                if journal is not None:
+                    journal.advance("writing")
                 if not self.vector_store.client.has_collection(collection_name=self.vector_store.collection_name):
                     # 集合被外部删除后，LangChain 的 collection view 仍可能缓存旧对象。
                     self.vector_store.col = None
@@ -255,7 +282,6 @@ class VectorStore:
                     raise RuntimeError("入库期间源文件发生变化")
                 # 提交后不再调用可能失败的进度写入，避免错误触发源文件回滚。
                 report("finalizing", 0, 1)
-                self.manifests.put(manifest.ready())
             except Exception:
                 logger.exception("[向量库] 入库失败 file=%s", file_path)
                 try:
@@ -263,6 +289,20 @@ class VectorStore:
                 except Exception:
                     logger.exception("[向量库] 清理本次写入失败，保留清单供健康检查修复")
                 return result
+
+            if journal is not None:
+                journal.advance("publishing")
+            try:
+                self._confirm_publication(file_path, sha256, manifest.index_id,
+                                          lambda: self.manifests.put(manifest.ready()))
+            except PublicationUncertain:
+                raise
+            except Exception:
+                # 已核对未发布；保留 building 清单供修复，清理只限本次代次。
+                self._delete_pks(ids)
+                raise
+            if journal is not None:
+                self._record_published(journal)
 
             # 清单已提交，此后清理失败不能回滚磁盘到旧内容。
             result = {**result, "chunks": len(documents), "ok": True,
@@ -274,6 +314,26 @@ class VectorStore:
                 logger.exception("[向量库] 新清单已提交，旧分块清理失败 file=%s", file_path)
                 return {**result, "ok": False, "error": "新版本已入库，但旧分块清理失败，请执行索引修复"}
             return result
+
+    def _confirm_publication(self, source: str, digest: str, index_id: str, publish: Callable[[], None]) -> None:
+        with span("index.publish", index_id=index_id, content_hash=digest):
+            try:
+                publish()
+            except Exception as original:
+                try:
+                    published = self.manifests.is_published(source, digest, index_id)
+                except Exception as verification:
+                    raise PublicationUncertain("发布结果暂时无法确认，请执行索引修复；已保留文件和索引") from verification
+                if not published:
+                    raise original
+                logger.warning("[索引] 发布回执异常，已核对目标版本提交成功 index_id=%s", index_id)
+
+    @staticmethod
+    def _record_published(journal: UploadJournal) -> None:
+        try:
+            journal.advance("published")
+        except Exception as exc:
+            raise PublicationUncertain("索引已发布，任务状态尚未确认，请执行索引修复") from exc
 
     def _delete_pks(self, pks: list) -> int:
         if not pks or not self.vector_store.client.has_collection(
@@ -322,44 +382,103 @@ class VectorStore:
             self.manifests.forget_file(file_path)
             self._retire_source_versions(file_path)
 
-    def replace_and_index_file(self, file_path: str, tmp_path: str, *,
-                               on_progress: ProgressCallback | None = None) -> dict:
-        """覆盖失败回滚源文件；提交新清单前始终保留旧向量和清单。"""
+    @traced("upload.replace")
+    def replace_and_index_file(self, file_path: str, tmp_path: str, *, journal: UploadJournal,
+                               on_progress: ProgressCallback | None = None) -> UploadedFileResult:
+        """保存恢复意图后才移动文件；未确认发布结果时保留全部恢复材料。"""
         file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
         tmp_path = scoped_knowledge_file(self.knowledge_dir, tmp_path)
         with interruptible_lock(self._store_lock):
-            existed = os.path.isfile(file_path)
-            backup = os.path.join(os.path.dirname(file_path), f".bak_{uuid.uuid4().hex}")
-            if existed:
-                os.replace(file_path, backup)
+            record = journal.prepare(self.knowledge_dir, file_path, tmp_path)
             try:
+                journal.advance("replacing")
+                if record.backup_path is not None:
+                    os.replace(file_path, record.backup_path)
                 os.replace(tmp_path, file_path)
-            except Exception:
-                if existed:
-                    os.replace(backup, file_path)
+                journal.advance("indexing")
+                result = self.index_file(file_path, on_progress=on_progress, journal=journal)
+            except PublicationUncertain:
                 raise
-            try:
-                result = self.index_file(file_path, on_progress=on_progress)
-            except ServiceStopping as exc:
-                result = {"file": file_path, "chunks": None, "ok": False, "error": str(exc)}
             except Exception:
-                logger.exception("[向量库] 覆盖上传入库异常 file=%s", file_path)
-                result = {"file": file_path, "chunks": None, "ok": False, "error": _INDEX_FAIL_GENERIC}
-            if not result["ok"] and not result.get("committed"):
-                if existed:
-                    os.replace(backup, file_path)
-                elif result.get("content_sha256"):
-                    self.manifests.record_files({file_path: result["content_sha256"]})
-                return {**result, "overwritten": existed}
+                # 即使异常出现在状态写回，恢复流程也先核对发布结果。
+                self.recover_upload(journal)
+                raise
+            if not result["ok"] and not result["committed"]:
+                self.recover_upload(journal)
+                return {**result, "overwritten": record.old_hash is not None}
             try:
-                self._retire_source_versions(file_path, result["content_sha256"])
+                self._finish_uploaded_version(journal)
             except Exception:
-                logger.exception("[向量库] 覆盖后清理旧版本失败 file=%s", file_path)
-                result = {**result, "ok": False, "error": "新版本已入库，但旧版本清理失败，请执行索引修复"}
-            finally:
-                if existed:
-                    try:
-                        os.remove(backup)
-                    except OSError:
-                        logger.exception("[向量库] 删除备份文件失败 file=%s", backup)
-            return {**result, "overwritten": existed}
+                logger.exception("[向量库] 新版本已入库，清理未完成")
+                return {**result, "ok": False, "committed": True, "overwritten": record.old_hash is not None,
+                        "error": "新版本已入库，清理未完成，请执行索引修复"}
+            return {**result, "ok": True, "error": None, "committed": True, "overwritten": record.old_hash is not None}
+
+    def _finish_uploaded_version(self, journal: UploadJournal) -> None:
+        record = journal.validated_record(self.knowledge_dir)
+        if record.index_id is None:
+            raise RuntimeError("已发布上传缺少索引代次")
+        if compute_file_sha256(record.destination) != record.new_hash:
+            raise RuntimeError("源文件版本已变化，停止自动恢复")
+        self._delete_pks([row["pk"] for row in self._content_rows((record.new_hash, document_format(record.destination)))
+                          if row["index_id"] != record.index_id])
+        self._retire_source_versions(record.destination, record.new_hash)
+        if record.backup_path is not None and os.path.exists(record.backup_path):
+            if compute_file_sha256(record.backup_path) != record.old_hash:
+                raise RuntimeError("备份文件校验失败，停止清理")
+            os.remove(record.backup_path)
+        journal.advance("cleaned")
+
+    @traced("upload.recover")
+    def recover_upload(self, journal: UploadJournal) -> UploadRecoveryResult:
+        """调用方持项目写锁；按磁盘及发布清单核对，重复恢复不重复覆盖。"""
+        with interruptible_lock(self._store_lock):
+            record = journal.validated_record(self.knowledge_dir)
+            result: UploadRecoveryResult = {"ok": False, "committed": False, "overwritten": record.old_hash is not None,
+                      "error": "上传已中断，原文件已恢复，请重新上传" if record.old_hash is not None
+                               else "上传尚未发布，请重新上传或执行修复与补建"}
+            if record.stage == "cleaned":
+                return {**result, "ok": True, "committed": True, "error": None}
+            if record.stage in ("rolled_back", "unpublished"):
+                return result
+            if record.index_id is not None:
+                try:
+                    published = self.manifests.is_published(record.destination, record.new_hash, record.index_id)
+                except Exception as exc:
+                    raise PublicationUncertain("无法核对发布结果，已保留文件和索引，请稍后修复") from exc
+                if published:
+                    manifest = self.manifests.all()[(record.new_hash, document_format(record.destination))]
+                    rows = self.chunk_rows(f"index_id == {json.dumps(record.index_id)}")
+                    if not chunks_match(manifest, rows):
+                        raise PublicationUncertain("已发布版本校验失败，已保留恢复材料")
+                    journal.advance("published")
+                    self._finish_uploaded_version(journal)
+                    return {**result, "ok": True, "committed": True, "error": None}
+                if record.stage == "published":
+                    raise PublicationUncertain("已确认的发布映射发生变化，停止自动回滚")
+            current_hash = compute_file_sha256(record.destination)
+            if os.path.exists(record.destination) and current_hash is None:
+                raise OSError("无法核对当前源文件，停止恢复")
+            if current_hash not in (None, record.old_hash, record.new_hash):
+                raise RuntimeError("源文件已被更新为其他版本，停止自动回滚")
+            if record.backup_path is not None:
+                if os.path.exists(record.backup_path):
+                    if compute_file_sha256(record.backup_path) != record.old_hash:
+                        raise RuntimeError("备份文件内容不匹配，停止恢复")
+                    os.replace(record.backup_path, record.destination)
+                elif current_hash != record.old_hash:
+                    raise RuntimeError("原文件备份缺失，无法恢复")
+            else:
+                if current_hash is None and os.path.isfile(record.staged_path):
+                    if compute_file_sha256(record.staged_path) != record.new_hash:
+                        raise RuntimeError("暂存文件内容不匹配，停止恢复")
+                    os.replace(record.staged_path, record.destination)
+                    current_hash = record.new_hash
+                if current_hash == record.new_hash:
+                    # 首次上传失败仍保留源文件，供现有“修复与补建”使用。
+                    self.manifests.record_files({record.destination: record.new_hash})
+                    result["error"] = "上传已中断，源文件已保留，请执行修复与补建"
+            if record.index_id is not None:
+                self._delete_pks([row["pk"] for row in self.chunk_rows(f"index_id == {json.dumps(record.index_id)}")])
+            journal.advance("rolled_back" if record.old_hash is not None else "unpublished")
+            return result

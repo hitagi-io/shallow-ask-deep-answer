@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import uuid
 from datetime import datetime
 
 import psycopg
@@ -11,6 +12,8 @@ from psycopg.types.json import Jsonb
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from utils.indexing.progress import IndexProgress
+from utils.indexing.recovery import UploadJournal
+from utils.observability.audit import append_audit
 
 
 _TASK_PROJECT_LOCK_NAMESPACE = "knowledge-upload-queue"
@@ -106,17 +109,16 @@ class UploadTaskStore:
         )
 
     def create(self, user_id: int, project_id: str, items: list[dict]) -> str:
-        import uuid
-
         task_id = str(uuid.uuid4())
+        trace_id = uuid.uuid4().hex
         with psycopg.connect(self.conninfo) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO upload_tasks (id, user_id, project_id, total)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO upload_tasks (id, user_id, project_id, total, trace_id)
+                    VALUES (%s, %s, %s, %s, %s)
                     """,
-                    (task_id, user_id, project_id, len(items)),
+                    (task_id, user_id, project_id, len(items), trace_id),
                 )
                 cur.executemany(
                     """
@@ -127,6 +129,9 @@ class UploadTaskStore:
                     [(task_id, index, item["name"], item["staged_path"])
                      for index, item in enumerate(items)],
                 )
+                append_audit(cur, user_id=user_id, action="file.upload", resource_type="upload_task",
+                             resource_id=task_id, project_id=project_id, result="accepted", operation_id=task_id,
+                             event_key=f"upload:{task_id}:accepted", details={"files": len(items)}, trace_id=trace_id)
             conn.commit()
         return task_id
 
@@ -147,14 +152,16 @@ class UploadTaskStore:
                 return None
             items = conn.execute(
                 """
-                SELECT position, name, status, overwritten, indexed, error, progress
+                SELECT position, name, status, overwritten, indexed, error, progress,
+                       recovery IS NOT NULL AND recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished') AS recovery_pending
                 FROM upload_task_items
                 WHERE task_id = %s
                 ORDER BY position
                 """,
                 (task_id,),
             ).fetchall()
-        return {**dict(task), "files": [dict(item) for item in items]}
+        return {**dict(task), "files": [dict(item) for item in items],
+                "recovery_required": task["status"] in ("failed", "completed") and any(item["recovery_pending"] for item in items)}
 
     def claim_next(self) -> tuple[dict, psycopg.Connection] | None:
         """持有会话锁，直到调用方处理完任务。
@@ -175,7 +182,7 @@ class UploadTaskStore:
                 if not lease.execute("SELECT pg_try_advisory_lock(%s) AS acquired", (key,)).fetchone()["acquired"]:
                     continue
                 row = lease.execute("""
-                    SELECT id, user_id, project_id, status FROM upload_tasks
+                    SELECT id, user_id, project_id, status, trace_id FROM upload_tasks
                     WHERE user_id = %s AND project_id = %s
                       AND status IN ('queued', 'running')
                     ORDER BY sequence LIMIT 1
@@ -183,6 +190,10 @@ class UploadTaskStore:
                 if row is None:
                     lease.execute("SELECT pg_advisory_unlock(%s)", (key,))
                     continue
+                if row["trace_id"] is None:
+                    # 迁移前排队的任务在第一次领取时获得稳定追踪编号。
+                    row["trace_id"] = uuid.uuid4().hex
+                    lease.execute("UPDATE upload_tasks SET trace_id=%s WHERE id=%s", (row["trace_id"], row["id"]))
                 if row["status"] == "queued":
                     lease.execute("""
                         UPDATE upload_tasks SET status = 'running', started_at = CURRENT_TIMESTAMP,
@@ -202,7 +213,10 @@ class UploadTaskStore:
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             tasks = conn.execute("""
                 SELECT * FROM upload_tasks WHERE user_id = %s AND project_id = %s
-                  AND (status IN ('queued', 'running') OR id IN (
+                  AND (status IN ('queued', 'running') OR EXISTS (
+                      SELECT 1 FROM upload_task_items i WHERE i.task_id=upload_tasks.id
+                        AND i.recovery IS NOT NULL AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished')
+                  ) OR id IN (
                       SELECT id FROM upload_tasks WHERE user_id = %s AND project_id = %s
                       ORDER BY created_at DESC, sequence DESC LIMIT 7))
                 ORDER BY created_at DESC, sequence DESC
@@ -211,17 +225,19 @@ class UploadTaskStore:
                 return []
             grouped = {task["id"]: [] for task in tasks}
             for item in conn.execute("""
-                SELECT task_id, position, name, status, overwritten, indexed, error, progress
+                SELECT task_id, position, name, status, overwritten, indexed, error, progress,
+                       recovery IS NOT NULL AND recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished') AS recovery_pending
                 FROM upload_task_items WHERE task_id = ANY(%s) ORDER BY position
             """, (list(grouped),)).fetchall():
                 grouped[item.pop("task_id")].append(item)
-        return [{**task, "files": grouped[task["id"]]} for task in tasks]
+        return [{**task, "files": grouped[task["id"]], "recovery_required": task["status"] in ("failed", "completed")
+                 and any(item["recovery_pending"] for item in grouped[task["id"]])} for task in tasks]
 
     def items(self, task_id: str) -> list[dict]:
         with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
             rows = conn.execute(
                 """
-                SELECT id, position, name, staged_path, status
+                SELECT id, position, name, staged_path, status, recovery
                 FROM upload_task_items
                 WHERE task_id = %s
                 ORDER BY position
@@ -248,8 +264,22 @@ class UploadTaskStore:
         with psycopg.connect(self.conninfo) as conn:
             return conn.execute("""
                 SELECT 1 FROM upload_tasks WHERE user_id = %s AND project_id = %s
-                  AND status IN ('queued', 'running') LIMIT 1
+                  AND (status IN ('queued', 'running') OR EXISTS (
+                    SELECT 1 FROM upload_task_items i WHERE i.task_id=upload_tasks.id
+                      AND i.recovery IS NOT NULL AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished')
+                  )) LIMIT 1
             """, (user_id, project_id)).fetchone() is not None
+
+    def pending_recoveries(self, user_id: int, project_id: str) -> list[dict]:
+        with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
+            return conn.execute("SELECT i.*, t.user_id,t.project_id FROM upload_task_items i "
+                                "JOIN upload_tasks t ON t.id=i.task_id WHERE t.user_id=%s AND t.project_id=%s "
+                                "AND t.status IN ('failed','completed') AND i.recovery IS NOT NULL "
+                                "AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished') ORDER BY t.sequence,i.position",
+                                (user_id,project_id)).fetchall()
+
+    def journal(self, task: dict, item: dict) -> UploadJournal:
+        return UploadJournal(self.conninfo, task["id"], item["id"], task["user_id"], task["project_id"], item["recovery"])
 
     def mark_item_running(self, task_id: str, item_id: int) -> None:
         with psycopg.connect(self.conninfo) as conn:
@@ -265,6 +295,14 @@ class UploadTaskStore:
                 "UPDATE upload_tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = %s",
                 (task_id,),
             )
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT user_id,project_id FROM upload_tasks WHERE id=%s", (task_id,))
+                owner = cur.fetchone()
+                if owner is None:
+                    raise RuntimeError("上传任务不存在")
+                append_audit(cur, user_id=owner["user_id"], action="file.upload.start", resource_type="upload_item",
+                             resource_id=str(item_id), project_id=owner["project_id"], operation_id=task_id,
+                             result="started", event_key=f"upload:{item_id}:start")
             conn.commit()
 
     def update_item_progress(self, task_id: str, item_id: int, progress: IndexProgress) -> None:
@@ -313,6 +351,15 @@ class UploadTaskStore:
                 """,
                 (task_id,),
             )
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT user_id,project_id FROM upload_tasks WHERE id=%s", (task_id,))
+                owner = cur.fetchone()
+                if owner is None:
+                    raise RuntimeError("上传任务不存在")
+                append_audit(cur, user_id=owner["user_id"], action="file.upload.finish", resource_type="upload_item",
+                             resource_id=str(item_id), project_id=owner["project_id"], operation_id=task_id,
+                             result="succeeded" if status == "success" else "partial" if indexed else "failed",
+                             event_key=f"upload:{item_id}:finish:{status}:{indexed}")
             conn.commit()
 
     def finish(self, task_id: str) -> None:
@@ -320,7 +367,7 @@ class UploadTaskStore:
             conn.execute(
                 """
                 UPDATE upload_tasks t
-                SET status = 'completed',
+                SET status = 'completed', error = CASE WHEN q.failed = 0 THEN NULL ELSE t.error END,
                     completed = q.completed, succeeded = q.succeeded,
                     failed = q.failed, finished_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
@@ -333,14 +380,14 @@ class UploadTaskStore:
                     WHERE task_id = %s
                     GROUP BY task_id
                 ) q
-                WHERE t.id = q.task_id AND t.status = 'running'
+                WHERE t.id = q.task_id AND q.completed = t.total
                 """,
                 (task_id,),
             )
             conn.commit()
 
     def fail(self, task_id: str, error: str) -> None:
-        with psycopg.connect(self.conninfo) as conn:
+        with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
             conn.execute(
                 """
                 UPDATE upload_task_items
@@ -350,7 +397,7 @@ class UploadTaskStore:
                 """,
                 (error, task_id),
             )
-            conn.execute(
+            result = conn.execute(
                 """
                 UPDATE upload_tasks t
                 SET status = 'failed', error = %s,
@@ -367,8 +414,16 @@ class UploadTaskStore:
                     GROUP BY task_id
                 ) q
                 WHERE t.id = q.task_id AND t.status = 'running'
+                RETURNING t.user_id,t.project_id,t.trace_id
                 """,
                 (error, task_id),
             )
+            owner = result.fetchone()
+            if owner is not None:
+                with conn.cursor() as cur:
+                    append_audit(cur, user_id=owner["user_id"], action="file.upload.fail",
+                                 resource_type="upload_task", resource_id=task_id, project_id=owner["project_id"],
+                                 result="failed", operation_id=task_id, event_key=f"upload:{task_id}:failed",
+                                 error_code="upload_interrupted", trace_id=owner["trace_id"], system=True)
             conn.commit()
 

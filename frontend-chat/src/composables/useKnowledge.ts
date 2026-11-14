@@ -69,7 +69,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     const groups = visibleTasks.map(task => ({
       id: localIds.get(task.task_id) ?? `task-${task.task_id}`,
       files: task.files.map(file => ({ name: file.name, status: file.status, detail: taskFileDetail(file), percent: taskFilePercent(file) })),
-      error: task.error,
+      error: task.recovery_required ? '上传结果尚未确认，请点击“修复与补建”核对后再使用资料。' : task.error,
     }))
     const taskIds = new Set(visibleTasks.map(task => task.task_id))
     // 尚未出现在服务端快照中的本地上传置顶，后加入的文件排在前面。

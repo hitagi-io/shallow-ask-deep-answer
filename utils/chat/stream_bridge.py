@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from contextvars import copy_context
 
 from utils.core.logging_config import get_logger
+from utils.chat.outcome import AnswerOutcome
 
 logger = get_logger(__name__)
 
@@ -41,7 +43,7 @@ class StreamBridge:
         # 共享给内层包装器（如 kb 模式的缓冲循环），让取消能穿透到原始消息流
         self._cancel_event = cancel_event
         self._thread = threading.Thread(
-            target=self._run, name=self.THREAD_NAME, daemon=True
+            target=copy_context().run, args=(self._run,), name=self.THREAD_NAME, daemon=True
         )
         self._thread.start()
 
@@ -58,6 +60,9 @@ class StreamBridge:
                 if self._stopped.is_set():
                     self._emit("cancelled")
                     return
+                if isinstance(item, AnswerOutcome):
+                    self._emit("outcome", item)
+                    continue
                 if isinstance(item, dict):
                     event_type = item["type"]
                     if event_type == "phase":

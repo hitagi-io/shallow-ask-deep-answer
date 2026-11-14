@@ -21,6 +21,9 @@ from utils.core.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
 from utils.core.logging_config import get_logger
 from rag.index_manifest import ManifestStore
 from utils.indexing.upload_tasks import UploadTaskStore
+from utils.observability.schema import migrate
+from utils.observability.audit import append_audit
+from utils.chat.outcome import ResultKind
 
 logger = get_logger(__name__)
 
@@ -229,6 +232,7 @@ def init_db():
                 )
                 UploadTaskStore.setup(cur)
                 ManifestStore.setup(cur)
+                migrate(cur)
             conn.commit()
 
 
@@ -380,10 +384,14 @@ def register(username: str, password: str, ip: str | None = None) -> dict:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO users (username, password) VALUES (%s, %s) "
-                "ON CONFLICT (username) DO NOTHING",
+                "ON CONFLICT (username) DO NOTHING RETURNING id",
                 (username, password_hash),
             )
             created = cur.rowcount > 0
+            if created:
+                created_id = cur.fetchone()[0]
+                append_audit(cur, user_id=created_id, action="account.register", resource_type="account",
+                             resource_id=str(created_id), result="succeeded")
         conn.commit()
         if not created:
             return {"ok": False, "error": "用户名已存在"}
@@ -530,6 +538,8 @@ def create_project(user_id: int, name: str) -> dict:
             cur.execute("INSERT INTO projects (id, user_id, name) VALUES (%s, %s, %s) "
                         f"RETURNING {_PROJECT_FIELDS}", (str(uuid.uuid4()), user_id, name))
             project = cur.fetchone()
+            append_audit(cur, user_id=user_id, action="project.create", resource_type="project",
+                         resource_id=project["id"], project_id=project["id"], result="succeeded")
         conn.commit()
         return project
 
@@ -542,6 +552,9 @@ def update_project(user_id: int, project_id: str, name: str) -> dict | None:
                         f"WHERE id = %s AND user_id = %s AND deleted_at IS NULL RETURNING {_PROJECT_FIELDS}",
                         (name, project_id, user_id))
             project = cur.fetchone()
+            if project is not None:
+                append_audit(cur, user_id=user_id, action="project.rename", resource_type="project",
+                             resource_id=project_id, project_id=project_id, result="succeeded")
         conn.commit()
         return project
 
@@ -575,6 +588,8 @@ def delete_project(user_id: int, project_id: str, stale_seconds: float = 120, cl
             # 保留项目身份供历史引用识别；文档、索引及模型上下文由 cleanup 清理。
             cur.execute("UPDATE projects SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
                         "WHERE id = %s AND user_id = %s", (project_id, user_id))
+            append_audit(cur, user_id=user_id, action="project.delete", resource_type="project",
+                         resource_id=project_id, project_id=project_id, result="succeeded")
         conn.commit()
         return {"status": "deleted", "conversation_ids": conversation_ids}
 
@@ -652,7 +667,10 @@ def list_messages(
                 boundary = " AND id < %s"
                 params.append(before)
             params.append(limit + 1)
-            cur.execute('SELECT id, role, content, status, kb_only AS "kbOnly" FROM messages '
+            cur.execute('SELECT id, role, content, status, kb_only AS "kbOnly", generation_id, '
+                        '(SELECT trace_id FROM generations WHERE id=messages.generation_id) AS trace_id, '
+                        '(SELECT result_kind FROM generations WHERE id=messages.generation_id) AS result_kind, '
+                        '(SELECT error_code FROM generations WHERE id=messages.generation_id) AS error_code FROM messages '
                         "WHERE conversation_id = %s" +
                         boundary + " ORDER BY id DESC LIMIT %s", params)
             rows = cur.fetchall()
@@ -735,13 +753,15 @@ def _conversation_lock_key(conv_id: str) -> int:
 
 
 _GENERATION_REPLAY_QUERY = """
-    SELECT g.id, g.request_id, g.status, g.error, g.phase,
+    SELECT g.id, g.id AS generation_id, g.request_id, g.status, g.error, g.phase,
+           g.result_kind, g.error_code, g.trace_id, g.attempt_id, g.retry_of, u.content AS user_content,
            g.user_message_id, g.assistant_message_id, g.kb_only, g.project_id,
            p.name AS project_name, p.deleted_at IS NOT NULL AS project_deleted,
            EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - g.created_at)) AS elapsed_seconds,
            m.content AS assistant_content
     FROM generations g
     LEFT JOIN messages m ON m.id = g.assistant_message_id
+    LEFT JOIN messages u ON u.id = g.user_message_id
     LEFT JOIN projects p ON p.id = g.project_id AND p.user_id = g.user_id
     WHERE g.conversation_id = %s AND g.request_id = %s
 """
@@ -755,7 +775,7 @@ def _reap_stale_generations(cur, conv_id: str, stale_seconds: float) -> int:
     running 状态。
     """
     cur.execute(
-        "SELECT id, assistant_message_id, kb_only FROM generations "
+        "SELECT id, assistant_message_id, kb_only, user_id, project_id, attempt_id, trace_id, cancel_requested FROM generations "
         "WHERE conversation_id = %s AND status = 'running' "
         "AND heartbeat_at < now() - make_interval(secs => %s) "
         "FOR UPDATE",
@@ -764,13 +784,22 @@ def _reap_stale_generations(cur, conv_id: str, stale_seconds: float) -> int:
     rows = cur.fetchall()
     for row in rows:
         message_id = row["assistant_message_id"]
-        cur.execute("UPDATE messages SET status = 'error', content = CASE WHEN content = '' "
-                    "THEN '回答已中断，请重新提问。' ELSE content END WHERE id = %s", (message_id,))
+        status = "cancelled" if row["cancel_requested"] else "failed"
+        code = "cancelled" if row["cancel_requested"] else "worker_lost"
+        cur.execute("UPDATE messages SET status = %s, content = CASE WHEN content = '' "
+                    "THEN '回答已中断，请重新提问。' ELSE content END WHERE id = %s",
+                    ("cancelled" if row["cancel_requested"] else "error", message_id))
         cur.execute(
-            "UPDATE generations SET status = 'failed', error = %s, "
+            "UPDATE generations SET status = %s, error_code = %s, error = %s, "
             "assistant_message_id = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
-            ("服务暂时不可用，回答已中断，请稍后再试。", message_id, row["id"]),
+            (status, code, "已停止回答。" if row["cancel_requested"] else "执行进程失联，回答已中断，请重试。", message_id, row["id"]),
         )
+        cur.execute("UPDATE generation_attempts SET status=%s, error_code=%s, finished_at=now() WHERE id=%s AND status='running'",
+                    (status, code, row["attempt_id"]))
+        append_audit(cur, user_id=row["user_id"], action="generation.finish", resource_type="generation",
+                     resource_id=str(row["id"]), project_id=row["project_id"], result=status,
+                     error_code=code, system=True, event_key=f"generation:{row['id']}:finish",
+                     operation_id=f"generation:{row['id']}", trace_id=row["trace_id"])
     if rows:
         logger.warning("[会话] 已将 %s 个长期未更新的生成任务标记为失败 conversation_id=%s", len(rows), conv_id)
     return len(rows)
@@ -784,6 +813,7 @@ def begin_generation(
     stale_seconds: float,
     kb_only: bool = True,
     project_id: str | None = None,
+    retry_of: int | None = None,
 ) -> dict:
     """登记一次生成任务，并原子写入用户消息。
 
@@ -845,6 +875,8 @@ def begin_generation(
                     return {"status": "mode_conflict"}
                 if existing["project_id"] != project_id:
                     return {"status": "project_conflict"}
+                if existing["user_content"] != content or existing["retry_of"] != retry_of:
+                    return {"status": "content_conflict"}
                 return {"status": "replay", "generation": existing}
 
             cur.execute("SELECT 1 FROM generations WHERE conversation_id = %s AND status = 'running'",
@@ -853,12 +885,26 @@ def begin_generation(
                 conn.commit()
                 return {"status": "busy"}
 
+            if retry_of is not None:
+                cur.execute("SELECT g.status, m.content FROM generations g JOIN messages m ON m.id=g.user_message_id "
+                            "WHERE g.id=%s AND g.user_id=%s AND g.conversation_id=%s", (retry_of, user_id, conv_id))
+                previous = cur.fetchone()
+                if previous is None or previous["status"] not in ("failed", "cancelled") or previous["content"] != content:
+                    return {"status": "invalid_retry"}
+            trace_id, attempt_id = uuid.uuid4().hex, uuid.uuid4().hex
             cur.execute(
-                "INSERT INTO generations (conversation_id, user_id, request_id, kb_only, project_id) "
-                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                (conv_id, user_id, request_id, kb_only, project_id),
+                "INSERT INTO generations (conversation_id,user_id,request_id,kb_only,project_id,trace_id,attempt_id,retry_of) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (conv_id,user_id,request_id,kb_only,project_id,trace_id,attempt_id,retry_of),
             )
             generation_id = cur.fetchone()["id"]
+            cur.execute("INSERT INTO generation_attempts(id,generation_id,trace_id,worker_id,status) VALUES(%s,%s,%s,%s,'running')",
+                        (attempt_id, generation_id, trace_id, f"{os.getpid()}:{threading.get_ident()}"))
+            append_audit(cur, user_id=user_id, action="generation.retry" if retry_of is not None else "generation.start",
+                         resource_type="generation", resource_id=str(generation_id), project_id=project_id,
+                         result="accepted", event_key=f"generation:{generation_id}:start",
+                         operation_id=f"generation:{generation_id}", trace_id=trace_id,
+                         details={"retry_of": retry_of} if retry_of is not None else {})
 
             cur.execute(
                 "INSERT INTO messages (conversation_id, role, content, generation_id, kb_only) "
@@ -886,6 +932,8 @@ def begin_generation(
             "generation_id": generation_id,
             "user_message_id": user_message_id,
             "assistant_message_id": assistant_message_id,
+            "trace_id": trace_id,
+            "attempt_id": attempt_id,
         }
 
 
@@ -909,11 +957,17 @@ def get_generation(user_id: int, conv_id: str, request_id: str, stale_seconds: f
 def cancel_generation(user_id: int, conv_id: str, request_id: str) -> bool:
     """显式停止与断开订阅分离；重复停止已结束的任务也成功。"""
     with _connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("UPDATE generations SET cancel_requested = TRUE "
-                        "WHERE conversation_id = %s AND request_id = %s AND user_id = %s",
+                        "WHERE conversation_id = %s AND request_id = %s AND user_id = %s RETURNING id,project_id,trace_id",
                         (conv_id, request_id, user_id))
-            found = cur.rowcount > 0
+            row = cur.fetchone()
+            found = row is not None
+            if row is not None:
+                append_audit(cur, user_id=user_id, action="generation.cancel", resource_type="generation",
+                             resource_id=str(row["id"]), project_id=row["project_id"], result="accepted",
+                             event_key=f"generation:{row['id']}:cancel", operation_id=f"generation:{row['id']}",
+                             trace_id=row["trace_id"])
         conn.commit()
     return found
 
@@ -939,6 +993,7 @@ def finish_generation(
     message_status: str,
     content: str,
     error: str | None,
+    *, result_kind: ResultKind | None = None, error_code: str | None = None,
 ) -> int | None:
     """将生成任务置为终态并写入助手消息（终态：completed / failed / cancelled）。
 
@@ -948,7 +1003,7 @@ def finish_generation(
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT conversation_id, status, kb_only, assistant_message_id, cancel_requested "
+                "SELECT conversation_id, status, kb_only, assistant_message_id, cancel_requested, user_id, project_id, attempt_id, trace_id "
                 "FROM generations WHERE id = %s FOR UPDATE",
                 (generation_id,),
             )
@@ -956,8 +1011,9 @@ def finish_generation(
             if row is None or row["status"] != "running":
                 conn.rollback()
                 return None
-            if row["cancel_requested"] and status == "completed":
+            if row["cancel_requested"]:
                 status, message_status, error = "cancelled", "cancelled", "已停止回答。"
+                result_kind, error_code = None, "cancelled"
             if not content and message_status == "error":
                 content = error or "回答已中断，请重新提问。"
             message_id = row["assistant_message_id"]
@@ -965,14 +1021,33 @@ def finish_generation(
                         (content, message_status, message_id))
             cur.execute(
                 "UPDATE generations SET status = %s, error = %s, assistant_message_id = %s, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = %s",
-                (status, error, message_id, generation_id),
+                "result_kind = %s, error_code = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (status, error, message_id, result_kind, error_code, generation_id),
             )
+            cur.execute("UPDATE generation_attempts SET status=%s,error_code=%s,finished_at=now() WHERE id=%s AND status='running'",
+                        (status, error_code, row["attempt_id"]))
+            append_audit(cur, user_id=row["user_id"], action="generation.finish", resource_type="generation",
+                         resource_id=str(generation_id), project_id=row["project_id"],
+                         result="succeeded" if status == "completed" else "cancelled" if status == "cancelled" else "failed",
+                         error_code=error_code, event_key=f"generation:{generation_id}:finish",
+                         operation_id=f"generation:{generation_id}", trace_id=row["trace_id"])
         # 不更新 conversations：会话的 updated_at 已在登记用户消息时刷新，
         # 这里只锁 generations 行，避免与删除会话（先锁 conversations 再锁 generations）
         # 形成锁顺序反转。
         conn.commit()
         return message_id
+
+
+def reap_stale_generations(stale_seconds: float) -> int:
+    """定时补偿失联任务，不依赖用户再次打开会话；行锁保证多 worker 安全。"""
+    with _connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT DISTINCT conversation_id FROM generations WHERE status='running' "
+                        "AND heartbeat_at < now()-make_interval(secs=>%s) ORDER BY conversation_id LIMIT 100", (stale_seconds,))
+            conversations = cur.fetchall()
+            count = sum(_reap_stale_generations(cur, row["conversation_id"], stale_seconds) for row in conversations)
+        conn.commit()
+    return count
 
 
 def delete_conversation_guarded(
