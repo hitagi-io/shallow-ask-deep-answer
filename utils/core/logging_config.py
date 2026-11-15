@@ -1,7 +1,7 @@
 """应用日志配置。
 
 所有后端模块都通过 ``get_logger(__name__)`` 获取 logger；只有应用入口负责
-配置 handler，避免导入模块时重复初始化日志或在测试中修改全局配置。
+配置 handler，避免导入模块时重复初始化日志或修改全局配置。
 """
 
 from __future__ import annotations

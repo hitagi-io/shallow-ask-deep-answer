@@ -238,6 +238,17 @@ class ManifestStore:
                                 "AND content_sha256=%s AND source_format=%s",
                                 (self.namespace,source,digest,document_format(source))).fetchone() is not None
 
+    def index_is_published(self, index_id: str) -> bool:
+        """恢复清理前核对代次是否仍被任一文件发布，包括旧配置版本。"""
+        with self._connect() as conn:
+            return conn.execute("""
+                SELECT 1 FROM published_source_files f JOIN index_manifests m
+                  ON m.namespace = f.namespace AND m.content_sha256 = f.content_sha256
+                  AND m.source_format = f.source_format
+                WHERE f.namespace = %s AND m.index_id = %s AND m.state = 'ready'
+                LIMIT 1
+            """, (self.namespace, index_id)).fetchone() is not None
+
     def published_files(self) -> dict[str, str]:
         with self._connect() as conn:
             rows = conn.execute("""

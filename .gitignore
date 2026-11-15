@@ -39,14 +39,9 @@ frontend-chat/dist/
 .env.*
 !.env.example
 
-# 测试与静态检查产物
-.pytest_cache/
+# 静态检查产物
 .mypy_cache/
 .ruff_cache/
-.coverage
-.coverage.*
-coverage.xml
-htmlcov/
 
 # Jupyter 笔记本检查点
 .ipynb_checkpoints/

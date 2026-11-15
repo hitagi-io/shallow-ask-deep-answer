@@ -420,13 +420,16 @@ class VectorStore:
             raise RuntimeError("已发布上传缺少索引代次")
         if compute_file_sha256(record.destination) != record.new_hash:
             raise RuntimeError("源文件版本已变化，停止自动恢复")
+        backup_path = record.backup_path
+        if backup_path is not None and not os.path.exists(backup_path):
+            backup_path = None  # 上次清理可能已删备份，尚未写回 cleaned。
+        if backup_path is not None and compute_file_sha256(backup_path) != record.old_hash:
+            raise RuntimeError("备份文件校验失败，停止清理")
         self._delete_pks([row["pk"] for row in self._content_rows((record.new_hash, document_format(record.destination)))
                           if row["index_id"] != record.index_id])
         self._retire_source_versions(record.destination, record.new_hash)
-        if record.backup_path is not None and os.path.exists(record.backup_path):
-            if compute_file_sha256(record.backup_path) != record.old_hash:
-                raise RuntimeError("备份文件校验失败，停止清理")
-            os.remove(record.backup_path)
+        if backup_path is not None:
+            os.remove(backup_path)
         journal.advance("cleaned")
 
     @traced("upload.recover")
@@ -441,6 +444,7 @@ class VectorStore:
                 return {**result, "ok": True, "committed": True, "error": None}
             if record.stage in ("rolled_back", "unpublished"):
                 return result
+            index_in_use = False
             if record.index_id is not None:
                 try:
                     published = self.manifests.is_published(record.destination, record.new_hash, record.index_id)
@@ -456,6 +460,12 @@ class VectorStore:
                     return {**result, "ok": True, "committed": True, "error": None}
                 if record.stage == "published":
                     raise PublicationUncertain("已确认的发布映射发生变化，停止自动回滚")
+                try:
+                    # 同内容文件可能复用已发布代次；当前文件发布失败不代表该代次可删除。
+                    # 在移动任何文件前核对，无法确认时保留所有恢复材料。
+                    index_in_use = self.manifests.index_is_published(record.index_id)
+                except Exception as exc:
+                    raise PublicationUncertain("无法核对索引引用，已保留文件和索引，请稍后修复") from exc
             current_hash = compute_file_sha256(record.destination)
             if os.path.exists(record.destination) and current_hash is None:
                 raise OSError("无法核对当前源文件，停止恢复")
@@ -478,7 +488,7 @@ class VectorStore:
                     # 首次上传失败仍保留源文件，供现有“修复与补建”使用。
                     self.manifests.record_files({record.destination: record.new_hash})
                     result["error"] = "上传已中断，源文件已保留，请执行修复与补建"
-            if record.index_id is not None:
+            if record.index_id is not None and not index_in_use:
                 self._delete_pks([row["pk"] for row in self.chunk_rows(f"index_id == {json.dumps(record.index_id)}")])
             journal.advance("rolled_back" if record.old_hash is not None else "unpublished")
             return result
