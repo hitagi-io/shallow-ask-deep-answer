@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 
 import psycopg
@@ -281,29 +282,28 @@ class UploadTaskStore:
     def journal(self, task: dict, item: dict) -> UploadJournal:
         return UploadJournal(self.conninfo, task["id"], item["id"], task["user_id"], task["project_id"], item["recovery"])
 
-    def mark_item_running(self, task_id: str, item_id: int) -> None:
-        with psycopg.connect(self.conninfo) as conn:
+    @contextmanager
+    def _write_transaction(self, lease: psycopg.Connection | None):
+        # Worker 用持租约的连接写回结果。丢失租约后，旧 worker 无法覆盖接管者的状态。
+        if lease is not None:
+            with lease.transaction():
+                yield lease
+        else:
+            with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
+                yield conn
+
+    def requeue_unprepared_items(self, task_id: str, lease: psycopg.Connection) -> None:
+        """仅在接管时调用。旧 worker 的开始事件证明它在移动文件前必写恢复日志。"""
+        with self._write_transaction(lease) as conn:
             conn.execute(
                 """
-                UPDATE upload_task_items
-                SET status = 'running', updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s AND task_id = %s AND status = 'queued'
+                UPDATE upload_task_items i SET status = 'queued', updated_at = now()
+                WHERE i.task_id = %s AND i.status = 'running' AND i.recovery IS NULL
+                  AND EXISTS (SELECT 1 FROM audit_events a
+                              WHERE a.event_key = 'upload:' || i.id || ':start' AND a.operation_id = i.task_id)
                 """,
-                (item_id, task_id),
-            )
-            conn.execute(
-                "UPDATE upload_tasks SET updated_at = CURRENT_TIMESTAMP WHERE id = %s",
                 (task_id,),
             )
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SELECT user_id,project_id FROM upload_tasks WHERE id=%s", (task_id,))
-                owner = cur.fetchone()
-                if owner is None:
-                    raise RuntimeError("上传任务不存在")
-                append_audit(cur, user_id=owner["user_id"], action="file.upload.start", resource_type="upload_item",
-                             resource_id=str(item_id), project_id=owner["project_id"], operation_id=task_id,
-                             result="started", event_key=f"upload:{item_id}:start")
-            conn.commit()
 
     def update_item_progress(self, task_id: str, item_id: int, progress: IndexProgress) -> None:
         with psycopg.connect(self.conninfo) as conn:
@@ -320,8 +320,8 @@ class UploadTaskStore:
 
     def finish_item(self, task_id: str, item_id: int, *, status: str,
                     overwritten: bool | None, indexed: bool | None,
-                    error: str | None) -> None:
-        with psycopg.connect(self.conninfo) as conn:
+                    error: str | None, lease: psycopg.Connection | None = None) -> None:
+        with self._write_transaction(lease) as conn:
             conn.execute(
                 """
                 UPDATE upload_task_items
@@ -360,10 +360,9 @@ class UploadTaskStore:
                              resource_id=str(item_id), project_id=owner["project_id"], operation_id=task_id,
                              result="succeeded" if status == "success" else "partial" if indexed else "failed",
                              event_key=f"upload:{item_id}:finish:{status}:{indexed}")
-            conn.commit()
 
-    def finish(self, task_id: str) -> None:
-        with psycopg.connect(self.conninfo) as conn:
+    def finish(self, task_id: str, *, lease: psycopg.Connection | None = None) -> None:
+        with self._write_transaction(lease) as conn:
             conn.execute(
                 """
                 UPDATE upload_tasks t
@@ -384,10 +383,9 @@ class UploadTaskStore:
                 """,
                 (task_id,),
             )
-            conn.commit()
 
-    def fail(self, task_id: str, error: str) -> None:
-        with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
+    def fail(self, task_id: str, error: str, *, lease: psycopg.Connection | None = None) -> None:
+        with self._write_transaction(lease) as conn:
             conn.execute(
                 """
                 UPDATE upload_task_items
@@ -425,5 +423,4 @@ class UploadTaskStore:
                                  resource_type="upload_task", resource_id=task_id, project_id=owner["project_id"],
                                  result="failed", operation_id=task_id, event_key=f"upload:{task_id}:failed",
                                  error_code="upload_interrupted", trace_id=owner["trace_id"], system=True)
-            conn.commit()
 

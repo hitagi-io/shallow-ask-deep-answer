@@ -35,7 +35,7 @@ from utils.core.pg_lock import SingleInstanceGuard, exclusive_section, shared_se
 from utils.chat.generation_runner import run_generation
 from utils.observability.context import ExecutionContext, bind_context, current_context
 from utils.observability.tracing import span, start_tracing, stop_tracing
-from utils.observability.audit import audit_operation, resource_digest, configure_audit
+from utils.observability.audit import AuditResult, audit_operation, resource_digest, configure_audit
 from utils.observability.queries import generation_trace, audit_page, prune_observability
 from utils.indexing.recovery import PublicationUncertain
 from utils.indexing.health_report_cache import HealthReportCache, HealthReportInvalidated
@@ -301,6 +301,13 @@ def _format_repair_summary(repair: dict) -> str:
     )
 
 
+def _repair_audit_result(report: dict) -> AuditResult:
+    repair = report["repair"]
+    if repair["re_index_failures"] or repair["ghost_errors"] or not report["healthy"]:
+        return "partial"
+    return "succeeded"
+
+
 def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
     """索引自动修复闭环：健康检查发现问题 → 自动修复 → 复查，直至检查通过或达到轮次上限。
 
@@ -328,7 +335,7 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
                 with audit_operation(user_id, "index.repair", "project", project_id,
                                      project_id=project_id, system=True) as operation:
                     report = index_health.repair()
-                    operation.result = "succeeded" if report["healthy"] else "partial"
+                    operation.result = _repair_audit_result(report)
                 repair = report["repair"]
                 logger.info(f"[索引自动修复] 本轮修复完成：{_format_repair_summary(repair)}")
             except ServiceStopping:
@@ -382,23 +389,19 @@ def _upload_task_payload(task: dict) -> dict:
     }
 
 
-def _process_upload_task(task: dict, lease: psycopg.Connection) -> bool:
+def _process_upload_task(task: dict, lease: psycopg.Connection, queued_items: list[dict]) -> bool:
     """执行一个上传任务的索引操作；数据库队列保证同一项目内按顺序执行。"""
     task_id = task["id"]
     user_id, project_id = task["user_id"], task["project_id"]
     succeeded = True
     try:
-        for item in _upload_task_store.items(task_id):
-            if item["status"] != "queued":
-                continue
+        for item in queued_items:
             check_shutdown()
             journal = _upload_task_store.journal(task, item)
-            _upload_task_store.mark_item_running(task_id, item["id"])
             status = "error"
             overwritten = None
             indexed = False
             error = None
-            staged_path = item["staged_path"]
             last_progress: IndexProgress | None = None
 
             def report_progress(progress: IndexProgress) -> None:
@@ -420,7 +423,7 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> bool:
                     _ensure_project(current)
                     _resolve_pending_uploads(user_id, project_id)
                     knowledge_dir = get_knowledge_dir(user_id, project_id)
-                    staged_path = scoped_knowledge_file(knowledge_dir, staged_path)
+                    staged_path = _staged_upload_path(knowledge_dir, item["staged_path"])
                     destination = scoped_knowledge_file(
                         knowledge_dir, os.path.join(knowledge_dir, item["name"])
                     )
@@ -432,7 +435,7 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> bool:
                     error = result["error"]
                     status = "success" if indexed and not error else "error"
                 _invalidate_health(user_id, project_id)
-            except ServiceStopping:
+            except (ServiceStopping, psycopg.OperationalError):
                 raise
             except PublicationUncertain as exc:
                 error = str(exc)
@@ -443,32 +446,23 @@ def _process_upload_task(task: dict, lease: psycopg.Connection) -> bool:
             except Exception:
                 logger.exception("[知识库] 后台上传任务失败 file=%s project_id=%s", item["name"], project_id)
                 error = "后台入库失败，请稍后重试"
-            finally:
-                try:
-                    if not journal.pending:
-                        _remove_staged_upload(user_id, project_id, staged_path)
-                except (OSError, ValueError):
-                    logger.exception("[知识库] 临时上传文件清理失败 file=%s", staged_path)
             _upload_task_store.finish_item(
                 task_id, item["id"], status=status, overwritten=overwritten,
-                indexed=indexed, error=error,
+                indexed=indexed, error=error, lease=lease,
             )
             if error:
                 succeeded = False
                 check_shutdown()
                 if journal.pending:
                     raise PublicationUncertain(error)
-        _upload_task_store.finish(task_id)
+        _upload_task_store.finish(task_id, lease=lease)
         return succeeded
-    except Exception as exc:
-        if isinstance(exc, ServiceStopping):
-            logger.info("[知识库] 后台上传任务已停止 task_id=%s", task_id)
-            error = str(exc)
-        else:
-            logger.exception("[知识库] 后台上传任务异常 task_id=%s", task_id)
-            error = "后台任务异常中断，请重新上传"
+    except (ServiceStopping, psycopg.OperationalError):
+        raise
+    except Exception:
+        logger.exception("[知识库] 后台上传任务异常 task_id=%s", task_id)
         try:
-            _upload_task_store.fail(task_id, error)
+            _upload_task_store.fail(task_id, "后台任务异常中断，请重新上传", lease=lease)
         except Exception:
             logger.exception("[知识库] 后台上传任务状态写回失败 task_id=%s", task_id)
         return False
@@ -488,6 +482,7 @@ def _run_next_upload() -> bool:
                 with _index_write_section(task["user_id"], task["project_id"]), \
                         project_access(task["user_id"], task["project_id"]) as project:
                     _ensure_project(project)
+                    _upload_task_store.requeue_unprepared_items(task["id"], lease)
                     for item in _upload_task_store.items(task["id"]):
                         if item["status"] == "running":
                             journal = _upload_task_store.journal(task, item)
@@ -496,17 +491,30 @@ def _run_next_upload() -> bool:
                                 "error": "更新前任务缺少恢复记录，请检查文档状态或重新上传",
                             }
                             _upload_task_store.finish_item(task["id"], item["id"], status="success" if result["ok"] else "error",
-                                indexed=result["committed"], overwritten=result["overwritten"], error=result["error"])
+                                indexed=result["committed"], overwritten=result["overwritten"], error=result["error"], lease=lease)
                             if not result["ok"]:
                                 execution.fail("upload_interrupted")
-            if not _process_upload_task(task, lease):
+            queued_items = [item for item in _upload_task_store.items(task["id"]) if item["status"] == "queued"]
+            if not _process_upload_task(task, lease, queued_items):
                 execution.fail("upload_failed")
+            queued_ids = {item["id"] for item in queued_items}
             for item in _upload_task_store.items(task["id"]):
-                if not _upload_task_store.journal(task, item).pending:
+                if item["status"] not in ("success", "error"):
+                    continue
+                if item["recovery"] is None and item["id"] not in queued_ids:
+                    continue  # 无法核实的旧任务仍需保留暂存文件。
+                if _upload_task_store.journal(task, item).pending:
+                    continue
+                try:
                     _remove_staged_upload(task["user_id"], task["project_id"], item["staged_path"])
+                except (OSError, ValueError):
+                    logger.exception("[知识库] 临时上传文件清理失败 file=%s", item["staged_path"])
         return True
+    except (ServiceStopping, psycopg.OperationalError, TimeoutError):
+        # 关停、断连或接管时等锁超时，都留给下一次领取继续。
+        raise
     except Exception:
-        _upload_task_store.fail(task["id"], "上传恢复未完成，请执行索引修复")
+        _upload_task_store.fail(task["id"], "上传恢复未完成，请执行索引修复", lease=lease)
         raise
     finally:
         lease.close()
@@ -527,10 +535,15 @@ def _resolve_pending_uploads(user_id: int, project_id: str) -> None:
         _remove_staged_upload(user_id, project_id, item["staged_path"])
 
 
-def _remove_staged_upload(user_id: int, project_id: str, path: str) -> None:
-    path = scoped_knowledge_file(get_knowledge_dir(user_id, project_id), path)
+def _staged_upload_path(directory: str, path: str) -> str:
+    path = scoped_knowledge_file(directory, path)
     if not os.path.basename(path).startswith(".upload_"):
         raise ValueError("无效的上传暂存文件")
+    return path
+
+
+def _remove_staged_upload(user_id: int, project_id: str, path: str) -> None:
+    path = _staged_upload_path(get_knowledge_dir(user_id, project_id), path)
     try:
         os.remove(path)
     except FileNotFoundError:
@@ -1424,7 +1437,7 @@ def repair_index_health(project: dict = Depends(require_project)):
                 _ensure_no_uploads(user_id, project_id)
                 report = IndexHealth(user_id, project_id).repair(include_pending=True)
                 _health_cache(user_id, project_id).set({"report": report})
-            operation.result = "succeeded" if report["healthy"] else "partial"
+            operation.result = _repair_audit_result(report)
             return report
         except HTTPException:
             raise

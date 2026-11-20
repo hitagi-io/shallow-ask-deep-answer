@@ -6,6 +6,7 @@ import threading
 import time
 from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack
+from contextvars import copy_context
 from typing import Literal
 
 from langchain_core.embeddings import Embeddings
@@ -43,13 +44,15 @@ class DashScopeEmbeddings(Embeddings):
         })
 
     def _embed_batch(self, client, batch: list[str], text_type: _TextType, stopped: threading.Event) -> list[list[float]]:
+        def check_batch() -> None:
+            if stopped.is_set():
+                raise CancelledError()
+
         with ExitStack() as slots:
             # 先取得入库名额，避免等待中的入库请求占用提问预留的全局名额。
             if text_type == "document":
-                slots.enter_context(interruptible_lock(_document_request_slots))
-            slots.enter_context(interruptible_lock(_request_slots))
-            if stopped.is_set():
-                raise CancelledError()
+                slots.enter_context(interruptible_lock(_document_request_slots, cancel_check=check_batch))
+            slots.enter_context(interruptible_lock(_request_slots, cancel_check=check_batch))
             body = request_json(client, self.request_settings, {
                 "model": self.model, "input": {"texts": batch},
                 "parameters": {"text_type": text_type},
@@ -106,7 +109,7 @@ class DashScopeEmbeddings(Embeddings):
                 def submit_next():
                     start = next(starts, None)
                     if start is not None:
-                        future = executor.submit(self._embed_batch, client,
+                        future = executor.submit(copy_context().run, self._embed_batch, client,
                                                  texts[start:start + self.batch_size], text_type, stopped)
                         pending[future] = start
 

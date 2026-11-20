@@ -45,6 +45,13 @@ export function parseGeneration(value: unknown): GenerationSnapshot {
     phase: value.phase, error: value.error, trace_id: value.trace_id, result_kind: value.result_kind, error_code: value.error_code }
 }
 
+function parseHistoryMessageStatus(role: Message['role'], status: unknown): Message['status'] {
+  // 历史接口以 null 表示用户提问没有生成状态，页面模型使用可选字段。
+  if (role === 'user' && status === null) return undefined
+  if (status === 'streaming' || status === 'completed' || status === 'error' || status === 'cancelled') return status
+  throw new Error('历史消息格式无效')
+}
+
 export function parseMessageHistory(value: unknown): {
   messages: Message[]; next_before: number | null; kbOnly: boolean | null; project_id: string | null
   project_name: string | null; project_deleted: boolean; active_generation: { request_id: string } | null
@@ -63,13 +70,13 @@ export function parseMessageHistory(value: unknown): {
   const messages = value.messages.map((item: unknown): Message => {
     if (!isRecord(item) || !isCount(item.id) || item.id === 0 || (item.role !== 'user' && item.role !== 'assistant')
         || typeof item.content !== 'string' || typeof item.kbOnly !== 'boolean'
-        || (item.status !== 'streaming' && item.status !== 'completed' && item.status !== 'error' && item.status !== 'cancelled')
         || (item.generation_id !== null && (!isCount(item.generation_id) || item.generation_id === 0))
         || !nullableText(item.trace_id) || !resultKind(item.result_kind) || !nullableText(item.error_code)) {
       throw new Error('历史消息格式无效')
     }
-    return { id: item.id, role: item.role, content: item.content, kbOnly: item.kbOnly, status: item.status,
-      generation_id: item.generation_id, trace_id: item.trace_id, result_kind: item.result_kind, error_code: item.error_code }
+    return { id: item.id, role: item.role, content: item.content, kbOnly: item.kbOnly,
+      status: parseHistoryMessageStatus(item.role, item.status), generation_id: item.generation_id,
+      trace_id: item.trace_id, result_kind: item.result_kind, error_code: item.error_code }
   })
   return { messages, next_before: value.next_before, kbOnly: value.kbOnly, project_id: value.project_id,
     project_name: value.project_name, project_deleted: value.project_deleted,

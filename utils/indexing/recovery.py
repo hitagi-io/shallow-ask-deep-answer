@@ -48,6 +48,17 @@ class UploadJournal:
     def _save(self, record: UploadRecovery) -> None:
         with psycopg.connect(self.conninfo, connect_timeout=5) as conn:
             with conn.cursor() as cur:
+                if record.stage == "prepared":
+                    # running 和首条恢复记录一起提交。哈希计算或等锁期间退出仍是 queued。
+                    cur.execute("""UPDATE upload_task_items SET status='running'
+                                   WHERE id=%s AND task_id=%s AND status='queued' AND recovery IS NULL""",
+                                (self.item_id, self.task_id))
+                    if cur.rowcount != 1:
+                        raise RuntimeError("上传项已不在等待队列，停止修改文件")
+                    cur.execute("UPDATE upload_tasks SET updated_at=now() WHERE id=%s", (self.task_id,))
+                    append_audit(cur, user_id=self.user_id, action="file.upload.start", resource_type="upload_item",
+                                 resource_id=str(self.item_id), project_id=self.project_id, operation_id=self.task_id,
+                                 result="started", event_key=f"upload:{self.item_id}:start")
                 cur.execute("UPDATE upload_task_items SET recovery=%s,updated_at=now() WHERE id=%s AND task_id=%s",
                             (Jsonb(record.model_dump()), self.item_id, self.task_id))
                 if cur.rowcount != 1:
