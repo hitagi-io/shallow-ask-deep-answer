@@ -1,6 +1,8 @@
 import { isRecord, isCount } from './validation'
 import type { Message } from '../api'
 
+type SavedMessage = Message & { id: number }
+
 export type ResultKind = 'answered' | 'clarification' | 'no_evidence' | 'answer_rejected' | 'dependency_failed'
 export interface GenerationSnapshot {
   generation_id: number
@@ -53,7 +55,7 @@ function parseHistoryMessageStatus(role: Message['role'], status: unknown): Mess
 }
 
 export function parseMessageHistory(value: unknown): {
-  messages: Message[]; next_before: number | null; kbOnly: boolean | null; project_id: string | null
+  messages: SavedMessage[]; next_before: number | null; kbOnly: boolean | null; project_id: string | null
   project_name: string | null; project_deleted: boolean; active_generation: { request_id: string } | null
 } {
   if (!isRecord(value) || !Array.isArray(value.messages)
@@ -67,7 +69,7 @@ export function parseMessageHistory(value: unknown): {
     if (!isRecord(value.active_generation) || typeof value.active_generation.request_id !== 'string') throw new Error('进行中的回答格式无效')
     active = { request_id: value.active_generation.request_id }
   }
-  const messages = value.messages.map((item: unknown): Message => {
+  const messages = value.messages.map((item: unknown): SavedMessage => {
     if (!isRecord(item) || !isCount(item.id) || item.id === 0 || (item.role !== 'user' && item.role !== 'assistant')
         || typeof item.content !== 'string' || typeof item.kbOnly !== 'boolean'
         || (item.generation_id !== null && (!isCount(item.generation_id) || item.generation_id === 0))

@@ -757,7 +757,9 @@ _GENERATION_REPLAY_QUERY = """
            g.result_kind, g.error_code, g.trace_id, g.attempt_id, g.retry_of, u.content AS user_content,
            g.user_message_id, g.assistant_message_id, g.kb_only, g.project_id,
            p.name AS project_name, p.deleted_at IS NOT NULL AS project_deleted,
-           EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - g.created_at)) AS elapsed_seconds,
+           GREATEST(0, EXTRACT(EPOCH FROM (
+               CASE WHEN g.status = 'running' THEN CURRENT_TIMESTAMP ELSE g.updated_at END - g.created_at
+           ))) AS elapsed_seconds,
            m.content AS assistant_content
     FROM generations g
     LEFT JOIN messages m ON m.id = g.assistant_message_id

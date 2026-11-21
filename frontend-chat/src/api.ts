@@ -26,8 +26,9 @@ export interface MessageHistory {
   messages: Message[]
   messagesLoaded?: boolean
   nextBefore?: number | null
+  latestHistoryId?: number
   messagesLoading?: boolean
-  messagesError?: string
+  messagesError?: { message: string; before: number | null; retry: () => Promise<void> }
 }
 
 export interface ConversationSummary {
@@ -235,9 +236,7 @@ export async function fetchConversations(cursor?: string | null): Promise<{
   return res.json()
 }
 
-export async function fetchMessages(id: string, before?: number | null): Promise<{
-  messages: Message[]; next_before: number | null; kbOnly: boolean | null; project_id: string | null; project_name: string | null; project_deleted: boolean; active_generation: { request_id: string } | null
-}> {
+export async function fetchMessages(id: string, before?: number | null) {
   const query = new URLSearchParams({ limit: '50' })
   if (before != null) query.set('before', String(before))
   const res = await apiFetch(`/api/conversations/${encodeURIComponent(id)}/messages?${query}`, { headers: authHeaders() })

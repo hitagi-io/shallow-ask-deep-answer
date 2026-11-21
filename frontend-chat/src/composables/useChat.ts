@@ -7,6 +7,28 @@ import type { ConfirmAction } from './useConfirmation'
 const PROJECT_REQUIRED_NOTICE = '请先选择一个可用项目，再发送知识库问题'
 const PROJECT_DELETED_NOTICE = '项目已删除，历史对话仅供查看，无法继续提问'
 
+type HistoryPage = Awaited<ReturnType<typeof fetchMessages>>
+
+function mergeLatestMessages(conv: Conversation, pages: HistoryPage[], nextBefore: number | null) {
+  const oldestId = conv.messages.find(message => message.id !== undefined)?.id
+  const byId = new Map<number, Message>()
+  for (const message of conv.messages) {
+    if (message.id !== undefined) byId.set(message.id, message)
+  }
+  for (const page of pages) {
+    for (const message of page.messages) {
+      const previous = byId.get(message.id)
+      if (previous) Object.assign(previous, message)
+      else byId.set(message.id, message)
+    }
+  }
+  conv.messages = [...byId.entries()].sort(([left], [right]) => left - right).map(([, message]) => message)
+  const newestPage = pages[0].messages
+  conv.latestHistoryId = newestPage[newestPage.length - 1]?.id ?? 0
+  // 最近页可能只覆盖已加载历史的一部分，翻页必须从最早的已加载消息继续。
+  if (oldestId === undefined || nextBefore === null || nextBefore <= oldestId) conv.nextBefore = nextBefore
+}
+
 export function useChat(userId: number, projects: Ref<Project[]>, confirmAction: ConfirmAction, updatingProjectId: Readonly<Ref<string | null>>, active: Readonly<Ref<boolean>>) {
   let disposed = false
   // 输入框随内容自适应高度；清空内容时需手动复位（程序化清空不会触发 input 事件）
@@ -79,7 +101,8 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   watch([currentId, kbOnly, projectId, active], clearNotice, { flush: 'sync' })
   const knowledgeReadiness = useProjectReadiness(computed(() => active.value && kbOnly.value && projectReady.value ? projectId.value : null), updatingProjectId)
   const { blocked: knowledgeBlocked, notice: knowledgeNotice, status: knowledgeStatus, refresh: refreshKnowledgeReadiness } = knowledgeReadiness
-  const checkingSend = ref(false)
+  const checkingSendFor = ref<string | null>(null)
+  const checkingSend = computed(() => checkingSendFor.value !== null)
   watch(projectReady, ready => {
     if (ready && persistNotice.value === PROJECT_REQUIRED_NOTICE) clearNotice()
   })
@@ -89,18 +112,22 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     loading.value = true
     loadError.value = ''
     try {
-      const page = await fetchConversations()
-      if (disposed) return
-      nextCursor.value = page.next_cursor
+      const selected = localStorage.getItem(selectionKey) || ''
       const loaded: Record<string, Conversation> = {}
-      for (const c of page.conversations) loaded[c.id] = withEmptyHistory(c)
+      let cursor: string | null = null
+      do {
+        const page = await fetchConversations(cursor)
+        if (disposed) return
+        for (const c of page.conversations) loaded[c.id] ??= withEmptyHistory(c)
+        cursor = page.next_cursor
+      } while (selected && !loaded[selected] && cursor)
       if (Object.keys(loaded).length === 0) {
         const conv = await createConversationApi('新对话')
         loaded[conv.id] = conv
       }
       if (disposed) return
+      nextCursor.value = cursor
       conversations.value = loaded
-      const selected = localStorage.getItem(selectionKey) || ''
       currentId.value = loaded[selected] ? selected : Object.keys(loaded)[0] || ''
     } catch (e) {
       loadError.value = e instanceof Error ? e.message : '会话加载失败'
@@ -121,36 +148,64 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     finally { loadingMore.value = false }
   }
 
-  async function loadMessages(id = currentId.value, earlier = false) {
+  async function loadMessages(id = currentId.value, before: number | null = null) {
     const conv = conversations.value[id]
     if (!conv) return
-    if (conv.messagesLoading || (!earlier && runs.value[id]) || (earlier && !conv.nextBefore)) return
-    conv.messagesLoading = true
-    conv.messagesError = ''
-    try {
-      const page = await fetchMessages(id, earlier ? conv.nextBefore : null)
-      if (disposed || conversations.value[id] !== conv) return
-      const knownIds = new Set(conv.messages.map(m => m.id))
-      conv.messages = earlier
-        ? [...page.messages.filter(m => !knownIds.has(m.id)), ...conv.messages]
-        : page.messages
-      conv.nextBefore = page.next_before
-      conv.messagesLoaded = true
-      if (page.messages.length) conv.hasMessages = true
-      if (page.kbOnly != null) {
-        conv.kbOnly = page.kbOnly
-        conv.project_id = page.project_id
-        conv.project_name = page.project_name
-        conv.project_deleted = page.project_deleted
+    if (conv.messagesError?.before === before) return conv.messagesError.retry()
+    const pages: HistoryPage[] = []
+    let cursor = before
+    const refreshThrough = before === null && conv.messages.length ? conv.latestHistoryId ?? 0 : null
+    async function read() {
+      if (disposed || conversations.value[id] !== conv || conv.messagesLoading) return
+      if (before === null && (runs.value[id] || checkingSendFor.value === id)) return
+      conv.messagesLoading = true
+      if (conv.messagesError?.before === before) conv.messagesError = undefined
+      try {
+        do {
+          const page = await fetchMessages(id, cursor)
+          if (disposed || conversations.value[id] !== conv) return
+          pages.push(page)
+          cursor = page.next_before
+          // 离开期间可能新增超过一页消息；补到上次读取的位置再一次性合并。
+        } while (refreshThrough !== null && cursor !== null && cursor > refreshThrough)
+        const page = pages[0]
+        if (before === null) {
+          const firstVisibleId = currentId.value === id ? visibleMessages.value[0]?.id : undefined
+          mergeLatestMessages(conv, pages, cursor)
+          if (firstVisibleId !== undefined) {
+            const index = conv.messages.findIndex(message => message.id === firstVisibleId)
+            if (index >= 0) visibleCount.value = Math.max(visibleCount.value, conv.messages.length - index)
+          }
+          if (currentId.value === id) scrollToBottom()
+        } else {
+          const knownIds = new Set(conv.messages.map(message => message.id))
+          const earlier = page.messages.filter(message => !knownIds.has(message.id))
+          conv.messages.unshift(...earlier)
+          conv.nextBefore = cursor
+          if (currentId.value === id) revealEarlier(earlier.length)
+        }
+        conv.messagesLoaded = true
+        if (page.messages.length) conv.hasMessages = true
+        if (page.kbOnly != null) {
+          conv.kbOnly = page.kbOnly
+          conv.project_id = page.project_id
+          conv.project_name = page.project_name
+          conv.project_deleted = page.project_deleted
+        }
+        if (page.project_deleted && page.project_id) markProjectDeleted(page.project_id)
+        if (page.active_generation && !runs.value[id]) {
+          void observeGeneration(id, page.active_generation.request_id)
+        }
+      } catch (e) {
+        // 后台刷新也失败时，重试按钮仍应指向用户正在翻的历史页。
+        if (!conv.messagesError || before !== null) {
+          conv.messagesError = { message: e instanceof Error ? e.message : '消息加载失败', before, retry: read }
+        }
+      } finally {
+        conv.messagesLoading = false
       }
-      if (page.project_deleted && page.project_id) markProjectDeleted(page.project_id)
-      if (page.active_generation && !runs.value[id]) {
-        void observeGeneration(id, page.active_generation.request_id)
-      }
-      if (!earlier && currentId.value === id) jumpToLatest()
-    } catch (e) {
-      conv.messagesError = e instanceof Error ? e.message : '消息加载失败'
-    } finally { conv.messagesLoading = false }
+    }
+    await read()
   }
 
   watch(isProcessing, (processing) => {
@@ -164,24 +219,25 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   const messageOffset = computed(() => Math.max(0, (current.value?.messages.length || 0) - visibleCount.value))
   const visibleMessages = computed(() => current.value?.messages.slice(messageOffset.value) || [])
   const hasEarlier = computed(() => messageOffset.value > 0 || !!current.value?.nextBefore)
-  async function showEarlier() {
-    const conv = current.value
-    if (!conv || conv.messagesLoading) return
+  async function revealEarlier(count: number) {
     const id = currentId.value
     const mode = kbOnly.value
     const el = chatArea.value
     const height = el?.scrollHeight || 0
     const top = el?.scrollTop || 0
     following.value = false
-    if (messageOffset.value > 0) visibleCount.value += 50
-    else {
-      const count = conv.messages.length
-      await loadMessages(id, true)
-      if (currentId.value !== id || kbOnly.value !== mode) return
-      visibleCount.value += (current.value?.messages.length || 0) - count
-    }
+    visibleCount.value += count
     await nextTick()
-    if (el && currentId.value === id && kbOnly.value === mode) el.scrollTop = top + el.scrollHeight - height
+    if (el && el === chatArea.value && currentId.value === id && kbOnly.value === mode) el.scrollTop = top + el.scrollHeight - height
+  }
+  async function showEarlier() {
+    const conv = current.value
+    if (!conv || conv.messagesLoading) return
+    if (messageOffset.value > 0) await revealEarlier(Math.min(50, messageOffset.value))
+    else if (conv.nextBefore != null) {
+      following.value = false
+      await loadMessages(conv.id, conv.nextBefore)
+    }
   }
   function onScroll() {
     const el = chatArea.value
@@ -414,10 +470,10 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
       if (knowledgeBlocked.value) return
       const selectedId = conv.project_id
       const draft = input.value
-      checkingSend.value = true
+      checkingSendFor.value = convId
       let ready: boolean
       try { ready = await refreshKnowledgeReadiness() }
-      finally { checkingSend.value = false }
+      finally { checkingSendFor.value = null }
       // 确认期间切换会话、模式或修改草稿时，不提交旧问题或清空新草稿。
       if (!ready || disposed || !active.value || currentId.value !== convId || conv.project_id !== selectedId
         || answerMode !== kbOnly.value || isProcessing.value || conversationBusy.value || loading.value

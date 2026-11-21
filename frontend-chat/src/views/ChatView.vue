@@ -14,7 +14,7 @@ const { input, inputEl, chatArea, current, isProcessing, isThinking, thinkingSec
   kbOnly, switchMode, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice, projectId, selectedProject, projectReady, projectDeleted, selectProject, newConversation,
   loading, loadError, initConversations, conversationBusy, following, onScroll, jumpToLatest,
   knowledgeBlocked, knowledgeNotice, knowledgeStatus, refreshKnowledgeReadiness, checkingSend,
-  loadMessages, hasEarlier, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend } = props.chat
+  hasEarlier, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend } = props.chat
 const suggestions = computed(() => kbOnly.value ? [
   { icon: 'file' as const, title: '提炼重点', detail: '快速读懂项目资料', prompt: '请总结这个项目资料中的核心内容，并列出关键要点。' },
   { icon: 'book' as const, title: '查找依据', detail: '让答案有据可查', prompt: '请帮我查找资料中关于以下问题的规定，并注明来源：' },
@@ -63,8 +63,8 @@ async function clearInput() {
     <template v-if="current && !loading && !loadError">
       <div v-if="current.messagesLoading && !current.messagesLoaded" class="empty loading-state" role="status"><span class="loading-spinner" aria-hidden="true"></span>正在加载消息…</div>
       <div v-if="current.messagesError" role="alert" class="history-button">
-        {{ current.messagesError }}
-        <button class="text-action" :disabled="current.messagesLoading" @click="current.messagesLoaded ? showEarlier() : loadMessages()">重试加载</button>
+        {{ current.messagesError.message }}
+        <button class="text-action" :disabled="current.messagesLoading" @click="current.messagesError.retry()">重试加载</button>
       </div>
       <div v-if="current.messagesLoaded && current.messages.length === 0" class="empty welcome-state">
         <div class="welcome-brand"><BrandMark /></div>
