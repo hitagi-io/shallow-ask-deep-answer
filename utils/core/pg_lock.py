@@ -30,11 +30,6 @@ def project_index_lock_key(user_id: int, project_id: str) -> int:
     return int.from_bytes(hashlib.sha256(scope.encode()).digest()[:8], "big", signed=True)
 
 
-def conversation_execution_lock_key(thread_id: str) -> int:
-    """生成线程退出前不允许新尝试同时修改同一会话的检查点。"""
-    return int.from_bytes(hashlib.sha256(f"chat-execution:{thread_id}".encode()).digest()[:8], "big", signed=True)
-
-
 @contextmanager
 def _lock_section(conninfo: str, lock_key: int, timeout_seconds: float | None, *, shared: bool,
                   cancel_check: Callable[[], None] | None = None):

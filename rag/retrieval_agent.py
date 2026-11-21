@@ -69,14 +69,17 @@ def build_retrieval_subagent(user_id: int, project_id: str):
         if not query.strip():
             raise ValueError("检索 query 必须为非空字符串")
         try:
-            with span("retrieval.execute"), shared_section(
-                os.getenv("PG_CONNECTION_STRING", "postgresql://postgres:postgres@localhost:5432/shallow_ask_deep_answer"),
-                project_index_lock_key(user_id, project_id),
-                timeout_seconds=float(os.getenv("INDEX_READ_LOCK_TIMEOUT_SECONDS", "30")),
-            ):
-                remaining_seconds()
-                retriever = get_vector_store(user_id, project_id).get_retriever()
-                docs = retriever.invoke(query)
+            with span("retrieval.execute"):
+                with shared_section(
+                    os.getenv("PG_CONNECTION_STRING", "postgresql://postgres:postgres@localhost:5432/shallow_ask_deep_answer"),
+                    project_index_lock_key(user_id, project_id),
+                    timeout_seconds=float(os.getenv("INDEX_READ_LOCK_TIMEOUT_SECONDS", "30")),
+                ):
+                    remaining_seconds()
+                    retriever = get_vector_store(user_id, project_id).hybrid_retriever
+                    candidates = retriever.candidates(query)
+                # 候选已包含同一发布版本的正文和引用元数据，外部精排期间可以释放项目读锁。
+                docs = retriever.rerank(query, candidates)
             chunks = []
             for doc in docs:
                 evidence = make_source_evidence(doc, project_id)

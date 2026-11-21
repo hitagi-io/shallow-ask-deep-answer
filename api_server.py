@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from chat_agent import ChatAgent, PG_CHECKPOINT_POOL_MAX
+from utils.chat.checkpoints import AttemptCheckpoints
 from rag.vector_store import get_vector_store
 from rag.index_health import IndexHealth
 from rag.index_manifest import ManifestStore, current_index_version, project_collection_name
@@ -63,6 +64,7 @@ from auth import (
     update_conversation_title,
     begin_generation,
     get_generation,
+    StreamAccessRevoked,
     cancel_generation,
     save_generation_progress,
     finish_generation,
@@ -139,7 +141,7 @@ def _warn_connection_budget() -> None:
               "建议提高 max_connections，或降低连接池上限。")
     else:
         logger.info(f"[启动] PostgreSQL 池与 Trace 预算 {need}，连接上限 {max_conn}（{detail}）；"
-                    "还需为并发生成锁、索引、审计与扫描连接预留容量")
+                    "还需为索引读写、审计与扫描连接预留容量")
 
 
 @asynccontextmanager
@@ -949,16 +951,17 @@ def _background_task_done(task: asyncio.Task) -> None:
             logger.error("[后台任务] %s 异常结束", task.get_name(), exc_info=error)
 
 
-async def _run_generation(req: ChatRequest, user_id: int, generation_id: int, slot: str):
+async def _run_generation(req: ChatRequest, user_id: int, generation_id: int, attempt_id: str, slot: str):
     try:
         with span("generation.execute", kb_only=req.kb_only) as execution:
+            attempt = AttemptCheckpoints(f"{user_id}:{req.thread_id}", attempt_id)
             status = await run_generation(
                 lambda should_stop: agent.stream_answer(
-                    req.message, f"{user_id}:{req.thread_id}", kb_only=req.kb_only, should_stop=should_stop,
+                    req.message, attempt, kb_only=req.kb_only, should_stop=should_stop,
                     user_id=user_id, project_id=req.project_id,
                 ),
-                partial(save_generation_progress, generation_id),
-                partial(finish_generation, generation_id),
+                partial(save_generation_progress, generation_id, attempt.attempt_id),
+                partial(finish_generation, generation_id, attempt.attempt_id, publish_checkpoint=attempt.publish),
                 deadline=CHAT_STREAM_DEADLINE_SECONDS,
                 save_interval=CHAT_GENERATION_SAVE_SECONDS,
                 on_bridge=lambda bridge: _bind_chat_slot_cancel(slot, bridge.stop),
@@ -974,13 +977,13 @@ async def _run_generation(req: ChatRequest, user_id: int, generation_id: int, sl
 async def _generation_events(user_id: int, conv_id: str, request_id: str, auth_version: int):
     previous = None
     while True:
-        account = await asyncio.to_thread(get_user_by_id, user_id)
-        if account is None or account["auth_version"] != auth_version:
-            # 重连请求会收到 401；已建立的流停止发送快照。
+        try:
+            generation = await asyncio.to_thread(
+                get_generation, user_id, conv_id, request_id, CHAT_GENERATION_STALE_SECONDS,
+                auth_version=auth_version,
+            )
+        except StreamAccessRevoked:
             return
-        generation = await asyncio.to_thread(
-            get_generation, user_id, conv_id, request_id, CHAT_GENERATION_STALE_SECONDS,
-        )
         if generation is None:
             yield _sse({"type": "error", "status": "error", "error": "未找到这次回答，请刷新页面后重试。"})
             return
@@ -1108,7 +1111,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
                           trace_id=begun["trace_id"], user_id=user["user_id"], project_id=req.project_id,
                           generation_id=begun["generation_id"], attempt_id=begun["attempt_id"])):
             generation_task = asyncio.create_task(
-                _run_generation(req, user["user_id"], begun["generation_id"], slot),
+                _run_generation(req, user["user_id"], begun["generation_id"], begun["attempt_id"], slot),
                 name=f"generation-{begun['generation_id']}",
             )
         _generation_tasks.add(generation_task)

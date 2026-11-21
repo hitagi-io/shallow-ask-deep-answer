@@ -8,6 +8,7 @@ from psycopg import OperationalError
 
 from utils.core.logging_config import get_logger
 from utils.chat.stream_bridge import StreamBridge
+from utils.chat.checkpoints import CheckpointPublicationError
 from utils.chat.outcome import ANSWER_REJECTED_ERROR, AnswerOutcome
 from utils.observability.context import execution_deadline, ExecutionStopped
 from utils.observability.tracing import span
@@ -87,16 +88,25 @@ async def run_generation(stream_factory, save_progress, finish, *, deadline, on_
     finally:
         if bridge is not None:
             bridge.stop()
-        for attempt in range(3):
+        result_kind = outcome.result_kind if ended and outcome is not None else None
+        save_attempt = 1
+        while True:
             try:
                 with span("generation.save", status=status, error_code=error_code or ""):
                     await asyncio.to_thread(finish, status, message_status, "".join(parts), error,
-                                            result_kind=outcome.result_kind if ended and outcome is not None else None,
-                                            error_code=error_code)
+                                            result_kind=result_kind, error_code=error_code)
                 break
-            except OperationalError:
-                logger.exception("[对话生成] 保存终态失败（第 %s 次）", attempt + 1)
-                if attempt == 2:
+            except CheckpointPublicationError:
+                if result_kind is None:
                     raise
+                logger.exception("[对话生成] 检查点事务已回滚，记录失败结果")
+                status, message_status = "failed", "error"
+                error, error_code = "会话保存失败，请重新提问。", "checkpoint_save_failed"
+                result_kind = None
+            except OperationalError:
+                logger.exception("[对话生成] 保存终态失败（第 %s 次）", save_attempt)
+                if save_attempt == 3:
+                    raise
+                save_attempt += 1
                 await asyncio.sleep(0.5)
     return status

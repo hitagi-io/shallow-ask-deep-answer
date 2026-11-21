@@ -6,9 +6,11 @@ import re
 import random
 import threading
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
+from psycopg import Connection
 from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -94,9 +96,11 @@ def _connection():
     try:
         yield conn
     finally:
-        if conn.info.transaction_status == TransactionStatus.INTRANS:
-            conn.rollback()
-        pool.putconn(conn)
+        try:
+            if conn.info.transaction_status in (TransactionStatus.INTRANS, TransactionStatus.INERROR):
+                conn.rollback()
+        finally:
+            pool.putconn(conn)
 
 
 def init_db():
@@ -752,8 +756,8 @@ def _conversation_lock_key(conv_id: str) -> int:
     return int.from_bytes(digest, "big") & 0x7FFFFFFFFFFFFFFF
 
 
-_GENERATION_REPLAY_QUERY = """
-    SELECT g.id, g.id AS generation_id, g.request_id, g.status, g.error, g.phase,
+_GENERATION_FIELDS = """
+           g.id, g.id AS generation_id, g.request_id, g.status, g.error, g.phase,
            g.result_kind, g.error_code, g.trace_id, g.attempt_id, g.retry_of, u.content AS user_content,
            g.user_message_id, g.assistant_message_id, g.kb_only, g.project_id,
            p.name AS project_name, p.deleted_at IS NOT NULL AS project_deleted,
@@ -761,11 +765,23 @@ _GENERATION_REPLAY_QUERY = """
                CASE WHEN g.status = 'running' THEN CURRENT_TIMESTAMP ELSE g.updated_at END - g.created_at
            ))) AS elapsed_seconds,
            m.content AS assistant_content
-    FROM generations g
+"""
+_GENERATION_JOINS = """
     LEFT JOIN messages m ON m.id = g.assistant_message_id
     LEFT JOIN messages u ON u.id = g.user_message_id
     LEFT JOIN projects p ON p.id = g.project_id AND p.user_id = g.user_id
+"""
+_GENERATION_REPLAY_QUERY = f"""
+    SELECT {_GENERATION_FIELDS} FROM generations g {_GENERATION_JOINS}
     WHERE g.conversation_id = %s AND g.request_id = %s
+"""
+_GENERATION_SNAPSHOT_QUERY = f"""
+    SELECT {_GENERATION_FIELDS},
+           g.status = 'running' AND g.heartbeat_at < now() - make_interval(secs => %s) AS stale
+    FROM users account
+    LEFT JOIN generations g ON g.user_id = account.id AND g.conversation_id = %s AND g.request_id = %s
+    {_GENERATION_JOINS}
+    WHERE account.id = %s AND (%s::int IS NULL OR account.auth_version = %s)
 """
 
 
@@ -939,20 +955,29 @@ def begin_generation(
         }
 
 
-def get_generation(user_id: int, conv_id: str, request_id: str, stale_seconds: float) -> dict | None:
-    """可跨 worker 订阅的完整快照；每次读取校验归属并补偿失联任务。"""
+class StreamAccessRevoked(Exception):
+    """账号已注销或凭证已撤销，已建立的 SSE 应立即关闭。"""
+
+
+def get_generation(user_id: int, conv_id: str, request_id: str, stale_seconds: float,
+                   *, auth_version: int | None = None) -> dict | None:
+    """在同一条查询中核对凭证、读取快照并检查心跳，仅失联时执行补偿。"""
+    params = (stale_seconds, conv_id, request_id, user_id, auth_version, auth_version)
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            query = _GENERATION_REPLAY_QUERY + " AND g.user_id = %s"
-            cur.execute(query, (conv_id, request_id, user_id))
+            cur.execute(_GENERATION_SNAPSHOT_QUERY, params)
             row = cur.fetchone()
-            if row is not None and row["status"] == "running":
+            if row is not None and row["stale"]:
                 _reap_stale_generations(cur, conv_id, stale_seconds)
-                cur.execute(query, (conv_id, request_id, user_id))
+                cur.execute(_GENERATION_SNAPSHOT_QUERY, params)
                 row = cur.fetchone()
         conn.commit()
-    if row is not None:
-        row["elapsed_seconds"] = float(row["elapsed_seconds"])
+    if row is None and auth_version is not None:
+        raise StreamAccessRevoked
+    if row is None or row["id"] is None:
+        return None
+    del row["stale"]
+    row["elapsed_seconds"] = float(row["elapsed_seconds"])
     return row
 
 
@@ -974,28 +999,30 @@ def cancel_generation(user_id: int, conv_id: str, request_id: str) -> bool:
     return found
 
 
-def save_generation_progress(generation_id: int, content: str | None, phase: str) -> bool:
+def save_generation_progress(generation_id: int, attempt_id: str, content: str | None, phase: str) -> bool:
     """保存增量快照和心跳；返回 False 表示已取消或已由补偿流程结束。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("UPDATE generations SET heartbeat_at = CURRENT_TIMESTAMP, phase = %s "
-                        "WHERE id = %s AND status = 'running' "
-                        "RETURNING assistant_message_id, cancel_requested", (phase, generation_id))
+                        "WHERE id = %s AND attempt_id = %s AND status = 'running' AND NOT cancel_requested "
+                        "RETURNING assistant_message_id", (phase, generation_id, attempt_id))
             row = cur.fetchone()
             if row is not None and content is not None:
                 cur.execute("UPDATE messages SET content = %s WHERE id = %s",
                             (content, row["assistant_message_id"]))
         conn.commit()
-    return row is not None and not row["cancel_requested"]
+    return row is not None
 
 
 def finish_generation(
     generation_id: int,
+    attempt_id: str,
     status: str,
     message_status: str,
     content: str,
     error: str | None,
-    *, result_kind: ResultKind | None = None, error_code: str | None = None,
+    *, publish_checkpoint: Callable[[Connection], None],
+    result_kind: ResultKind | None = None, error_code: str | None = None,
 ) -> int | None:
     """将生成任务置为终态并写入助手消息（终态：completed / failed / cancelled）。
 
@@ -1006,8 +1033,8 @@ def finish_generation(
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "SELECT conversation_id, status, kb_only, assistant_message_id, cancel_requested, user_id, project_id, attempt_id, trace_id "
-                "FROM generations WHERE id = %s FOR UPDATE",
-                (generation_id,),
+                "FROM generations WHERE id = %s AND attempt_id = %s FOR UPDATE",
+                (generation_id, attempt_id),
             )
             row = cur.fetchone()
             if row is None or row["status"] != "running":
@@ -1016,6 +1043,9 @@ def finish_generation(
             if row["cancel_requested"]:
                 status, message_status, error = "cancelled", "cancelled", "已停止回答。"
                 result_kind, error_code = None, "cancelled"
+            elif result_kind is not None:
+                # 行锁覆盖检查点、消息、审计和终态的同一次提交。失联或取消的尝试不能发布。
+                publish_checkpoint(conn)
             if not content and message_status == "error":
                 content = error or "回答已中断，请重新提问。"
             message_id = row["assistant_message_id"]

@@ -93,7 +93,8 @@ class VectorStore:
             length_function=len,
             add_start_index=True,
         )
-        self._retriever = RunnableLambda(HybridRetriever(self).search)
+        self.hybrid_retriever = HybridRetriever(self)
+        self._retriever = RunnableLambda(self.hybrid_retriever.search)
         self._store_lock = threading.RLock()
 
     def get_retriever(self):

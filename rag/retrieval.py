@@ -98,6 +98,9 @@ class HybridRetriever:
         self.store = store
 
     def search(self, query: str) -> list[Document]:
+        return self.rerank(query, self.candidates(query))
+
+    def candidates(self, query: str) -> list[Document]:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("检索 query 必须为非空字符串")
         started = time.perf_counter()
@@ -141,11 +144,16 @@ class HybridRetriever:
         with span("retrieval.fusion", config_hash=fingerprint(json.dumps(SETTINGS, sort_keys=True))) as fusion:
             candidates = fuse_rrf([dense, sparse], SETTINGS["rrf_k"])
             fusion.attributes["count"] = len(candidates)
+        logger.info("[混合召回] 向量=%s BM25=%s 融合候选=%s 耗时=%.0fms",
+                    len(dense), len(sparse), len(candidates), (time.perf_counter() - started) * 1000)
+        return candidates
+
+    @staticmethod
+    def rerank(query: str, candidates: list[Document]) -> list[Document]:
+        if not candidates:
+            return []
         with span("retrieval.rerank", model=SETTINGS["rerank"]["model"]) as rerank:
             remaining_seconds()
             documents = rerank_documents(query, candidates, SETTINGS["top_k"], SETTINGS["rerank"])
             rerank.attributes["count"] = len(documents)
-        logger.info("[混合检索] 向量=%s BM25=%s 融合候选=%s 返回=%s 耗时=%.0fms",
-                    len(dense), len(sparse), len(candidates), len(documents),
-                    (time.perf_counter() - started) * 1000)
         return documents

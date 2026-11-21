@@ -20,7 +20,8 @@ from utils.chat.answer_guard import SEARCH_ERROR_MARKER, guarded_stream
 from utils.chat.kb_turn import stream_kb_turn
 from utils.retrieval.retrieval_protocol import build_clarification_content
 from utils.core.config_loader import agent_config
-from utils.core.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section, conversation_execution_lock_key
+from utils.core.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
+from utils.chat.checkpoints import AttemptCheckpoints
 from utils.chat.prompt_loader import (
     load_conversation_summary_prompt,
     render_general_prompt,
@@ -250,7 +251,8 @@ class ChatAgent:
         with self._kb_agents_lock:
             self._kb_agents.pop(knowledge_scope(user_id, project_id), None)
 
-    def stream_answer(self, query, thread_id, kb_only=True, should_stop=None, *, user_id=None, project_id=None):
+    def stream_answer(self, query, attempt: AttemptCheckpoints, kb_only=True, should_stop=None, *,
+                      user_id=None, project_id=None):
         """生成文本增量与阶段/替换事件，供 StreamBridge 消费。"""
         if kb_only:
             if user_id is None or project_id is None:
@@ -258,17 +260,14 @@ class ChatAgent:
             agent = self._get_kb_agent(user_id, project_id)
         else:
             agent = self._general_agent
-        def check_execution() -> None:
-            remaining_seconds()
-
-        with exclusive_section(_PG_CONNECTION_STRING, conversation_execution_lock_key(thread_id),
-                               remaining_seconds(), cancel_check=check_execution), \
-                span("agent.execute", prompt_hash=fingerprint(self.kb_only_prompt if kb_only else self.general_prompt),
+        with span("agent.execute", prompt_hash=fingerprint(self.kb_only_prompt if kb_only else self.general_prompt),
                   config_hash=fingerprint(json.dumps(agent_config, sort_keys=True)), date=date.today().isoformat()):
             callback = AgentTraceCallback(os.getenv("MAIN_AGENT_MODEL") or agent_config["main_agent_model"])
             try:
                 remaining_seconds()
-                config = {"configurable": {"thread_id": thread_id}, "callbacks": [callback]}
+                attempt.load(self.checkpointer)
+                agent = agent.copy(update={"checkpointer": attempt.saver})
+                config = {**attempt.config, "callbacks": [callback]}
                 if kb_only:
                     yield from stream_kb_turn(agent, query, config, should_stop)
                     return
