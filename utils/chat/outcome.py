@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 ResultKind = Literal["answered", "clarification", "no_evidence", "answer_rejected", "dependency_failed"]
+ANSWER_REJECTED_ERROR = "本次回答未通过校验，请补充问题后重试。"
 
 
 class AnswerOutcome(BaseModel):

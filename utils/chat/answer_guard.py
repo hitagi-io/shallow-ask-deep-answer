@@ -25,7 +25,7 @@ from utils.retrieval.retrieval_protocol import (
 )
 from utils.core.logging_config import get_logger
 from utils.retrieval.citations import cited_evidence_ids, render_citations
-from utils.chat.outcome import AnswerOutcome
+from utils.chat.outcome import ANSWER_REJECTED_ERROR, AnswerOutcome
 from utils.observability.tracing import span
 
 logger = get_logger(__name__)
@@ -281,7 +281,8 @@ def _general_stream(raw_stream, phase_event: Callable[[str], dict[str, str] | No
             result_kind="answer_rejected", error_code="missing_answer")
 
 
-def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
+def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None, *,
+                   on_final_text: Callable[[str], None] | None = None):
     """把 Agent 的原始消息流包装为"用户可见文本流"。
 
     严格模式先缓冲模型文本；收齐任务报告且有 status=ok 时进入增量放行，
@@ -294,6 +295,8 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
     - str：正常文本增量；
     - {"type": "phase", "phase": ...}：阶段提示（thinking / retrieving / generating）；
     - {"type": "replace", "content": ...}：用新内容整段替换此前已下发文本。
+
+    知识库模式在最终结果事件前调用 on_final_text，传入最终正文或空回答的终止提示。
 
     should_stop 为取消判定（threading.Event.is_set）。kb 模式需要读取上游消息，
     外层无法在读取过程中察觉取消，必须在循环里主动检查，否则停止/断连后仍会把
@@ -363,16 +366,17 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None):
             validation.attributes["result_kind"] = guard.outcome.result_kind
             if guard.outcome.error_code is not None:
                 validation.fail(guard.outcome.error_code)
-        if action == "none" or not text:
-            yield guard.outcome
+        if action == "replace" and text:
+            emitted_text = "".join(emitted)
+            if not emitted_text:
+                yield text
+            elif emitted_text != text:
+                # 已下发内容与最终校验结果不一致（引用越界、降级文案等），整段替换
+                yield {"type": "replace", "content": text}
+        if should_stop is not None and should_stop():
             return
-
-        emitted_text = "".join(emitted)
-        if not emitted_text:
-            yield text
-        elif emitted_text != text:
-            # 已下发内容与最终校验结果不一致（引用越界、降级文案等），整段替换
-            yield {"type": "replace", "content": text}
+        if on_final_text is not None:
+            on_final_text(text or ANSWER_REJECTED_ERROR)
         yield guard.outcome
     finally:
         try:

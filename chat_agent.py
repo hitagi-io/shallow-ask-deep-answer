@@ -17,6 +17,7 @@ from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg_pool import ConnectionPool
 from utils.chat.answer_guard import SEARCH_ERROR_MARKER, guarded_stream
+from utils.chat.kb_turn import stream_kb_turn
 from utils.retrieval.retrieval_protocol import build_clarification_content
 from utils.core.config_loader import agent_config
 from utils.core.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section, conversation_execution_lock_key
@@ -267,11 +268,15 @@ class ChatAgent:
             callback = AgentTraceCallback(os.getenv("MAIN_AGENT_MODEL") or agent_config["main_agent_model"])
             try:
                 remaining_seconds()
+                config = {"configurable": {"thread_id": thread_id}, "callbacks": [callback]}
+                if kb_only:
+                    yield from stream_kb_turn(agent, query, config, should_stop)
+                    return
                 raw_stream = agent.stream(
                     {"messages": [{"role": "human", "content": query}]},
-                    config={"configurable": {"thread_id": thread_id}, "callbacks": [callback]},
+                    config=config,
                     stream_mode="messages",
                 )
-                yield from guarded_stream(raw_stream, kb_only=kb_only, should_stop=should_stop)
+                yield from guarded_stream(raw_stream, kb_only=False, should_stop=should_stop)
             finally:
                 callback.close()

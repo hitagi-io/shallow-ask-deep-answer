@@ -8,7 +8,7 @@ from psycopg import OperationalError
 
 from utils.core.logging_config import get_logger
 from utils.chat.stream_bridge import StreamBridge
-from utils.chat.outcome import AnswerOutcome
+from utils.chat.outcome import ANSWER_REJECTED_ERROR, AnswerOutcome
 from utils.observability.context import execution_deadline, ExecutionStopped
 from utils.observability.tracing import span
 
@@ -63,7 +63,7 @@ async def run_generation(stream_factory, save_progress, finish, *, deadline, on_
                     ended = True
                     error_code = outcome.error_code
                     if outcome.failed:
-                        error = "知识库暂时无法查询，请稍后重试。" if outcome.result_kind == "dependency_failed" else "本次回答未通过校验，请补充问题后重试。"
+                        error = "知识库暂时无法查询，请稍后重试。" if outcome.result_kind == "dependency_failed" else ANSWER_REJECTED_ERROR
                     else:
                         status, message_status, error = "completed", "completed", None
                     break
