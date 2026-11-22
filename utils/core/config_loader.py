@@ -68,9 +68,6 @@ def validate_parsing_config(config: dict) -> None:
             raise ValueError(f"parsing.{key} 必须为正整数")
     if not 72 <= settings["pdf_dpi"] <= 400 or not 640 <= settings["ocr_max_side"] <= 4096:
         raise ValueError("pdf_dpi 必须为 72～400，ocr_max_side 必须为 640～4096")
-    confidence = settings.get("ocr_min_confidence")
-    if type(confidence) not in (int, float) or not 0 < confidence <= 1:
-        raise ValueError("parsing.ocr_min_confidence 必须大于 0 且不超过 1")
     limits = config.setdefault("xlsx_limits", {})
     if not isinstance(limits, dict):
         raise ValueError("xlsx_limits 必须为键值映射")

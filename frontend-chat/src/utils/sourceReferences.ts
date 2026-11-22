@@ -16,10 +16,9 @@ export function formatSourceReferences(doc: Document, deleted: boolean) {
   const list = doc.body.lastElementChild
   const heading = list?.previousElementSibling
   if (list?.tagName !== 'UL' || heading?.tagName !== 'P'
-    || !['来源：', '来源', '参考来源（点击查看原文）'].includes(heading.textContent || '')) return
+    || !['来源：', '来源'].includes(heading.textContent || '')) return
 
   const groups = new Map<string, { name: string; urls: string[]; knowledge: boolean }>()
-  const citedUrls = new Set<string>()
   for (const item of list.children) {
     const link = item.querySelector<HTMLAnchorElement>('a[href]')
     const href = link?.getAttribute('href') || ''
@@ -35,15 +34,8 @@ export function formatSourceReferences(doc: Document, deleted: boolean) {
     const group = groups.get(key) || { name, urls: [], knowledge }
     if (!group.urls.includes(href)) group.urls.push(href)
     groups.set(key, group)
-    citedUrls.add(href)
   }
   if (!groups.size) return
-
-  // 已保存的旧回答仍可阅读：只移除对应文末来源的数字链接，保留正文中的普通数字。
-  for (const link of doc.querySelectorAll<HTMLAnchorElement>('a[href]')) {
-    if (!list.contains(link) && citedUrls.has(link.getAttribute('href') || '')
-      && /^\[?\d+\]?$/.test(link.textContent || '')) link.remove()
-  }
 
   const references = doc.createElement('p')
   references.className = 'source-references'

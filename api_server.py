@@ -29,7 +29,7 @@ from utils.chat.checkpoints import AttemptCheckpoints
 from rag.vector_store import get_vector_store
 from rag.index_health import IndexHealth
 from rag.index_manifest import ManifestStore, current_index_version, project_collection_name
-from utils.documents.knowledge_files import list_supported_files
+from utils.documents.knowledge_files import document_format, list_supported_files
 from utils.documents.upload_form import upload_form, upload_request_size
 from utils.documents.file_listing import NAME_SORTS, FileFilter, FilePage, FileSort, KnowledgeFile, paginate_files, summarize_files
 from utils.retrieval.source_evidence import SourceVersionChanged, read_source_passage
@@ -1262,12 +1262,15 @@ def _safe_filename(filename: str) -> str:
     return filename
 
 
+def _project_manifests(user_id: int, project_id: str) -> ManifestStore:
+    return ManifestStore({**vector_db_config, "collection_name":
+                          project_collection_name(vector_db_config, user_id, project_id)})
+
+
 def _project_file_statuses(user_id: int, project_id: str) -> list[KnowledgeFile]:
     directory = get_knowledge_dir(user_id, project_id)
     paths = list_supported_files(directory, allowed_types)
-    manifests = ManifestStore({**vector_db_config, "collection_name":
-                               project_collection_name(vector_db_config, user_id, project_id)})
-    return manifests.file_statuses(paths, current_index_version(vector_db_config))
+    return _project_manifests(user_id, project_id).file_statuses(paths, current_index_version(vector_db_config))
 
 
 @app.get("/api/projects/{project_id}/files", response_model=FilePage)
@@ -1301,9 +1304,10 @@ def get_source_passage(
     version: str = Query(pattern=r"^[0-9a-f]{64}$"),
     unit: int = Query(ge=0), start: int = Query(ge=0), end: int = Query(gt=0),
     digest: str = Query(pattern=r"^[0-9a-f]{64}$"),
+    snapshot: str = Query(pattern=r"^[0-9a-f]{64}$"),
     project: dict = Depends(require_project),
 ):
-    """按账号鉴权后重新读取原文；历史引用不能悄悄落到覆盖后的新版本。"""
+    """按项目读取入库快照并核对原文件版本。"""
     with audit_operation(project["user_id"], "source.read", "file", resource_digest(filename), project_id=project["id"]) as operation:
         user_id, project_id = project["user_id"], project["id"]
         try:
@@ -1312,7 +1316,12 @@ def get_source_passage(
             with shared_section(PG_CONN, project_index_lock_key(user_id, project_id), timeout_seconds=10), \
                     project_access(user_id, project_id) as current:
                 _ensure_project(current)
-                passage = read_source_passage(file_path, version, unit, start, end, digest)
+                def lookup(key: str):
+                    identity = (version, document_format(file_path))
+                    return _project_manifests(user_id, project_id).source_snapshot(identity, key)
+
+                passage = read_source_passage(file_path, version, unit, start, end, digest,
+                                              snapshot=snapshot, lookup=lookup)
             return JSONResponse(passage, headers={"Cache-Control": "no-store"})
         except HTTPException:
             raise

@@ -4,7 +4,7 @@ embedding_model: qwen3.7-text-embedding-flash
 embedding_endpoint: https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding
 # 索引管线修订号：解析规则或服务端模型行为变化时递增，触发完整重建。
 # 分块参数、嵌入模型与解析依赖版本也会自动计入索引版本指纹。
-index_version: 3
+index_version: 4
 
 # Milvus 配置（通过 Docker 部署 Milvus 服务）
 milvus_uri: "http://localhost:19530"
@@ -38,11 +38,13 @@ allowed_types: [".txt", ".md", ".pdf", ".docx", ".xlsx", ".pptx", ".png", ".jpg"
 parsing:
   pdf_dpi: 200
   ocr_max_side: 2600
-  ocr_min_confidence: 0.5
+  # 对应 deploy/documents/compose.yaml。更换服务端权重、提示词或转换器时同步更新。
+  any2markdown_revision: 54bf7f0a27d87ef43b712b948c97ec23bfa81c59
+  xiaomi_ocr_revision: e4d1c4a6804bd9ef342b93d705a73af003e2ef4e
   max_pages: 500
   max_sheet_cells: 250000
 
-# XLSX 入库、索引修复和原文回看共用限额，每个 API 进程同时只运行一个表格解析子进程。
+# XLSX 入库与索引修复共用解析限额，每个 API 进程同时只运行一个表格解析子进程。
 xlsx_limits:
   memory_mb: 1024
   timeout_seconds: 180

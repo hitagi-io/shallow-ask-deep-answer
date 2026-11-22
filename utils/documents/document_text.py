@@ -25,18 +25,23 @@ def document(text: str, source: str, locator: str = "", *, page: int = 0, extrac
     })]
 
 
-def table_documents(rows, source: str, locator: str, *, context="", **metadata) -> list[Document]:
-    """逐行保留列号及首行上下文；空值不前向填充，首行不冒充已确认的表头。"""
+def table_documents(rows, source: str, locator: str, *, context="", header_rows=0, **metadata) -> list[Document]:
+    """每行携带列号和显式表头，没有表头标记的表格附带首个非空行。"""
     result = []
     context_prefix = f"表格前文: {clean_text(context)}\n\n" if context else ""
-    first_row = ""
+    header_context = ""
+    headers = []
     for index, cells in enumerate(rows):
+        if index == header_rows and headers:
+            header_context = "\n".join(headers) + "\n\n"
         row = [clean_text(str(cell)) if cell is not None else "" for cell in cells]
         if not any(row):
             continue
         rendered = "；".join(f"第 {i} 列: {cell or '（空）'}" for i, cell in enumerate(row, 1))
-        result.extend(document(f"{context_prefix}{first_row}第 {index + 1} 行: {rendered}", source,
+        result.extend(document(f"{context_prefix}{header_context}第 {index + 1} 行: {rendered}", source,
                                f"{locator} · 第 {index + 1} 行", **metadata))
-        if not first_row:
-            first_row = f"表格首个非空行（第 {index + 1} 行）: {rendered}\n\n"
+        if index < header_rows:
+            headers.append(f"表头（第 {index + 1} 行）: {rendered}")
+        elif not header_rows and not header_context:
+            header_context = f"表格首个非空行（第 {index + 1} 行）: {rendered}\n\n"
     return result

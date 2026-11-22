@@ -22,7 +22,10 @@ _CACHE_CHARACTERS = 4_000_000
 
 def document_format(file_path: str) -> str:
     """同字节只有使用相同解析器才能共享索引（例如 TXT 与 Markdown 不同）。"""
-    return LOADERS[os.path.splitext(file_path)[1].lower()].__name__.removeprefix("load_")
+    loader = LOADERS.get(os.path.splitext(file_path)[1].lower())
+    if loader is None:
+        raise ValueError("不支持的原文件类型")
+    return loader.__name__.removeprefix("load_")
 
 
 def compute_file_sha256(file_path: str) -> str | None:
@@ -65,8 +68,8 @@ def list_supported_files(dir_path,allowed_types:tuple[str]):
             files.append(path)
     return tuple(sorted(files))
 
-def load_documents(file_path, *, on_progress: UnitProgressCallback | None = None):
-    """缓存有界且按绝对路径和文件摘要隔离，引用回看无需反复执行 OCR。"""
+def load_documents(file_path, *, parser_version: str | None = None, on_progress: UnitProgressCallback | None = None):
+    """相同文件和解析版本复用进程内结果，已发布引用使用数据库中的快照。"""
     check_shutdown()
     if on_progress is not None:
         on_progress(0, 1)
@@ -74,7 +77,7 @@ def load_documents(file_path, *, on_progress: UnitProgressCallback | None = None
     digest = compute_file_sha256(path)
     if digest is None:
         raise ValueError("无法读取源文件")
-    key = (path, digest)
+    key = (path, digest, parser_version)
     with _cache_lock:
         cached = _parsed_cache.get(key)
         if cached is not None:

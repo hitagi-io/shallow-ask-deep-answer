@@ -19,7 +19,9 @@ from rag.index_manifest import IndexManifest, ManifestStore, chunks_match, curre
 from rag.retrieval import HybridRetriever
 from utils.core.config_loader import vector_db_config
 from utils.documents.knowledge_files import list_supported_files, compute_file_sha256, get_document_loader, document_format
-from utils.retrieval.source_evidence import SOURCE_FIELDS, chunk_signature, split_located_documents, text_digest
+from utils.retrieval.source_evidence import (
+    SOURCE_FIELDS, chunk_signature, parsed_unit_snapshot, split_located_documents, text_digest,
+)
 from utils.core.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
 from utils.core.logging_config import get_logger
 from utils.indexing.progress import IndexProgress, IndexStage, ProgressCallback
@@ -220,7 +222,7 @@ class VectorStore:
                 return {**result, "chunks": old.expected_chunks, "ok": True, "error": None, "committed": True}
             try:
                 report("parsing", 0, 1)
-                parsed = loader(file_path, on_progress=partial(report, "parsing"))
+                parsed = loader(file_path, parser_version=self.index_version, on_progress=partial(report, "parsing"))
                 report("splitting", 0, max(1, len(parsed)))
                 documents = split_located_documents(parsed, self.splitter, on_progress=partial(report, "splitting"))
                 check_shutdown()
@@ -303,8 +305,9 @@ class VectorStore:
             if journal is not None:
                 journal.advance("publishing")
             try:
+                snapshots = (parsed_unit_snapshot(doc, unit) for unit, doc in enumerate(parsed))
                 self._confirm_publication(file_path, sha256, manifest.index_id,
-                                          lambda: self.manifests.put(manifest.ready()))
+                                          lambda: self.manifests.put(manifest.ready(), snapshots=snapshots))
             except PublicationUncertain:
                 raise
             except Exception:

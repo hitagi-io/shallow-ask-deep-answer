@@ -33,9 +33,7 @@ def current_index_version(config: dict) -> str:
         "parsing": config["parsing"],
         "dependencies": {name: version(name) for name in (
             "langchain-text-splitters", "pdfplumber", "pdfminer.six", "pypdfium2", "python-docx",
-            "python-pptx", "openpyxl", "Pillow", "markdown-it-py", "rapidocr", "onnxruntime",
-            "opencv-python-headless", "numpy",
-            "lxml", "shapely", "pyclipper",
+            "python-pptx", "openpyxl", "Pillow", "markdown-it-py", "lxml",
         )},
     }
     return text_digest(json.dumps(recipe, sort_keys=True, ensure_ascii=False))
@@ -155,6 +153,18 @@ class ManifestStore:
                     REFERENCES index_manifests(namespace, content_sha256, source_format) ON DELETE CASCADE
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS indexed_source_snapshots (
+                namespace TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                source_format TEXT NOT NULL,
+                snapshot TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                PRIMARY KEY (namespace, content_sha256, source_format, snapshot),
+                FOREIGN KEY (namespace, content_sha256, source_format)
+                    REFERENCES index_manifests(namespace, content_sha256, source_format) ON DELETE CASCADE
+            )
+        """)
 
     def _connect(self):
         return psycopg.connect(self.conninfo, connect_timeout=5, row_factory=dict_row)
@@ -169,7 +179,7 @@ class ManifestStore:
         records = [IndexManifest(**{**row, "chunk_hashes": tuple(row["chunk_hashes"])}) for row in rows]
         return {record.identity: record for record in records}
 
-    def put(self, manifest: IndexManifest) -> None:
+    def put(self, manifest: IndexManifest, *, snapshots=()) -> None:
         with self._connect() as conn:
             conn.execute("""
                 INSERT INTO index_manifests
@@ -185,8 +195,24 @@ class ManifestStore:
                   manifest.index_version, manifest.index_id, manifest.expected_chunks,
                   Jsonb(list(manifest.chunk_hashes)), manifest.state))
             if manifest.state == "ready":
+                # 保留同文件曾发布过的解析结果，直到最后一份同内容文件被删除。
+                # 快照和发布指针同事务提交，重建失败或中断不会影响可读版本。
+                with conn.cursor() as cur:
+                    cur.executemany("""
+                        INSERT INTO indexed_source_snapshots
+                            (namespace, content_sha256, source_format, snapshot, payload)
+                        VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING
+                    """, ((self.namespace, *manifest.identity, key, Jsonb(data)) for key, data in snapshots))
                 self._record_files(conn, {manifest.source: manifest.content_sha256})
                 self._publish_file(conn, manifest.source, manifest.content_sha256)
+
+    def source_snapshot(self, identity: tuple[str, str], key: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("""
+                SELECT payload FROM indexed_source_snapshots
+                WHERE namespace = %s AND content_sha256 = %s AND source_format = %s AND snapshot = %s
+            """, (self.namespace, *identity, key)).fetchone()
+        return row["payload"] if row else None
 
     def _publish_file(self, conn, source: str, digest: str) -> None:
         conn.execute("""

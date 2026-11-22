@@ -23,10 +23,11 @@ def valid_evidence(item: dict) -> bool:
         return False
     if unquote(url.path.rsplit("/", 1)[-1]) != item["source"]:
         return False
-    query = parse_qs(url.query)
-    if set(query) != {"version", "unit", "start", "end", "digest"} or any(len(v) != 1 for v in query.values()):
+    query = parse_qs(url.query, keep_blank_values=True)
+    required = {"version", "unit", "start", "end", "digest", "snapshot"}
+    if set(query) != required or any(len(v) != 1 for v in query.values()):
         return False
-    if any(not re.fullmatch(r"[0-9a-f]{64}", query[k][0]) for k in ("version", "digest")):
+    if any(not re.fullmatch(r"[0-9a-f]{64}", query[k][0]) for k in ("version", "digest", "snapshot")):
         return False
     if any(not re.fullmatch(r"\d{1,12}", query[k][0]) for k in ("unit", "start", "end")):
         return False

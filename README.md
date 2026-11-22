@@ -5,7 +5,7 @@
 ## 功能
 
 - **双模式问答**：知识库检索与通用问答，通用模式支持 Tavily 联网搜索。
-- **文档入库**：支持 TXT、Markdown、PDF、DOCX、XLSX、PPTX 和图片，扫描文档支持本地 OCR。
+- **文档入库**：Any2Markdown 统一转换 TXT、Markdown、PDF、DOCX、XLSX、PPTX 和图片。扫描页与 Office 内嵌图片使用本地 Xiaomi-OCR-0 识别，提取结果保留页码、幻灯片对象、工作表及单元格位置。
 - **检索与引用**：向量与 BM25 混合检索、rerank 精排，点击知识库来源可查看提取文本、上下文及高亮证据。
 - **私有工作空间**：项目、资料和会话按账号隔离，支持流式回答、历史记录、停止生成和索引维护。
 
@@ -23,6 +23,16 @@ docker compose -f deploy/milvus/compose.yaml up -d --wait
 ```
 
 已有数据库或 Milvus 服务可跳过对应命令；使用已有 Milvus 时，在 `config/vector_db.yaml` 设置 `milvus_uri`。首次部署使用空数据库，后端自动建表；已有当前项目结构会执行增量迁移，数据库账号需有建表与修改表结构的权限。
+
+文档解析使用独立的 Linux 容器，需要 Docker 能访问 NVIDIA GPU。首次启动会构建 Any2Markdown，下载 vLLM 镜像和小米模型权重，并为解码准备 CUDA Graph。权重及 CUDA、Triton 编译缓存保存在 Docker 命名卷中。
+
+```powershell
+docker compose -f deploy/documents/compose.yaml up -d --build --wait
+```
+
+模型开始监听后，在 PowerShell 运行 `Invoke-RestMethod http://127.0.0.1:8088/models/default/status` 确认模型可用。Any2Markdown 在本机 8088 端口为应用提供转换服务。服务连接设置见 [.env.example](./.env.example)，版本及部署配置见 [文档解析 Compose](./deploy/documents/compose.yaml)。更换 GPU 或主机时见[在其他机器上部署 OCR](#在其他机器上部署-ocr)。
+
+小米模型以 BF16 运行。生成表格时，vLLM 重放单请求解码的 CUDA Graph，并从当前请求中已出现的文本提出最多 3 个后续 token，由同一个模型一次验证。重复出现的表格标记也能走这条路径。初始化进度可用 `docker compose -f deploy/documents/compose.yaml logs -f xiaomi-ocr` 查看。
 
 ```powershell
 python -m venv .venv
@@ -66,6 +76,17 @@ npm --prefix frontend-chat run dev
 
 访问 [http://localhost:5173](http://localhost:5173)。后端默认端口为 `8000`；修改时同步调整 [Vite 代理](./frontend-chat/vite.config.ts)。
 
+## 在其他机器上部署 OCR
+
+**后端和解析服务同机，且 Docker 能访问兼容的 NVIDIA GPU 时，先沿用默认配置。** 在新机项目根目录执行上面的 Compose 启动命令并检查模型状态。新机首次启动会下载权重、准备本机 GPU 的编译缓存和 CUDA Graph。默认配置已在 RTX 5070 Laptop（8 GB）上验证，针对逐张识别表格图片的场景做了加速。
+
+| 新机情况 | 操作 |
+| --- | --- |
+| NVIDIA GPU，按单请求解析 | 沿用 `--max-num-seqs 1`、`--gpu-memory-utilization 0.78`、解码 CUDA Graph 和最多 3 个候选 token 的 GPU n-gram 配置。换显卡后的速度以新机实测为准。 |
+| 模型启动时报显存不足 | 用 `docker compose -f deploy/documents/compose.yaml logs xiaomi-ocr` 查看出错阶段。若日志明确提示 KV 缓存容纳不了 8192 个 token，可调低 Compose 中的 `--max-model-len` 并重新启动。图像输入和表格输出共用此长度，调整后用最长的扫描表核对末行。若加载权重时已耗尽显存，先释放其他进程占用的显存或换用显存更大的 GPU。 |
+| 新机只有 CPU、AMD 或 Apple GPU | 当前镜像和加速参数面向 NVIDIA CUDA。可把后端和解析服务一起部署到兼容的 NVIDIA 主机，在新机通过前端访问。要在新机本地推理，需要另行适配推理后端。 |
+| 后端和解析服务分属两台主机 | Compose 将 8088 绑定到回环地址，应用也会校验 `ANY2MARKDOWN_URL` 是否指向本机。跨主机直连需要同时适配服务监听和应用地址校验。 |
+
 ## 使用
 
 1. 注册并登录，在「知识库」中创建项目、上传文档，等待文件显示「已入库」。
@@ -74,7 +95,9 @@ npm --prefix frontend-chat run dev
 
 上传或入库期间，该项目暂不能发送新问题。上传默认每个文件限 50 MiB，每次请求限 32 个文件、共 101 MiB（含表单开销）。网页会自动逐个发送文件。TXT、Markdown 使用 UTF-8，Office 文件需为未加密的新格式。OCR 可能存在识别误差，关键内容请核对原文。
 
-XLSX 在独立子进程中解析。默认每本限 25 万个单元格、400 万个提取字符、1 GiB 解析内存和 180 秒，每个 API 工作进程同时解析一本。公式缓存、重复的首行上下文和图片 OCR 的文字均计入输出限额。超限时可拆分工作簿，或在 `config/vector_db.yaml` 中调整限额。
+PDF 按页选择文字提取或 OCR，带文字层的页面还会检查内嵌图片。Office 文档按原生对象补充转换结果中的嵌图、公式和定位信息。表格按行保存，保留表头上下文、列号及空值。每条原文引用都带有入库时的解析快照标识。点击引用时，系统从当前项目的 PostgreSQL 快照中读取对应文字和上下文，并核对原文件摘要。
+
+XLSX 在独立子进程中校验、转换和恢复单元格位置。默认每本限 25 万个单元格、400 万个提取字符和 180 秒，每个 API 工作进程同时处理一本。1 GiB 内存上限适用于该子进程，Any2Markdown 容器和模型服务独立使用内存与显存。公式缓存、重复的首行上下文和图片 OCR 的文字均计入输出限额。超限时可拆分工作簿，或在 `config/vector_db.yaml` 中调整限额。
 
 上传进度在同一条目中显示，绿色条随实际工作完成向右增长，完成后隐藏。百分比按传输、检查、解析、分块、向量化、写入、校验和收尾八个阶段等权计算，阶段内使用已处理数量，不代表剩余耗时。等待外部服务时进度保持不变。更新此功能后需重启后端，启动时会为上传任务补充进度字段；更新前已经运行的任务没有详细阶段记录。
 
@@ -129,7 +152,6 @@ XLSX 在独立子进程中解析。默认每本限 25 万个单元格、400 万�
 ```powershell
 python -s -m pip check
 python -m compileall -q api_server.py auth.py accounts.py chat_agent.py rag utils
-python -s -m unittest discover -s tests -v
 npm --prefix frontend-chat run build
 ```
 
@@ -137,4 +159,12 @@ npm --prefix frontend-chat run build
 
 ## 许可证
 
-[MIT](./LICENSE)
+本项目自有代码采用 [MIT 许可证](./LICENSE)。
+
+文档解析依赖以下第三方组件。Docker Compose 在部署时构建 Any2Markdown、拉取 vLLM 镜像并下载模型权重，具体版本见[文档解析部署配置](./deploy/documents/compose.yaml)。
+
+| 组件 | 在本项目中的用途 | 仓库内的许可证 | 上游来源 |
+| --- | --- | --- | --- |
+| Any2Markdown | 通过本机 HTTP 服务将文档转换为 Markdown | [AGPL-3.0 全文](./licenses/AGPL-3.0.txt) | [该版本的 LICENSE](https://github.com/SeerRay-Lab/Any2Markdown/blob/54bf7f0a27d87ef43b712b948c97ec23bfa81c59/LICENSE) |
+| Xiaomi-OCR-0 模型权重 | 识别扫描页和内嵌图片 | [Apache-2.0 全文](./licenses/Apache-2.0.txt) · [模型许可声明摘录](./licenses/Xiaomi-OCR-0.md) | [该版本的模型卡](https://huggingface.co/xiaomi-research/Xiaomi-OCR-0/blob/e4d1c4a6804bd9ef342b93d705a73af003e2ef4e/README.md) |
+| vLLM | 在本地 GPU 上运行 Xiaomi-OCR-0 | [Apache-2.0 全文](./licenses/Apache-2.0.txt) | [v0.33.0 的 LICENSE](https://github.com/vllm-project/vllm/blob/v0.33.0/LICENSE) |

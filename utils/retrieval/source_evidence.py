@@ -5,6 +5,7 @@ import json
 import os
 import re
 from bisect import bisect_left, bisect_right
+from collections.abc import Callable
 from urllib.parse import quote, urlencode
 from utils.indexing.progress import UnitProgressCallback
 
@@ -13,7 +14,8 @@ def text_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-SOURCE_FIELDS = ("source_unit", "source_start", "source_end", "page", "locator", "extraction", "source_location")
+SOURCE_FIELDS = ("source_unit", "source_start", "source_end", "page", "locator", "extraction", "source_location",
+                 "source_snapshot")
 
 
 def passage_digest(text: str, location: str, unit: int, start: int, end: int) -> str:
@@ -21,9 +23,23 @@ def passage_digest(text: str, location: str, unit: int, start: int, end: int) ->
     return text_digest(json.dumps([text, location, unit, start, end], ensure_ascii=False))
 
 
+def parsed_unit_snapshot(document, unit: int) -> tuple[str, dict]:
+    """哈希绑定索引时的完整文本单元，因此模型重跑后的细微差别不会改变旧引用。"""
+    data = {"text": document.page_content, "unit": unit,
+            **{name: document.metadata[name] for name in ("locator", "page", "extraction")}}
+    return snapshot_digest(data), data
+
+
+def snapshot_digest(data: dict) -> str:
+    return text_digest(json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":")))
+
+
 def chunk_signature(text: str, metadata: dict) -> str:
-    """清单绑定正文与引用坐标，拒绝缺字段的旧块及已损坏的当前块。"""
+    """清单绑定正文、引用坐标和解析快照。"""
     values = {field: metadata[field] for field in SOURCE_FIELDS}
+    snapshot = values["source_snapshot"]
+    if not isinstance(snapshot, str) or not re.fullmatch(r"[0-9a-f]{64}", snapshot):
+        raise ValueError("无效的原文快照摘要")
     if (not isinstance(text, str) or not text.strip()
             or any(type(values[field]) is not int or values[field] < 0
                    for field in ("source_unit", "source_start", "source_end", "page"))
@@ -66,6 +82,7 @@ def split_located_documents(documents, splitter, *, on_progress: UnitProgressCal
     chunks = []
     for unit, document in enumerate(documents):
         text = document.page_content
+        snapshot, _ = parsed_unit_snapshot(document, unit)
         spans = paragraph_spans(text)
         page_number = document.metadata["page"]
         for chunk in splitter.split_documents([document]):
@@ -77,6 +94,7 @@ def split_located_documents(documents, splitter, *, on_progress: UnitProgressCal
                 raise ValueError("分块与原文字符偏移不一致")
             chunk.metadata.update({
                 "source_unit": unit, "source_start": start, "source_end": end,
+                "source_snapshot": snapshot,
                 "source_location": source_location(text, start, end, page_number, spans=spans,
                     locator=document.metadata["locator"], extraction=document.metadata["extraction"]),
             })
@@ -99,6 +117,7 @@ def make_source_evidence(document, project_id: str) -> dict:
         "start": metadata["source_start"], "end": metadata["source_end"],
         "digest": passage_digest(document.page_content, metadata["source_location"], metadata["source_unit"],
                                  metadata["source_start"], metadata["source_end"]),
+        "snapshot": metadata["source_snapshot"],
     }
     url = f"/api/projects/{project_id}/sources/{quote(source, safe='')}?{urlencode(query)}"
     return {
@@ -112,27 +131,24 @@ class SourceVersionChanged(ValueError):
     pass
 
 
-def read_source_passage(file_path: str, version: str, unit: int, start: int, end: int, digest: str) -> dict:
+def read_source_passage(file_path: str, version: str, unit: int, start: int, end: int, digest: str,
+                        *, snapshot: str, lookup: Callable[[str], dict | None]) -> dict:
     # 延迟导入，坐标和引用协议不依赖文档解析器或外部服务。
-    from utils.documents.knowledge_files import compute_file_sha256, get_document_loader
+    from utils.documents.knowledge_files import compute_file_sha256
 
     if not os.path.isfile(file_path):
         raise FileNotFoundError("原文件不存在或已删除")
     if compute_file_sha256(file_path) != version:
         raise SourceVersionChanged("原文件已更新，无法用当前版本核验这条历史引用。请重新提问。")
-    loader = get_document_loader(file_path)
-    if loader is None:
-        raise ValueError("不支持的原文件类型")
-    documents = loader(file_path)
-    if not 0 <= unit < len(documents):
-        raise ValueError("引用页段不存在")
-    document = documents[unit]
-    text = document.page_content
+    saved = lookup(snapshot)
+    if saved is None or saved.get("unit") != unit or snapshot_digest(saved) != snapshot:
+        raise SourceVersionChanged("此引用对应的解析快照不可用。")
+    text = saved["text"]
+    page_number = saved["page"]
     if not 0 <= start < end <= len(text):
         raise SourceVersionChanged("原文解析结果已变化，无法定位该证据。请重新提问。")
-    page_number = document.metadata["page"]
-    location = source_location(text, start, end, page_number, locator=document.metadata["locator"],
-                               extraction=document.metadata["extraction"])
+    location = source_location(text, start, end, page_number, locator=saved["locator"],
+                               extraction=saved["extraction"])
     if passage_digest(text[start:end], location, unit, start, end) != digest:
         raise SourceVersionChanged("原文解析结果已变化，无法定位该证据。请重新提问。")
     if compute_file_sha256(file_path) != version:
@@ -140,7 +156,7 @@ def read_source_passage(file_path: str, version: str, unit: int, start: int, end
     return {
         "source": os.path.basename(file_path), "version": version,
         "location": location,
-        "extraction": document.metadata["extraction"],
+        "extraction": saved["extraction"],
         "page": page_number or None, "excerpt": text[start:end],
         "before": text[max(0, start - 500):start], "after": text[end:end + 500],
         "clipped_before": start > 500, "clipped_after": end + 500 < len(text),

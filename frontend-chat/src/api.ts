@@ -77,7 +77,9 @@ export interface SourcePassage {
 
 export function isSourceUrl(value: string): boolean {
   // 只允许本站固定原文路由；绝不把凭证发送到回答中的外部链接。
-  return /^\/api\/projects\/[0-9a-f-]{36}\/sources\/[^/?#]+\?[^#]+$/.test(value)
+  if (!/^\/api\/projects\/[0-9a-f-]{36}\/sources\/[^/?#]+\?[^#]+$/.test(value)) return false
+  const snapshots = new URLSearchParams(value.slice(value.indexOf('?') + 1)).getAll('snapshot')
+  return snapshots.length === 1 && /^[0-9a-f]{64}$/.test(snapshots[0] ?? '')
 }
 
 export async function apiSourcePassage(url: string, signal: AbortSignal): Promise<SourcePassage> {
