@@ -13,12 +13,15 @@ SEARCH_CONTENT_LIMIT = agent_config["search_content_limit"]
 SEARCH_MAX_CALLS = 3
 
 
-def _text(value: object) -> str:
-    return value.strip() if isinstance(value, str) else ""
+def _optional_text(value: object) -> str | None:
+    """缺失或 null 表示空白，其他非文本值表示响应格式错误。"""
+    if value is None:
+        return ""
+    return value.strip() if isinstance(value, str) else None
 
 
 def _source_url(value: object) -> str:
-    url = _text(value)
+    url = _optional_text(value)
     if not url or any(char.isspace() for char in url):
         return ""
     try:
@@ -42,28 +45,24 @@ def format_search_response(response: object) -> str:
     if not isinstance(raw_results, list):
         return SEARCH_ERROR_MARKER
 
-    answer = response.get("answer")
-    if answer is not None and not isinstance(answer, str):
+    summary = _optional_text(response.get("answer"))
+    if summary is None:
         return SEARCH_ERROR_MARKER
-    summary = _text(answer)
     results = []
-    for item in raw_results:
+    for item in raw_results[:SEARCH_RESULT_LIMIT]:
         if not isinstance(item, dict):
             return SEARCH_ERROR_MARKER
         url = _source_url(item.get("url"))
-        if not url:
+        title = _optional_text(item.get("title"))
+        content = _optional_text(item.get("content"))
+        if not url or title is None or content is None:
             return SEARCH_ERROR_MARKER
-        if any(item.get(key) is not None and not isinstance(item[key], str) for key in ("title", "content")):
-            return SEARCH_ERROR_MARKER
-        content = _text(item.get("content"))
         results.append({
-            "title": _text(item.get("title"))[:300] or url,
+            "title": title[:300] or url,
             "url": url,
             "content": content[:SEARCH_CONTENT_LIMIT],
             "content_truncated": len(content) > SEARCH_CONTENT_LIMIT,
         })
-        if len(results) >= SEARCH_RESULT_LIMIT:
-            break
 
     if not summary and not results:
         return SEARCH_EMPTY_MARKER

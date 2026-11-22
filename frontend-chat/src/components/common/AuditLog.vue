@@ -8,7 +8,7 @@ const next = ref<number | null>(null)
 const loading = ref(false)
 const error = ref('')
 const actions: Record<string, string> = {
-  'auth.login': '登录', 'account.register': '注册账号', 'account.update': '修改账号资料',
+  'auth.login': '登录', 'auth.logout': '退出登录', 'account.register': '注册账号', 'account.update': '修改账号资料',
   'account.verify_deletion': '验证注销身份', 'account.delete': '注销账号',
   'project.create': '创建项目', 'project.rename': '重命名项目', 'project.delete': '删除项目',
   'source.read': '查看原文', 'file.upload': '上传文件', 'file.upload.start': '开始入库',

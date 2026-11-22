@@ -58,7 +58,7 @@ def document_ocr_progress(source: str):
     state = "未完成"
     logger.info("[文档解析] 开始 file=%s", progress.source)
     try:
-        yield
+        yield progress
         state = "完成"
     finally:
         _progress.reset(token)
@@ -67,6 +67,16 @@ def document_ocr_progress(source: str):
                     progress.count - progress.skipped - progress.reused,
                     progress.empty, progress.skipped, progress.reused,
                     time.monotonic() - progress.started)
+
+
+def include_ocr_counts(count: int, empty: int, skipped: int, reused: int) -> None:
+    """将工作簿子进程的统计归入当前文档的解析日志。"""
+    progress = _progress.get()
+    if progress is not None:
+        progress.count += count
+        progress.empty += empty
+        progress.skipped += skipped
+        progress.reused += reused
 
 
 def _record_ocr(empty: bool, locator: str, *, skipped=False, reused=False) -> None:

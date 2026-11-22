@@ -2,7 +2,6 @@ import type { TraceSpan } from './generation'
 
 export interface TraceTimelineRow {
   span: TraceSpan
-  depth: number
   stepNumber: string
   startMs: number
   endMs: number
@@ -14,7 +13,6 @@ export interface TraceTimelineRow {
 
 export interface TraceTimeline {
   total: TraceSpan | null
-  durationMs: number
   startsWithGeneration: boolean
   roots: TraceTimelineRow[]
   rows: TraceTimelineRow[]
@@ -32,20 +30,18 @@ export function buildTraceTimeline(spans: TraceSpan[]): TraceTimeline {
     throw new Error('生成总耗时的记录关系无效')
   }
   const total = totals[0] ?? null
-  if (!spans.length) return { total, durationMs: 0, startsWithGeneration: false, roots: [], rows: [] }
-  const origin = Math.min(...spans.map(span => span.started_at_ms))
+  if (!spans.length) return { total, startsWithGeneration: false, roots: [], rows: [] }
   const ordered = [...spans].sort((a, b) => a.started_at_ms - b.started_at_ms || a.span_id.localeCompare(b.span_id))
+  const origin = ordered[0].started_at_ms
   const children = new Map<string | null, TraceTimelineRow[]>()
   const roots: TraceTimelineRow[] = []
-  let durationMs = 0
   for (const span of ordered) {
+    if (span === total) continue
     // 以存储时间的微秒精度计算边界，避免浮点时间相减使相接的步骤出现虚假重叠。
     const startUs = Math.round((span.started_at_ms - origin) * 1000)
     const endUs = startUs + Math.round(span.duration_ms * 1000)
-    durationMs = Math.max(durationMs, endUs / 1000)
-    if (span === total) continue
     const missingParent = span.parent_span_id !== null && !byId.has(span.parent_span_id)
-    const row: TraceTimelineRow = { span, depth: 0, stepNumber: '', startMs: startUs / 1000, endMs: endUs / 1000,
+    const row: TraceTimelineRow = { span, stepNumber: '', startMs: startUs / 1000, endMs: endUs / 1000,
       hasChildren: false, children: [], missingParent, parallelWith: [] }
     const siblings = children.get(span.parent_span_id)
     if (siblings) siblings.push(row)
@@ -66,17 +62,16 @@ export function buildTraceTimeline(spans: TraceSpan[]): TraceTimeline {
     }
   }
   const rows: TraceTimelineRow[] = []
-  function append(row: TraceTimelineRow, depth: number, stepNumber: string) {
+  function append(row: TraceTimelineRow, stepNumber: string) {
     const nested = children.get(row.span.span_id) ?? []
-    row.depth = depth
     row.stepNumber = stepNumber
     row.children = nested
     row.hasChildren = nested.length > 0
     rows.push(row)
-    nested.forEach((child, index) => append(child, depth + 1, `${stepNumber}.${index + 1}`))
+    nested.forEach((child, index) => append(child, `${stepNumber}.${index + 1}`))
   }
-  roots.forEach((row, index) => append(row, 0, String(index + 1)))
+  roots.forEach((row, index) => append(row, String(index + 1)))
   // 有环的节点无法从根访问，不能静默隐藏这些记录。
   if (rows.length !== spans.length - totals.length) throw new Error('执行步骤的父子关系存在循环')
-  return { total, durationMs, startsWithGeneration: total !== null && total.started_at_ms === origin, roots, rows }
+  return { total, startsWithGeneration: total !== null && total.started_at_ms === origin, roots, rows }
 }

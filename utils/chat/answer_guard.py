@@ -24,7 +24,7 @@ from utils.retrieval.retrieval_protocol import (
     parse_retrieval_report,
 )
 from utils.core.logging_config import get_logger
-from utils.retrieval.citations import cited_evidence_ids, render_citations
+from utils.retrieval.citations import CITATION_RE, render_citations
 from utils.chat.outcome import ANSWER_REJECTED_ERROR, AnswerOutcome
 from utils.observability.tracing import span
 
@@ -50,15 +50,13 @@ class AnswerGuard:
     """仅知识库模式的单回合输出判定器。
 
     调用方（guarded_stream）负责从流中取出消息并区分工具消息与文本消息；
-    本类维护单回合状态：拿到 status=ok 报告后允许增量放行，finish() 返回最终
-    校验动作（生成原文查看链接后整段替换 / 无输出）。
+    本类维护单回合状态：收齐任务报告且有证据后允许增量放行，finish() 返回最终正文。
     """
 
     def __init__(self) -> None:
         self.outcome = AnswerOutcome(result_kind="answer_rejected", error_code="missing_answer")
-        self.terminated = False
         self._buffer: list[str] = []
-        self._reports: list[dict] = []
+        self._reports: dict[str, dict] = {}
         self._clarification: str | None = None
         self._task_seen = False
         self._task_call_ids: set[str] = set()
@@ -72,35 +70,21 @@ class AnswerGuard:
         """记录模型发起的工具调用，用于把工具结果关联到具体调用。"""
         if tool_name == "task":
             self._task_seen = True
-            if tool_call_id:
-                if tool_call_id not in self._task_call_ids:
-                    # 检索前的计划或推测不属于最终答案。
-                    self._buffer.clear()
-                    self._releasing = False
+            if tool_call_id and tool_call_id not in self._task_call_ids:
+                # 检索前的计划或推测不属于最终答案。
+                self._buffer.clear()
+                self._releasing = False
                 self._task_call_ids.add(tool_call_id)
         elif tool_name == "ask_kb_clarification" and tool_call_id:
             self._clarification_call_ids.add(tool_call_id)
 
-    def begin_release(self) -> None:
-        """全部已派任务返回后放行，丢弃检索完成前的计划和推测。"""
-        if self.terminated or self._releasing:
-            return None
-        self._releasing = True
-        self._buffer.clear()
-
     def feed_tool(
         self,
         text: str,
-        tool_name: str | None = None,
-        tool_call_id: str | None = None,
-    ) -> str | None:
-        """处理一条工具消息：只接受结构化报告/澄清请求，不解析失败短句。
-
-        返回 None（无状态变化）、"generating"（可进入生成阶段）或
-        "release"（拿到 status=ok 报告，可开始增量放行）。
-        """
-        if self.terminated:
-            return
+        tool_name: str | None,
+        tool_call_id: str,
+    ) -> bool:
+        """记录有效的任务或澄清结果，返回本条消息是否进入生成阶段。"""
         if tool_name:
             self._seen_tools.append(tool_name)
         if tool_name == "task":
@@ -109,25 +93,26 @@ class AnswerGuard:
         report = parse_retrieval_report(text)
         if report is not None:
             if (
-                not tool_call_id
-                or tool_call_id not in self._task_call_ids
+                tool_call_id not in self._task_call_ids
                 or tool_name not in (None, "task")
             ):
                 logger.warning("[输出校验] 结构化检索报告未匹配到对应的 task 调用，已忽略该结果")
-                return None
-            if any(r["task_call_id"] == tool_call_id for r in self._reports):
-                return None
-            report["task_call_id"] = tool_call_id
-            self._reports.append(report)
+                return False
+            if tool_call_id in self._reports:
+                return False
+            self._reports[tool_call_id] = report
             sources = "、".join(report["sources"][:5]) or "-"
             logger.info(
                 f"[输出校验] 结构化检索报告 status={report['status']} "
-                f"reason={report.get('reason') or '-'} sources={sources} "
-                f"task_call={tool_call_id or '-'}"
+                f"reason={report['reason'] or '-'} sources={sources} "
+                f"task_call={tool_call_id}"
             )
-            complete = {r["task_call_id"] for r in self._reports} == self._task_call_ids
-            has_evidence = any(r["status"] == STATUS_OK for r in self._reports)
-            return "release" if complete and has_evidence and not self._clarification_call_ids else "generating"
+            complete = self._reports.keys() == self._task_call_ids
+            has_evidence = any(r["status"] == STATUS_OK for r in self._reports.values())
+            if complete and has_evidence and not self._clarification_call_ids:
+                self._buffer.clear()
+                self._releasing = True
+            return True
 
         if looks_like_report(text):
             logger.error("[输出校验] 结构化检索报告解析失败，当前回合按无有效证据处理")
@@ -135,62 +120,54 @@ class AnswerGuard:
         question = parse_clarification_content(text)
         if question is not None:
             if (
-                not tool_call_id
-                or tool_call_id not in self._clarification_call_ids
+                tool_call_id not in self._clarification_call_ids
                 or tool_name not in (None, "ask_kb_clarification")
             ):
                 logger.warning("[输出校验] 澄清结果未匹配到对应工具调用，已忽略该结果")
-                return None
+                return False
             self._clarification = question
-            return "generating"
-        return None
+            return True
+        return False
 
     def feed_text(self, text: str) -> str | None:
         """缓冲模型文本；已进入增量放行时返回应立刻下发的增量。"""
-        if self.terminated or not text:
+        if not text:
             return None
         self._buffer.append(text)
         return text if self._releasing else None
 
-    def finish(self) -> tuple[str, str]:
-        """流耗尽后执行最终校验，必要时覆盖此前增量放行的内容。
-
-        返回 (action, text)：
-        - ("replace", text)：整段替换为 text（固定文案或完整回答）；
-        - ("none", "")：无可输出。
-        """
-        if self.terminated:
-            return ("none", "")
-
+    def finish(self) -> str:
+        """流耗尽时返回最终正文，空字符串表示没有可输出的文本。"""
         if self._clarification_call_ids and self._task_seen:
             return self._terminate("unverified", "澄清回合不应同时执行检索")
-        if self._task_call_ids != {r["task_call_id"] for r in self._reports}:
+        if self._task_call_ids != self._reports.keys():
             return self._terminate("unverified", "部分检索任务缺少有效报告")
 
-        ok_reports = [report for report in self._reports if report["status"] == STATUS_OK]
+        reports = self._reports.values()
+        ok_reports = [report for report in reports if report["status"] == STATUS_OK]
         if ok_reports:
             return self._finish_with_evidence(ok_reports)
 
-        if any(report["status"] == STATUS_ERROR for report in self._reports):
+        if any(report["status"] == STATUS_ERROR for report in reports):
             return self._terminate("kb_down", "结构化报告为知识库检索服务故障")
-        if any(report["status"] == STATUS_EMPTY for report in self._reports):
+        if any(report["status"] == STATUS_EMPTY for report in reports):
             return self._terminate("kb_miss", "结构化报告为知识库无资料")
         if self._reports:
-            statuses = "、".join(sorted({report["status"] for report in self._reports}))
+            statuses = "、".join(sorted({report["status"] for report in reports}))
             return self._terminate("unverified", f"结构化报告状态不可用（{statuses}）")
 
-        if self._clarification is not None and not self._task_seen:
+        if self._clarification is not None:
             self._buffer.clear()
             self.outcome = AnswerOutcome(result_kind="clarification")
-            return ("replace", self._clarification)
+            return self._clarification
 
         if self._buffer_text().strip():
             tools = f"（已见工具：{'、'.join(self._seen_tools)}）" if self._seen_tools else ""
             return self._terminate("unverified", f"无检索证据或有效澄清请求{tools}")
-        return ("none", "")
+        return ""
 
 
-    def _finish_with_evidence(self, ok_reports: list[dict]) -> tuple[str, str]:
+    def _finish_with_evidence(self, ok_reports: list[dict]) -> str:
         text = self._buffer_text()
         if not text.strip():
             return self._terminate("unverified", "检索成功但本轮没有可校验的回答文本")
@@ -199,34 +176,32 @@ class AnswerGuard:
 
         evidence = []
         for report in ok_reports:
-            # 主助手只能保留子代理结论已使用的证据，不能把未采用的召回块当作出处。
-            used = cited_evidence_ids(report["answer"], report["evidence"])
+            # 报告已通过 parse_retrieval_report 校验，主助手只能沿用其结论引用的片段。
+            used = set(CITATION_RE.findall(report["answer"]))
             evidence.extend(item for item in report["evidence"] if item["citation_id"] in used)
         try:
-            result = render_citations(text, evidence)
+            result, used_ids = render_citations(text, evidence)
         except ValueError as exc:
             return self._terminate("unverified", str(exc))
         with span("answer.citations") as citations:
-            used_ids = cited_evidence_ids(text, evidence)
             citations.attributes["citation_ids"] = sorted(used_ids)
         self._buffer.clear()
         self.outcome = AnswerOutcome(result_kind="answered")
-        return ("replace", result)
+        return result
 
     def _buffer_text(self) -> str:
         return "".join(self._buffer)
 
-    def _terminate(self, winner: str, reason: str) -> tuple[str, str]:
+    def _terminate(self, winner: str, reason: str) -> str:
         self.outcome = {
             "kb_down": AnswerOutcome(result_kind="dependency_failed", error_code="retrieval_unavailable"),
             "kb_miss": AnswerOutcome(result_kind="no_evidence"),
             "unverified": AnswerOutcome(result_kind="answer_rejected", error_code="answer_validation_failed"),
         }[winner]
-        dropped = len(self._buffer_text())
+        dropped = sum(map(len, self._buffer))
         self._buffer.clear()
-        self.terminated = True
         logger.warning(f"[输出校验] {reason}，已拦截模型生成的 {dropped} 个字符并返回固定文案")
-        return ("replace", _COPY_BY_WINNER[winner])
+        return _COPY_BY_WINNER[winner]
 
 
 
@@ -263,6 +238,10 @@ def _general_stream(raw_stream, phase_event: Callable[[str], dict[str, str] | No
                 next_phase = "searching" if name == "tavily_search" else "working"
 
         if isinstance(chunk, ToolMessage):
+            if has_text:
+                # 工具调用前的说明只是进度；最终答案从工具返回后重新计数。
+                yield {"type": "replace", "content": ""}
+                has_text = False
             event = phase_event("generating")
             if event:
                 yield event
@@ -336,18 +315,10 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None, *,
                     next_phase = "retrieving"
 
             if isinstance(chunk, ToolMessage):
-                hint = guard.feed_tool(
-                    chunk.text,
-                    chunk.name,
-                    chunk.tool_call_id,
-                )
-                if hint:
-                    next_phase = "generating"
-                    event = phase_event(next_phase)
+                if guard.feed_tool(chunk.text, chunk.name, chunk.tool_call_id):
+                    event = phase_event("generating")
                     if event:
                         yield event
-                    if hint == "release":
-                        guard.begin_release()
                 continue
 
             delta = guard.feed_text(chunk.text)
@@ -362,11 +333,11 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None, *,
         if should_stop is not None and should_stop():
             return
         with span("answer.validate") as validation:
-            action, text = guard.finish()
+            text = guard.finish()
             validation.attributes["result_kind"] = guard.outcome.result_kind
             if guard.outcome.error_code is not None:
                 validation.fail(guard.outcome.error_code)
-        if action == "replace" and text:
+        if text:
             emitted_text = "".join(emitted)
             if not emitted_text:
                 yield text

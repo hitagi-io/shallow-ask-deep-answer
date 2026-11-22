@@ -29,7 +29,7 @@ def _locked_user(cur, user_id: int, version: int):
     return user
 
 
-def update_account(user_id: int, version: int, *, username: str | None = None,
+def update_account(user_id: int, version: int, *, session_id: str, expires_at: int, username: str | None = None,
                    current_password: str | None = None, new_password: str | None = None) -> dict:
     _check_rate(user_id)
     if username is None and new_password is None:
@@ -42,33 +42,33 @@ def update_account(user_id: int, version: int, *, username: str | None = None,
         error = auth._validate_password(new_password)
         if error:
             raise AccountError(error)
-    try:
-        with auth._connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                auth.account_write_access(cur, user_id)
-                user = _locked_user(cur, user_id, version)
-                if new_password is not None:
-                    if not auth._verify_password(current_password or "", user["password"]):
-                        raise AccountError("当前密码不正确")
-                    if current_password == new_password:
-                        raise AccountError("新密码不能与当前密码相同")
-                    cur.execute("UPDATE users SET password = %s, auth_version = auth_version + 1 WHERE id = %s",
-                                (auth._hash_password(new_password), user_id))
-                    user["auth_version"] += 1
-                if username is not None:
+    with auth._connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            auth.account_write_access(cur, user_id)
+            user = _locked_user(cur, user_id, version)
+            if current_password is None or not auth._verify_password(current_password, user["password"]):
+                raise AccountError("当前密码不正确")
+            if new_password is not None:
+                if current_password == new_password:
+                    raise AccountError("新密码不能与当前密码相同")
+                cur.execute("UPDATE users SET password = %s, auth_version = auth_version + 1 WHERE id = %s",
+                            (auth._hash_password(new_password), user_id))
+            if username is not None:
+                try:
                     cur.execute("UPDATE users SET username = %s WHERE id = %s", (username, user_id))
-                    user["username"] = username
-                append_audit(cur, user_id=user_id, action="account.update", resource_type="account",
-                             resource_id=str(user_id), result="succeeded",
-                             details={"fields": (["username"] if username is not None else []) +
-                                      (["password"] if new_password is not None else [])})
-            conn.commit()
-    except UniqueViolation as exc:
-        raise AccountError("用户名已存在，请换一个名字", 409) from exc
+                except UniqueViolation as exc:
+                    raise AccountError("用户名已存在，请换一个名字", 409) from exc
+                user["username"] = username
+            append_audit(cur, user_id=user_id, action="account.update", resource_type="account",
+                         resource_id=str(user_id), result="succeeded",
+                         details={"fields": (["username"] if username is not None else []) +
+                                  (["password"] if new_password is not None else [])})
+        conn.commit()
     if new_password is not None:
         return {"user": {"id": user_id, "username": user["username"]}, "reauthenticate": True}
     return {"user": {"id": user_id, "username": user["username"]},
-            "token": auth._create_token(user_id, user["username"], user["auth_version"])}
+            "token": auth._create_token(user_id, user["username"], user["auth_version"],
+                                        session_id=session_id, expires_at=expires_at)}
 
 
 def prepare_deletion(user_id: int, version: int, password: str) -> dict:

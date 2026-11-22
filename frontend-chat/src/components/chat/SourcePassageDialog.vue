@@ -16,14 +16,11 @@ async function load() {
   controller = null
   passage.value = null
   error.value = ''
-  loading.value = false
+  loading.value = !props.projectDeleted
   if (props.projectDeleted) return
   const request = new AbortController()
   controller = request
   const timeout = window.setTimeout(() => request.abort(), 30000)
-  passage.value = null
-  error.value = ''
-  loading.value = true
   try {
     const result = await apiSourcePassage(props.urls[selected.value], request.signal)
     if (controller === request) passage.value = result

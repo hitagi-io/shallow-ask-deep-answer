@@ -23,6 +23,7 @@ from utils.retrieval.source_evidence import SOURCE_FIELDS, chunk_signature, spli
 from utils.core.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
 from utils.core.logging_config import get_logger
 from utils.indexing.progress import IndexProgress, IndexStage, ProgressCallback
+from utils.indexing.upload_quota import moving_upload_files, reserve_embedding_chars, UploadQuotaExceeded
 from utils.indexing.recovery import UploadJournal, PublicationUncertain, UploadRecoveryResult
 from utils.observability.tracing import span, traced
 from utils.runtime.shutdown import ServiceStopping, check_shutdown, interruptible_lock
@@ -70,6 +71,9 @@ class VectorStore:
         collection_name = project_collection_name(vector_db_config, self.user_id, self.project_id)
         self.manifests = ManifestStore({**vector_db_config, "collection_name": collection_name})
         self.index_version = current_index_version(vector_db_config)
+        self.daily_embedding_chars = int(os.getenv("ACCOUNT_DAILY_EMBEDDING_CHARS", "10000000"))
+        if self.daily_embedding_chars < 1:
+            raise ValueError("每日入库文本额度必须为正整数")
         self.embeddings = DashScopeEmbeddings(vector_db_config)
         self.vector_store = Milvus(
             collection_name=collection_name,
@@ -104,7 +108,7 @@ class VectorStore:
         with self._store_lock:
             vs = self.vector_store
             # 另一个 worker 可能刚为之前的空项目创建集合，补齐客户端字段与检索配置。
-            if vs.client.has_collection(collection_name=vs.collection_name) and not vs.fields:
+            if not vs.fields and vs.client.has_collection(collection_name=vs.collection_name):
                 vs._init()
 
     def drop_project_index(self) -> None:
@@ -232,6 +236,12 @@ class VectorStore:
                 return {**result, "error": "文件分割后为空"}
             if compute_file_sha256(file_path) != sha256:
                 return {**result, "error": "解析期间文件发生变化，请重试"}
+            texts = [doc.page_content for doc in documents]
+            try:
+                reserve_embedding_chars(self.manifests.conninfo, self.user_id,
+                                        sum(map(len, texts)), self.daily_embedding_chars)
+            except UploadQuotaExceeded as exc:
+                return {**result, "error": str(exc)}
             hashes = tuple(chunk_signature(doc.page_content, doc.metadata) for doc in documents)
             manifest = IndexManifest(sha256, file_path, identity[1], self.index_version,
                                      uuid.uuid4().hex, len(documents), hashes, "building")
@@ -239,7 +249,6 @@ class VectorStore:
                 journal.advance("indexing", index_id=manifest.index_id)
             if old is None or old.state != "ready":
                 self.manifests.put(manifest)
-            texts = [doc.page_content for doc in documents]
             try:
                 # 每批请求由嵌入适配器有限重试。
                 embeddings = self.embeddings.embed_documents(texts, on_progress=partial(report, "embedding"))
@@ -393,9 +402,10 @@ class VectorStore:
             record = journal.prepare(self.knowledge_dir, file_path, tmp_path)
             try:
                 journal.advance("replacing")
-                if record.backup_path is not None:
-                    os.replace(file_path, record.backup_path)
-                os.replace(tmp_path, file_path)
+                with moving_upload_files(journal.conninfo, self.user_id):
+                    if record.backup_path is not None:
+                        os.replace(file_path, record.backup_path)
+                    os.replace(tmp_path, file_path)
                 journal.advance("indexing")
                 result = self.index_file(file_path, on_progress=on_progress, journal=journal)
             except PublicationUncertain:
@@ -476,14 +486,16 @@ class VectorStore:
                 if os.path.exists(record.backup_path):
                     if compute_file_sha256(record.backup_path) != record.old_hash:
                         raise RuntimeError("备份文件内容不匹配，停止恢复")
-                    os.replace(record.backup_path, record.destination)
+                    with moving_upload_files(journal.conninfo, self.user_id):
+                        os.replace(record.backup_path, record.destination)
                 elif current_hash != record.old_hash:
                     raise RuntimeError("原文件备份缺失，无法恢复")
             else:
                 if current_hash is None and os.path.isfile(record.staged_path):
                     if compute_file_sha256(record.staged_path) != record.new_hash:
                         raise RuntimeError("暂存文件内容不匹配，停止恢复")
-                    os.replace(record.staged_path, record.destination)
+                    with moving_upload_files(journal.conninfo, self.user_id):
+                        os.replace(record.staged_path, record.destination)
                     current_hash = record.new_hash
                 if current_hash == record.new_hash:
                     # 首次上传失败仍保留源文件，供现有“修复与补建”使用。

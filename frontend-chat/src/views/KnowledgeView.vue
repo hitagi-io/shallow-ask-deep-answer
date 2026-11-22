@@ -11,10 +11,10 @@ import { knowledgeFileAccept, knowledgeFileTypes } from '../utils/knowledgeForma
 import { fileSortLabels, type FileSort } from '../utils/knowledgeFiles'
 const props = defineProps<{ knowledge: ReturnType<typeof useKnowledge>; projects: ReturnType<typeof useProjects> }>()
 const emit = defineEmits<{ back: []; ask: [id: string]; deleted: [id: string] }>()
-const { files, knowledgeLoading, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput, deletingName, health, healthChecking, healthRepairing, knowledgeBusy, loadKnowledgeState, onFileSelect, onDrop, handleDeleteFile, handleHealthCheck, handleHealthRepair, formatHealthTime } = props.knowledge
-const { fileTotal, indexedTotal, matchedFiles, filePage, filePageCount, filesLoading, goToFilePage, search, statusFilter, fileSort, uploadProgress, loadError, selectFiles, clearNotice } = props.knowledge
+const { files, knowledgeLoading, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput, deletingName, health, healthChecking, healthRepairing, knowledgeBusy, loadKnowledgeState, onFileSelect, onDrop, handleDeleteFile, handleHealthCheck, handleHealthRepair } = props.knowledge
+const { fileSummary, matchedFiles, filePage, filePageCount, filesLoading, goToFilePage, search, statusFilter, fileSort, uploadProgress, loadError, selectFiles, clearNotice } = props.knowledge
 const { healthNotice, documentStatus, indexStatus } = props.knowledge
-const { indexing, taskLoadError } = props.knowledge
+const { indexing, recoveryRequired, taskLoadError } = props.knowledge
 const { projects: projectList, selectedId, selected, loading, saving, error, load, save, remove } = props.projects
 const projectSearch = ref('')
 const filteredProjects = computed(() => projectList.value.filter(project => project.name.toLocaleLowerCase().includes(projectSearch.value.trim().toLocaleLowerCase())))
@@ -65,11 +65,12 @@ async function changeFilePage(page: number) {
     documentsSection.value?.scrollIntoView({ block: 'start' })
   }
 }
-const canAsk = computed(() => !busy.value && !indexing.value && !loadError.value && !taskLoadError.value && indexedTotal.value > 0)
+const canAsk = computed(() => !busy.value && !indexing.value && !recoveryRequired.value && !loadError.value && !taskLoadError.value && !!fileSummary.value?.indexed)
 const askTitle = computed(() => canAsk.value ? '开始问答'
+  : recoveryRequired.value ? '请先在索引维护中执行“修复与补建”'
   : indexing.value ? '入库中，完成后可提问'
   : busy.value ? '正在处理，请稍候'
-  : loadError.value || taskLoadError.value ? '资料状态读取失败，请刷新'
+  : loadError.value || taskLoadError.value || !fileSummary.value ? '资料状态未知，请刷新'
   : '请先完成文档入库')
 function openDialog(type: 'create' | 'rename') {
   error.value = ''
@@ -125,8 +126,8 @@ async function removeProject() {
         </header>
         <AppNotice v-if="knowledgeMsg" class="knowledge-notice" :tone="knowledgeMsgType === 'error' ? 'error' : 'success'" dismissible @dismiss="clearNotice">{{ knowledgeMsg }}</AppNotice>
         <div class="project-stats" aria-label="项目概览" :aria-busy="knowledgeLoading">
-          <div><span><AppIcon name="file" :size="15" />项目文档</span><strong>{{ fileTotal.toString().padStart(2, '0') }}<small>份</small></strong></div>
-          <div><span><AppIcon name="book" :size="15" />已入库</span><strong>{{ indexedTotal.toString().padStart(2, '0') }}<small>份</small></strong></div>
+          <div><span><AppIcon name="file" :size="15" />项目文档</span><strong>{{ fileSummary?.total.toString().padStart(2, '0') ?? '—' }}<small>份</small></strong></div>
+          <div><span><AppIcon name="book" :size="15" />已入库</span><strong>{{ fileSummary?.indexed.toString().padStart(2, '0') ?? '—' }}<small>份</small></strong></div>
           <div><span><AppIcon name="success" :size="15" />资料状态</span><strong class="status-value" :class="documentStatus.tone"><span class="status-dot"></span>{{ documentStatus.label }}</strong></div>
         </div>
         <p v-if="healthNotice" class="health-notice" role="status">{{ healthNotice }}</p>
@@ -154,7 +155,7 @@ async function removeProject() {
         <details class="health-section">
           <summary><AppIcon class="health-chevron" name="chevron-right" :size="16" /><span>索引维护</span><span class="health-indicator" :class="indexStatus.tone"><span class="status-dot"></span>{{ indexStatus.label }}</span></summary>
           <div class="health-content">
-            <div class="section-heading"><p class="hint">最近检查：{{ formatHealthTime(health?.checked_at || null) }}<br />{{ health?.stats.chunks || 0 }} 个资料片段</p><div class="section-actions">
+            <div class="section-heading"><p class="hint">最近检查：{{ health?.checked_at ? new Date(health.checked_at).toLocaleString() : '暂无记录' }}<template v-if="health && !health.milvus_error && !health.manifest_error"><br />{{ health.stats.chunks }} 个资料片段</template></p><div class="section-actions">
               <button class="btn btn-secondary btn-small" :disabled="busy || indexing" @click="handleHealthCheck">{{ healthChecking ? '检查中…' : '检查索引' }}</button>
               <button class="btn btn-secondary btn-small" :disabled="busy || indexing" @click="handleHealthRepair">{{ healthRepairing ? '处理中…' : '修复与补建' }}</button>
             </div></div>
@@ -163,7 +164,7 @@ async function removeProject() {
         </details>
 
         <section ref="documentsSection" class="documents-section" aria-labelledby="documents-title" :aria-busy="filesLoading">
-          <div class="section-heading"><h3 id="documents-title">项目资料 <span>{{ fileTotal }}</span></h3><div class="section-actions">
+          <div class="section-heading"><h3 id="documents-title">项目资料 <span v-if="fileSummary">{{ fileSummary.total }}</span></h3><div class="section-actions">
             <button class="btn btn-secondary btn-small" :disabled="busy" @click="loadKnowledgeState">{{ knowledgeLoading ? '刷新中…' : '刷新' }}</button>
           </div></div>
           <div class="file-filters">
@@ -178,12 +179,12 @@ async function removeProject() {
           </div>
           <div v-if="loadError" class="document-empty" role="alert">{{ loadError }} <button class="text-action" :disabled="busy" @click="loadKnowledgeState">重新加载</button></div>
           <div v-else-if="filesLoading && !files.length" class="document-empty" role="status"><span class="loading-spinner" aria-hidden="true"></span>正在加载资料…</div>
-          <div v-else-if="!files.length" class="document-empty"><span class="empty-file-icon"><AppIcon name="file" :size="24" /></span><strong>{{ fileTotal ? '没有匹配的文档' : '这里将存放你的项目资料' }}</strong><p>{{ fileTotal ? '试试其他关键词，或调整入库状态筛选。' : '上传第一份文档，让知识问答从这里开始。' }}</p></div>
+          <div v-else-if="fileSummary && !files.length" class="document-empty"><span class="empty-file-icon"><AppIcon name="file" :size="24" /></span><strong>{{ fileSummary.total ? '没有匹配的文档' : '这里将存放你的项目资料' }}</strong><p>{{ fileSummary.total ? '试试其他关键词，或调整入库状态筛选。' : '上传第一份文档，让知识问答从这里开始。' }}</p></div>
           <ul v-else class="file-list">
             <li v-for="file in files" :key="file.name">
               <span class="file-icon"><AppIcon name="file" :size="20" /></span><div class="file-info"><span class="file-name">{{ file.name }}</span><small>{{ file.name.split('.').pop()?.toUpperCase() }} 文档</small></div>
               <span class="file-status" :class="file.indexed ? 'indexed' : 'pending'">{{ file.indexed ? '已入库' : '待入库' }}</span>
-              <button class="btn btn-danger btn-small" :disabled="busy || indexing" :aria-label="`删除文档：${file.name}`" @click="handleDeleteFile(file.name)">{{ deletingName === file.name ? '删除中…' : '删除' }}</button>
+              <button class="btn btn-danger btn-small" :disabled="busy || indexing || recoveryRequired" :aria-label="`删除文档：${file.name}`" @click="handleDeleteFile(file.name)">{{ deletingName === file.name ? '删除中…' : '删除' }}</button>
             </li>
           </ul>
           <div v-if="matchedFiles" class="document-pagination">

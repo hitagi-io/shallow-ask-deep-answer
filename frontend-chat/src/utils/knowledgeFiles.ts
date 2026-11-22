@@ -12,7 +12,6 @@ export const fileSortLabels: Record<FileSort, string> = {
 }
 export interface FileItem {
   name: string
-  path: string
   /** 只有当前有效且已发布的入库记录才为 true；完整性另见检查报告。 */
   indexed: boolean
 }
@@ -40,9 +39,9 @@ export function parseFilePage(value: unknown): FilePage {
   }
   const summary = parseFileSummary(value.summary)
   const files = value.files.map((file: unknown): FileItem => {
-    if (!isRecord(file) || typeof file.name !== 'string' || !file.name || typeof file.path !== 'string'
-        || !file.path || typeof file.indexed !== 'boolean') throw new Error('项目资料数据格式无效')
-    return { name: file.name, path: file.path, indexed: file.indexed }
+    if (!isRecord(file) || typeof file.name !== 'string' || !file.name
+        || typeof file.indexed !== 'boolean') throw new Error('项目资料数据格式无效')
+    return { name: file.name, indexed: file.indexed }
   })
   const totalPages = Math.ceil(value.matched_total / value.page_size)
   const expectedFiles = Math.min(value.page_size, value.matched_total - (value.page - 1) * value.page_size)

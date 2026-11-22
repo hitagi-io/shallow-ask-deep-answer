@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
-import type { UserInfo } from '../api'
+import { apiLogout, type UserInfo } from '../api'
 import type { AppMode } from '../types'
 import { useChat } from '../composables/useChat'
 import { useKnowledge } from '../composables/useKnowledge'
@@ -31,6 +31,8 @@ const sidebarCollapsed = ref(false)
 const sidebarToggle = ref<HTMLButtonElement | null>(null)
 const confirmation = useConfirmation()
 const { message: confirmationMessage } = confirmation
+const loggingOut = ref(false)
+const logoutError = ref('')
 const projects = useProjects(confirmation.ask,
   navigation?.type === 'reload' && mode.value === 'knowledge' ? sessionStorage.getItem(PROJECT_KEY) : null)
 // 项目列表加载成功后再恢复选择，已删除或无权访问的项目不会被重新打开。
@@ -79,7 +81,13 @@ function selectConversation(id: string) {
   chat.selectConversation(id)
 }
 async function logout() {
-  if (await confirmation.ask('确定要退出登录吗？')) emit('logout')
+  if (loggingOut.value || !await confirmation.ask('确定要退出登录吗？')) return
+  loggingOut.value = true
+  try {
+    if (await apiLogout()) emit('logout')
+  } catch {
+    logoutError.value = '服务端尚未确认退出。请检查网络连接后重试。'
+  } finally { loggingOut.value = false }
 }
 </script>
 
@@ -107,6 +115,10 @@ async function logout() {
   <AppDialog v-if="confirmationMessage" title="确认操作" compact @close="confirmation.settle(false)">
     <p class="confirmation-copy">{{ confirmationMessage }}</p>
     <div class="dialog-actions"><button class="btn btn-secondary" autofocus @click="confirmation.settle(false)">取消</button><button class="btn btn-primary" @click="confirmation.settle(true)">确认</button></div>
+  </AppDialog>
+  <AppDialog v-if="logoutError" title="退出登录未完成" compact @close="logoutError = ''">
+    <p role="alert">{{ logoutError }}</p>
+    <button class="btn btn-primary" @click="logoutError = ''">关闭</button>
   </AppDialog>
 </template>
 

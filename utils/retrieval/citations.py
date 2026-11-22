@@ -60,7 +60,8 @@ def _markdown_text(text: str) -> str:
     return re.sub(r"([\\`*_{}\[\]()#+.!|~>-])", r"\\\1", escaped)
 
 
-def render_citations(text: str, evidence: list[dict]) -> str:
+def render_citations(text: str, evidence: list[dict]) -> tuple[str, list[str]]:
+    """返回带来源链接的最终正文及其已校验的引用 ID。"""
     ids = cited_evidence_ids(text, evidence)
     by_id = {item["citation_id"]: item for item in evidence}
     # 标记只用于上面的证据校验；用户正文不显示角标，页段坐标保留在文末链接中。
@@ -70,4 +71,4 @@ def render_citations(text: str, evidence: list[dict]) -> str:
         item = by_id[identifier]
         label = _markdown_text(item['source'])
         blocks.append(f"- [{label}]({item['source_url']})")
-    return f"{body}\n\n来源：\n\n" + "\n".join(blocks)
+    return f"{body}\n\n来源：\n\n" + "\n".join(blocks), ids

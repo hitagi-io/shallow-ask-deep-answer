@@ -39,9 +39,8 @@ class StreamBridge:
         self._stream = sync_stream
         self._loop = asyncio.get_running_loop()
         self._queue: asyncio.Queue = asyncio.Queue()
-        self._stopped = threading.Event()
-        # 共享给内层包装器（如 kb 模式的缓冲循环），让取消能穿透到原始消息流
-        self._cancel_event = cancel_event
+        # 生产线程与内层消息循环读取同一个取消信号。
+        self._stopped = cancel_event if cancel_event is not None else threading.Event()
         self._thread = threading.Thread(
             target=copy_context().run, args=(self._run,), name=self.THREAD_NAME, daemon=True
         )
@@ -89,8 +88,6 @@ class StreamBridge:
     def stop(self) -> None:
         """请求取消；生产线程会在下一次 next() 返回或抛错时退出。"""
         self._stopped.set()
-        if self._cancel_event is not None:
-            self._cancel_event.set()
 
     async def receive(self):
         """等待下一个事件；调用方取消等待不会影响生产线程，需配合 stop()。"""

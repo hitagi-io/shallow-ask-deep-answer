@@ -109,31 +109,41 @@ class UploadTaskStore:
             "ON upload_tasks (user_id, project_id, sequence DESC)"
         )
 
-    def create(self, user_id: int, project_id: str, items: list[dict]) -> str:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS upload_daily_usage (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                usage_day DATE NOT NULL, bytes BIGINT NOT NULL CHECK (bytes >= 0),
+                embedding_chars BIGINT NOT NULL DEFAULT 0 CHECK (embedding_chars >= 0),
+                PRIMARY KEY (user_id,usage_day)
+            );
+            CREATE INDEX IF NOT EXISTS idx_upload_tasks_account_pending ON upload_tasks(user_id)
+                WHERE status IN ('queued','running');
+            CREATE TABLE IF NOT EXISTS upload_receivers (
+                token UUID PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                project_id VARCHAR(36) NOT NULL,
+                reserved_bytes BIGINT NOT NULL CHECK (reserved_bytes >= 0),
+                expires_at TIMESTAMPTZ NOT NULL,
+                FOREIGN KEY (user_id,project_id) REFERENCES projects(user_id,id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_upload_receivers_user ON upload_receivers(user_id, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_upload_receivers_expiry ON upload_receivers(expires_at);
+        """)
+
+    def create(self, user_id: int, project_id: str, items: list[dict], *, cur) -> str:
         task_id = str(uuid.uuid4())
         trace_id = uuid.uuid4().hex
-        with psycopg.connect(self.conninfo) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO upload_tasks (id, user_id, project_id, total, trace_id)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (task_id, user_id, project_id, len(items), trace_id),
-                )
-                cur.executemany(
-                    """
-                    INSERT INTO upload_task_items
-                        (task_id, position, name, staged_path)
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    [(task_id, index, item["name"], item["staged_path"])
-                     for index, item in enumerate(items)],
-                )
-                append_audit(cur, user_id=user_id, action="file.upload", resource_type="upload_task",
-                             resource_id=task_id, project_id=project_id, result="accepted", operation_id=task_id,
-                             event_key=f"upload:{task_id}:accepted", details={"files": len(items)}, trace_id=trace_id)
-            conn.commit()
+        cur.execute("INSERT INTO upload_tasks (id,user_id,project_id,total,trace_id) VALUES (%s,%s,%s,%s,%s)",
+                    (task_id, user_id, project_id, len(items), trace_id))
+        cur.executemany("INSERT INTO upload_task_items (task_id,position,name,staged_path) VALUES (%s,%s,%s,%s)",
+                        [(task_id, i, item["name"], item["staged_path"]) for i, item in enumerate(items)])
+        cur.execute("""
+            INSERT INTO upload_daily_usage(user_id,usage_day,bytes) VALUES (%s,(now() AT TIME ZONE 'UTC')::date,%s)
+            ON CONFLICT (user_id,usage_day) DO UPDATE SET bytes=upload_daily_usage.bytes + EXCLUDED.bytes
+        """, (user_id, sum(item["size"] for item in items)))
+        append_audit(cur, user_id=user_id, action="file.upload", resource_type="upload_task",
+                     resource_id=task_id, project_id=project_id, result="accepted", operation_id=task_id,
+                     event_key=f"upload:{task_id}:accepted", details={"files": len(items)}, trace_id=trace_id)
         return task_id
 
     def get(self, user_id: int, project_id: str, task_id: str) -> dict | None:
@@ -161,7 +171,7 @@ class UploadTaskStore:
                 """,
                 (task_id,),
             ).fetchall()
-        return {**dict(task), "files": [dict(item) for item in items],
+        return {**task, "files": items,
                 "recovery_required": task["status"] in ("failed", "completed") and any(item["recovery_pending"] for item in items)}
 
     def claim_next(self) -> tuple[dict, psycopg.Connection] | None:
@@ -200,7 +210,7 @@ class UploadTaskStore:
                         UPDATE upload_tasks SET status = 'running', started_at = CURRENT_TIMESTAMP,
                             updated_at = CURRENT_TIMESTAMP WHERE id = %s
                     """, (row["id"],))
-                return dict(row), lease
+                return row, lease
             lease.close()
             return None
         except BaseException:
@@ -236,7 +246,7 @@ class UploadTaskStore:
 
     def items(self, task_id: str) -> list[dict]:
         with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
-            rows = conn.execute(
+            return conn.execute(
                 """
                 SELECT id, position, name, staged_path, status, recovery
                 FROM upload_task_items
@@ -245,7 +255,6 @@ class UploadTaskStore:
                 """,
                 (task_id,),
             ).fetchall()
-        return [dict(row) for row in rows]
 
     def file_upload_order(self, user_id: int, project_id: str) -> list[FileUploadOrder]:
         """查询每个文件最近一次上传，覆盖全部资料，不受最近七条展示限制。"""
@@ -261,15 +270,24 @@ class UploadTaskStore:
             """, (user_id, project_id)).fetchall()
         return [FileUploadOrder.model_validate(row) for row in rows]
 
+    @staticmethod
+    def project_has_active(cur, user_id: int, project_id: str) -> bool:
+        cur.execute("""
+            SELECT 1 FROM upload_receivers
+            WHERE user_id = %s AND project_id = %s AND expires_at > clock_timestamp()
+            UNION ALL
+            SELECT 1 FROM upload_tasks WHERE user_id = %s AND project_id = %s
+              AND (status IN ('queued', 'running') OR EXISTS (
+                SELECT 1 FROM upload_task_items i WHERE i.task_id=upload_tasks.id
+                  AND i.recovery IS NOT NULL AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished')
+              ))
+            LIMIT 1
+        """, (user_id, project_id, user_id, project_id))
+        return cur.fetchone() is not None
+
     def has_active(self, user_id: int, project_id: str) -> bool:
-        with psycopg.connect(self.conninfo) as conn:
-            return conn.execute("""
-                SELECT 1 FROM upload_tasks WHERE user_id = %s AND project_id = %s
-                  AND (status IN ('queued', 'running') OR EXISTS (
-                    SELECT 1 FROM upload_task_items i WHERE i.task_id=upload_tasks.id
-                      AND i.recovery IS NOT NULL AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished')
-                  )) LIMIT 1
-            """, (user_id, project_id)).fetchone() is not None
+        with psycopg.connect(self.conninfo) as conn, conn.cursor() as cur:
+            return self.project_has_active(cur, user_id, project_id)
 
     def pending_recoveries(self, user_id: int, project_id: str) -> list[dict]:
         with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
@@ -316,7 +334,6 @@ class UploadTaskStore:
             )
             if result.rowcount != 1:
                 raise RuntimeError("上传任务已不在运行，无法更新入库进度")
-            conn.commit()
 
     def finish_item(self, task_id: str, item_id: int, *, status: str,
                     overwritten: bool | None, indexed: bool | None,

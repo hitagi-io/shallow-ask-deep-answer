@@ -128,7 +128,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
       if (disposed) return
       nextCursor.value = cursor
       conversations.value = loaded
-      currentId.value = loaded[selected] ? selected : Object.keys(loaded)[0] || ''
+      currentId.value = loaded[selected] ? selected : Object.keys(loaded)[0]
     } catch (e) {
       loadError.value = e instanceof Error ? e.message : '会话加载失败'
     } finally { loading.value = false }
@@ -193,7 +193,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
           conv.project_deleted = page.project_deleted
         }
         if (page.project_deleted && page.project_id) markProjectDeleted(page.project_id)
-        if (page.active_generation && !runs.value[id]) {
+        if (page.active_generation) {
           void observeGeneration(id, page.active_generation.request_id)
         }
       } catch (e) {
@@ -247,7 +247,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   watch([currentId, kbOnly], ([id]) => {
     visibleCount.value = 50
     if (id) localStorage.setItem(selectionKey, id)
-    if (conversations.value[id]) void loadMessages(id)
+    void loadMessages(id)
     resetInputHeight()
     jumpToLatest()
   })
@@ -386,7 +386,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   }
 
   async function observeGeneration(id: string, requestId: string, submission?: {
-    text: string; mode: boolean; projectId: string | null; user: Message; assistant: Message; hadMessages: boolean; retryOf?: number
+    text: string; mode: boolean; projectId: string | null; user: Message; assistant: Message; hadMessages: boolean; clearedDraft: string | null; retryOf?: number
   }) {
     const conv = conversations.value[id]
     if (!conv || runs.value[id] || disposed) return
@@ -398,6 +398,14 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     try {
       const outcome = await streamChat(id, requestId, snapshot => {
         if (disposed) return
+        if (!run.confirmed && submission) {
+          conv.updatedAt = new Date().toISOString()
+          if (!submission.hadMessages && conv.title === '新对话') {
+            const characters = Array.from(submission.text)
+            conv.title = characters.length > 20 ? characters.slice(0, 20).join('') + '...' : submission.text
+            updateConversationTitle(id, conv.title).catch(e => handlePersistError('更新标题', e))
+          }
+        }
         run.confirmed = true
         run.startedAt = Date.now() - snapshot.elapsed_seconds * 1000
         now.value = Date.now()
@@ -437,6 +445,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
       if (!outcome.started && submission) {
         conv.messages = conv.messages.filter(m => m !== submission.user && m !== submission.assistant)
         conv.hasMessages = submission.hadMessages
+        if (submission.clearedDraft !== null && !drafts.value[id]) drafts.value[id] = submission.clearedDraft
         failedAttempts.value[id] = { text: submission.text, mode: submission.mode, projectId: submission.projectId, requestId, retryOf: submission.retryOf }
         handlePersistError('发送消息', new Error(outcome.error || '未能确认是否发送成功，请重试'))
       } else {
@@ -448,7 +457,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
         }
       }
     } finally {
-      if (runs.value[id] === run) delete runs.value[id]
+      delete runs.value[id]
       controllers.delete(id)
       if (!disposed && submission && !run.confirmed) void loadMessages(id)
       if (currentId.value === id) scrollToBottom()
@@ -461,6 +470,11 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     const convId = currentId.value
     const conv = conversations.value[convId]
     if (!conv || answerMode !== kbOnly.value || !conv.messagesLoaded || conv.messagesLoading) return
+    const failed = failedAttempts.value[convId]
+    if (retryText == null && failed?.text === text && failed.mode === answerMode && failed.projectId === conv.project_id) {
+      previousRequestId = failed.requestId
+      retryOf = failed.retryOf
+    }
     clearNotice()
     if (!projectReady.value) {
       showNotice(projectDeleted.value ? PROJECT_DELETED_NOTICE : PROJECT_REQUIRED_NOTICE, 'error')
@@ -485,14 +499,10 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     const user = reactive<Message>({ role: 'user', content: text, kbOnly: answerMode })
     const assistant = reactive<Message>({ role: 'assistant', content: '', status: 'streaming', kbOnly: answerMode })
     conv.messages.push(user, assistant)
-    conv.updatedAt = new Date().toISOString()
-    if (!hadMessages && conv.title === '新对话') {
-      conv.title = text.length > 20 ? text.slice(0, 20) + '...' : text
-      updateConversationTitle(convId, conv.title).catch(e => handlePersistError('更新标题', e))
-    }
-    if (retryText == null) { input.value = ''; resetInputHeight() }
+    const clearedDraft = retryText == null || (previousRequestId && input.value.trim() === text) ? input.value : null
+    if (clearedDraft !== null) { input.value = ''; resetInputHeight() }
     jumpToLatest()
-    await observeGeneration(convId, previousRequestId || newRequestId(), { text, mode: answerMode, projectId: answerMode ? conv.project_id : null, user, assistant, hadMessages, retryOf })
+    await observeGeneration(convId, previousRequestId || newRequestId(), { text, mode: answerMode, projectId: answerMode ? conv.project_id : null, user, assistant, hadMessages, clearedDraft, retryOf })
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -503,7 +513,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   function refreshCurrent() {
     if (!document.hidden) {
       void refreshKnowledgeReadiness()
-      if (currentId.value && !runs.value[currentId.value]) void loadMessages()
+      void loadMessages()
     }
   }
   onMounted(() => {

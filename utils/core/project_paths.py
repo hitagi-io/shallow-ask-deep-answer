@@ -20,7 +20,7 @@ def knowledge_scope(user_id: int, project_id: str) -> tuple[int, str]:
 
 
 def get_knowledge_storage_root() -> str:
-    source_root = Path(get_project_root()).resolve()
+    source_root = Path(get_project_root())
     configured = os.getenv("KNOWLEDGE_STORAGE_ROOT")
     root = Path(configured).expanduser() if configured else source_root.parent / f"{source_root.name}-data"
     if not root.is_absolute():
@@ -47,6 +47,8 @@ def scoped_knowledge_file(directory: str, file_path: str) -> str:
     path = Path(file_path)
     if not path.is_absolute():
         path = root / path
-    if path.is_symlink() or path.resolve().parent != root:
-        raise ValueError("文件不属于当前知识库项目")
-    return str(path.resolve())
+    if not path.is_symlink():
+        resolved = path.resolve()
+        if resolved.parent == root:
+            return str(resolved)
+    raise ValueError("文件不属于当前知识库项目")

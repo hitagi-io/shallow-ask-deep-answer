@@ -67,8 +67,7 @@ class HealthReportCache:
     def _settle(self, refresh: _Refresh) -> None:
         # 只有任务真正退出（包括 check 的 finally 清理）才准许下一轮执行。
         with self._lock:
-            if self._pending is refresh:
-                self._pending = None
+            self._pending = None
         if not refresh.task.cancelled():
             refresh.task.exception()  # 所有调用者已离开时也回收异常。
         refresh.settled.set_result(None)

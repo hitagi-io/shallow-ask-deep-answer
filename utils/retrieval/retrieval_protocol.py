@@ -33,14 +33,14 @@ STATUS_ERROR = "error"
 STATUS_NO_RETRIEVAL = "no_retrieval"
 STATUS_INVALID = "invalid"
 
-_REPORT_STATUSES = {
+_REPORT_STATUSES = (
     STATUS_OK,
     STATUS_EMPTY,
     STATUS_ERROR,
     STATUS_NO_RETRIEVAL,
     STATUS_INVALID,
-}
-_CALL_STATUSES = {STATUS_OK, STATUS_EMPTY, STATUS_ERROR, STATUS_INVALID}
+)
+_CALL_STATUSES = (STATUS_OK, STATUS_EMPTY, STATUS_ERROR, STATUS_INVALID)
 
 SENTINEL_KB_DOWN = "检索服务暂时不可用"
 SENTINEL_KB_MISS = "未找到足够资料"
@@ -68,39 +68,28 @@ class RetrievalReport(BaseModel):
     retrieval_calls: list[dict]
 
 
-def build_retrieval_content(status: str, chunks: Sequence[dict]) -> str:
-    """模型可见的工具结果：代码状态与不可信资料分字段，转义嵌入的结构字符。"""
+def build_retrieval_result(status: str, query: str, chunks: Sequence[dict]) -> tuple[str, dict]:
+    """同一次检索生成模型可见的 JSON 和随工具消息传递的证据。"""
     if status not in (STATUS_OK, STATUS_EMPTY, STATUS_ERROR):
         raise ValueError(f"非法检索状态: {status}")
-    return json.dumps(
+    evidence = [dict(chunk) for chunk in chunks] if status == STATUS_OK else []
+    content = json.dumps(
         {
             "status": status,
             "documents": [
                 {"source": chunk["source"], "content": chunk["excerpt"],
                  "citation_id": chunk["citation_id"], "location": chunk["location"]}
-                for chunk in chunks
-            ] if status == STATUS_OK else [],
+                for chunk in evidence
+            ],
         },
         ensure_ascii=False,
     )
-
-
-def build_retrieval_artifact(
-    status: str,
-    query: str,
-    chunks: Sequence[dict],
-) -> dict:
-    """构造 do_retrieval 的结构化 artifact（不进入模型上下文，只随 ToolMessage 流转）。"""
-    if status not in (STATUS_OK, STATUS_EMPTY, STATUS_ERROR):
-        raise ValueError(f"非法检索状态: {status}")
-    return {
+    return content, {
         "protocol": RETRIEVAL_PROTOCOL,
         "version": PROTOCOL_VERSION,
         "status": status,
         "query": query,
-        "chunks": [
-            dict(chunk) for chunk in chunks
-        ] if status == STATUS_OK else [],
+        "chunks": evidence,
     }
 
 
@@ -184,9 +173,9 @@ def build_report_from_messages(messages: Sequence[BaseMessage]) -> dict:
     elif ok_records:
         if any(not call_id for call_id, _ in ok_records):
             status, reason = STATUS_INVALID, "missing_tool_call_id"
-        elif not answer_body.strip():
+        elif not answer_body:
             status, reason = STATUS_INVALID, "missing_answer"
-        elif answer_body.strip() in _SENTINELS:
+        elif answer_body in _SENTINELS:
             status, reason = STATUS_INVALID, "sentinel_with_evidence"
         elif citation_error:
             status, reason = STATUS_INVALID, "missing_or_invalid_citation"
@@ -268,32 +257,19 @@ def parse_retrieval_report(text: Any) -> dict | None:
         if not isinstance(call.get("chunk_count"), int) or call["chunk_count"] < 0:
             return None
 
-    evidence_sources = []
+    evidence_sources = set()
     chunk_ids = set()
     for item in evidence:
-        if not isinstance(item, dict):
-            return None
-        source = item.get("source")
-        chunk_id = item.get("chunk_id")
-        if not isinstance(source, str) or not source:
-            return None
-        if not isinstance(chunk_id, str) or chunk_id in chunk_ids:
-            return None
         if not valid_evidence(item):
             return None
+        chunk_id = item.get("chunk_id")
+        if not isinstance(chunk_id, str) or chunk_id in chunk_ids:
+            return None
         chunk_ids.add(chunk_id)
-        evidence_sources.append(source)
+        evidence_sources.add(item["source"])
 
     if status == STATUS_OK:
-        if not sources or not evidence or not calls or not answer.strip():
-            return None
-        if not ok_call_ids:
-            return None
-        if any(name not in sources for name in evidence_sources):
-            return None
-        if set(evidence_sources) != set(sources):
-            return None
-        if any(name not in sources for name in citations):
+        if not ok_call_ids or not evidence or evidence_sources != set(sources):
             return None
         for item in evidence:
             prefix, _, index = item["chunk_id"].rpartition(":")

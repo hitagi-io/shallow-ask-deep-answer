@@ -72,7 +72,9 @@ npm --prefix frontend-chat run dev
 2. 在对话输入区启用「知识库」，选择项目后提问；关闭该按钮则使用通用问答。
 3. 点击知识库回答末尾的来源查看提取文本；文档未入库或索引异常时，可在知识库页面展开“索引维护”，点击“修复与补建”统一处理未入库文件、异常索引和残留分块，也可单独点击“检查索引”查看状态。
 
-上传或入库期间，该项目暂不能发送新问题。单文件默认上限 50 MB；TXT、Markdown 使用 UTF-8，Office 文件需为未加密的新格式。OCR 可能存在识别误差，关键内容请核对原文。
+上传或入库期间，该项目暂不能发送新问题。上传默认每个文件限 50 MiB，每次请求限 32 个文件、共 101 MiB（含表单开销）。网页会自动逐个发送文件。TXT、Markdown 使用 UTF-8，Office 文件需为未加密的新格式。OCR 可能存在识别误差，关键内容请核对原文。
+
+XLSX 在独立子进程中解析。默认每本限 25 万个单元格、400 万个提取字符、1 GiB 解析内存和 180 秒，每个 API 工作进程同时解析一本。公式缓存、重复的首行上下文和图片 OCR 的文字均计入输出限额。超限时可拆分工作簿，或在 `config/vector_db.yaml` 中调整限额。
 
 上传进度在同一条目中显示，绿色条随实际工作完成向右增长，完成后隐藏。百分比按传输、检查、解析、分块、向量化、写入、校验和收尾八个阶段等权计算，阶段内使用已处理数量，不代表剩余耗时。等待外部服务时进度保持不变。更新此功能后需重启后端，启动时会为上传任务补充进度字段；更新前已经运行的任务没有详细阶段记录。
 
@@ -110,6 +112,15 @@ npm --prefix frontend-chat run dev
 - 源文件默认位于仓库同级的 `<仓库目录名>-data/<账号 ID>/<项目 UUID>/`，可通过 `KNOWLEDGE_STORAGE_ROOT` 指定源码目录之外的绝对路径作为存储根目录。备份需包含源文件、PostgreSQL 和 Milvus 数据。
 - [就绪检查](http://localhost:8000/api/health/ready)仅检测 PostgreSQL 和 Milvus，不验证模型服务。设置 `ENABLE_API_DOCS=true` 并重启后，可访问 [API 文档](http://localhost:8000/docs)。
 - 前端发布：运行 `npm --prefix frontend-chat run build`，托管 `frontend-chat/dist/`，将同域 `/api` 代理到后端，并关闭 SSE 响应缓冲。
+- 上传代理应流式转发请求体，并与后端的 `MAX_UPLOAD_REQUEST_MB` 使用相同的总大小上限。Nginx 默认配置下，可在上传接口的 `location` 中设置 `client_max_body_size 101m;`、`proxy_request_buffering off;` 和 `proxy_http_version 1.1;`，以便后端在接收文件前完成鉴权。
+
+## 会话与账号配额
+
+退出登录会在服务端撤销当前会话。修改登录名需要验证当前密码，并沿用原会话的到期时间。升级前签发的旧令牌共用一组撤销记录，退出其中一个旧会话会使同一账号、同一凭证版本的其他旧会话一并失效。升级后每次登录独立撤销。登录和注册入口先按来源和 worker 总量限流，跨 worker 的数据库配额继续生效，重复限流按操作汇总审计。
+
+每个账号默认最多同时打开 4 条聊天订阅。知识库可存储 1 GiB 源文件，每日可接收 250 MiB 上传，同时最多有 8 个正在接收、排队或执行的上传任务。服务器在读取请求正文前预留账号的字节数和任务名额，断线或接收超时会释放预留额度。已有源文件、暂存文件和覆盖备份都占用存储空间，删除资料会释放空间。
+
+上传、补建和修复共享每日 1000 万个分块字符的向量化额度，复用已完成的索引时免计。每日用量从升级后开始累计，按 UTC 零点重置。以上默认值可在 `.env.example` 中查看。回答中的站外图片以链接显示，点击后由浏览器打开。
 
 ## 开发检查
 
@@ -118,6 +129,7 @@ npm --prefix frontend-chat run dev
 ```powershell
 python -s -m pip check
 python -m compileall -q api_server.py auth.py accounts.py chat_agent.py rag utils
+python -s -m unittest discover -s tests -v
 npm --prefix frontend-chat run build
 ```
 

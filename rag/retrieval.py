@@ -67,9 +67,7 @@ def fuse_rrf(rankings, constant: int):
     return [documents[key] for key in sorted(scores, key=lambda key: (-scores[key], key))]
 
 
-def rerank_documents(query: str, candidates, top_k: int, config: dict):
-    if not candidates:
-        return []
+def _rerank_documents(query: str, candidates, top_k: int, config: dict):
     top_n = min(top_k, len(candidates))
     with make_client(config) as client:
         body = request_json(client, config, {
@@ -133,11 +131,9 @@ class HybridRetriever:
             return [vector_store._parse_document(dict(hit["entity"])) for hit in raw[0]]
 
         with span("retrieval.dense") as dense_span:
-            remaining_seconds()
             dense = search_field("vector", vector)
             dense_span.attributes["count"] = len(dense)
         with span("retrieval.bm25") as sparse_span:
-            remaining_seconds()
             sparse = search_field("sparse", query)
             sparse_span.attributes["count"] = len(sparse)
         # 保留两路候选的完整并集（最多 40），不能先截成 Top5 再精排。
@@ -154,6 +150,6 @@ class HybridRetriever:
             return []
         with span("retrieval.rerank", model=SETTINGS["rerank"]["model"]) as rerank:
             remaining_seconds()
-            documents = rerank_documents(query, candidates, SETTINGS["top_k"], SETTINGS["rerank"])
+            documents = _rerank_documents(query, candidates, SETTINGS["top_k"], SETTINGS["rerank"])
             rerank.attributes["count"] = len(documents)
         return documents

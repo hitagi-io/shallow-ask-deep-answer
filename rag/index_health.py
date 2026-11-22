@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-import threading
+from ntpath import basename
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -20,7 +20,6 @@ class IndexHealth:
         self.vector_store = get_vector_store(user_id, project_id)
         self.knowledge_dir = self.vector_store.knowledge_dir
         self.allowed_types = tuple(vector_db_config["allowed_types"])
-        self._lock = threading.RLock()
 
     def _scan(self):
         report = {
@@ -31,6 +30,7 @@ class IndexHealth:
         issues = {}
 
         def issue(kind, title, detail, item):
+            item = basename(str(item))
             report["healthy"] = False
             entry = issues.setdefault(kind, {
                 "type": kind, "severity": "error", "title": title, "detail": detail,
@@ -117,25 +117,15 @@ class IndexHealth:
 
     def check(self, *, record_files: bool = False) -> dict:
         """默认只读检查；定时维护可同时更新已知的文件摘要记录。"""
-        with self._lock, self.vector_store._store_lock:
+        with self.vector_store._store_lock:
             report, state = self._scan()
             if record_files and not report["manifest_error"]:
                 self.vector_store.manifests.record_files(state["disk"])
             return report
 
-    def snapshot(self) -> dict:
-        """完整扫描的只读快照，供显式检查使用。"""
-        with self._lock, self.vector_store._store_lock:
-            report, state = self._scan()
-            return {"report": report, "files": [
-                {"name": os.path.basename(path), "path": path,
-                 "indexed": (digest, document_format(path)) in state["healthy_keys"] and path not in state["unpublished_files"]}
-                for path, digest in state["disk"].items()
-            ]}
-
     def repair(self, *, include_pending: bool = False) -> dict:
         """按源文件修复异常内容；手动维护可同时补建未入库文件，失败保留清单供重试。"""
-        with self._lock, self.vector_store._store_lock:
+        with self.vector_store._store_lock:
             report, state = self._scan()
             if report["milvus_error"] or report["manifest_error"]:
                 raise RuntimeError("存储不可用，修复终止")
@@ -171,8 +161,8 @@ class IndexHealth:
             if paths:
                 failures = self.vector_store.index_pending_files(paths)
                 failed = {item["file"] for item in failures}
-                summary["re_indexed"] = [path for path in paths if path not in failed]
-                summary["re_index_failures"] = failures
+                summary["re_indexed"] = [basename(path) for path in paths if path not in failed]
+                summary["re_index_failures"] = [{**item, "file": basename(item["file"])} for item in failures]
                 summary["manifest_rebuilt"] = bool(summary["re_indexed"])
 
             # 重建完成后重新取快照；仅清理确认已无磁盘内容的清单。
@@ -192,11 +182,11 @@ class IndexHealth:
                                                             if (row.get("content_sha256"), row.get("source_format")) == identity])
                     self.vector_store.manifests.delete(identity)
                     summary["manifest_rebuilt"] = True
-                    if deleted and record.source not in summary["ghost_deleted"]:
-                        summary["ghost_deleted"].append(record.source)
+                    if deleted and basename(record.source) not in summary["ghost_deleted"]:
+                        summary["ghost_deleted"].append(basename(record.source))
                 except Exception:
                     logger.exception("[索引健康检查] 清理过期清单失败 source=%s", record.source)
-                    summary["ghost_errors"].append(f"{record.source}: 清理失败，详情见服务端日志")
+                    summary["ghost_errors"].append(f"{basename(record.source)}: 清理失败，详情见服务端日志")
             records = self.vector_store.manifests.all()
             # 无清单的残留块仅在源文件已丢失或替代索引已验证后删除。
             leftovers = defaultdict(list)
@@ -211,10 +201,10 @@ class IndexHealth:
             for source, pks in leftovers.items():
                 try:
                     self.vector_store._delete_pks(pks)
-                    summary["ghost_deleted"].append(source)
+                    summary["ghost_deleted"].append(basename(source))
                 except Exception:
                     logger.exception("[索引健康检查] 清理残留块失败 source=%s", source)
-                    summary["ghost_errors"].append(f"{source}: 清理失败，详情见服务端日志")
+                    summary["ghost_errors"].append(f"{basename(source)}: 清理失败，详情见服务端日志")
             report = self.check(record_files=True)
             report["repair"] = summary
             return report

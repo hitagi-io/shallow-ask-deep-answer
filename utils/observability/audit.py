@@ -8,6 +8,7 @@ import logging
 import uuid
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.types.json import Jsonb
 from starlette.exceptions import HTTPException
 
@@ -21,7 +22,8 @@ _conninfo: str | None = None
 
 def configure_audit(conninfo: str) -> None:
     global _conninfo
-    _conninfo = conninfo
+    options = conninfo_to_dict(conninfo).get("options", "")
+    _conninfo = make_conninfo(conninfo, options=f"{options} -c statement_timeout=5000".strip())
 
 
 def resource_digest(value: str) -> str:
@@ -63,8 +65,7 @@ class AuditOperation:
         # 独立提交确保后续业务回滚不会删除操作意图或失败记录。
         if _conninfo is None:
             raise RuntimeError("审计数据库尚未初始化")
-        with psycopg.connect(_conninfo, connect_timeout=5,
-                             options="-c statement_timeout=5000") as conn:
+        with psycopg.connect(_conninfo, connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 append_audit(cur, user_id=self.user_id, action=self.action,
                              resource_type=self.resource_type, resource_id=self.resource_id,

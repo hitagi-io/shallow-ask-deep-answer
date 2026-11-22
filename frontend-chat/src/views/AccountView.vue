@@ -10,6 +10,7 @@ const emit = defineEmits<{ back: []; updated: [user: UserInfo]; deleted: []; pas
 const username = ref(props.user.username)
 watch(() => props.user.username, value => { username.value = value })
 const currentPassword = ref('')
+const namePassword = ref('')
 const newPassword = ref('')
 const repeatPassword = ref('')
 const saving = ref<'name' | 'password' | 'verify' | 'delete' | null>(null)
@@ -32,7 +33,8 @@ async function saveName() {
   if (username.value.trim().length < 2) { nameError.value = '用户名需为 2～50 个字符'; return }
   saving.value = 'name'
   try {
-    const user = await apiUpdateAccount({ username: username.value.trim() })
+    const user = await apiUpdateAccount({ username: username.value.trim(), current_password: namePassword.value })
+    namePassword.value = ''
     emit('updated', user)
     nameSuccess.value = '名字已更新，下次请使用新用户名登录。'
   } catch (error) { nameError.value = (error as Error).message }
@@ -106,6 +108,8 @@ async function confirmDeletion() {
         <label for="profile-name">用户名</label>
         <input id="profile-name" v-model="username" class="filter-input" autocomplete="username" minlength="2" maxlength="50" required :disabled="busy" aria-describedby="name-hint" />
         <p id="name-hint" class="field-hint">2～50 个字符，不可与其他账号重名。</p>
+        <label for="name-password">当前密码</label>
+        <input id="name-password" v-model="namePassword" class="filter-input" type="password" autocomplete="current-password" maxlength="128" required :disabled="busy" />
         <button class="btn btn-primary" :disabled="busy || username.trim() === user.username" type="submit">{{ saving === 'name' ? '保存中…' : '保存名字' }}</button>
       </form>
     </section>

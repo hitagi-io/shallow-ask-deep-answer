@@ -14,8 +14,7 @@ from utils.retrieval.retrieval_protocol import (
     STATUS_OK,
     RetrievalReport,
     build_report_from_messages,
-    build_retrieval_artifact,
-    build_retrieval_content,
+    build_retrieval_result,
 )
 from utils.chat.prompt_loader import render_retrieval_agent_prompt
 from rag.vector_store import get_vector_store
@@ -92,20 +91,19 @@ def build_retrieval_subagent(user_id: int, project_id: str):
             raise
         except Exception:
             logger.exception("[知识库检索] 检索请求失败，已向子代理返回故障标记")
-            return build_retrieval_content(STATUS_ERROR, []), build_retrieval_artifact(STATUS_ERROR, query, [])
+            return build_retrieval_result(STATUS_ERROR, query, [])
 
-        if not chunks:
-            return build_retrieval_content(STATUS_EMPTY, []), build_retrieval_artifact(STATUS_EMPTY, query, [])
-        text = build_retrieval_content(STATUS_OK, chunks)
-        return text, build_retrieval_artifact(STATUS_OK, query, chunks)
+        return build_retrieval_result(STATUS_OK if chunks else STATUS_EMPTY, query, chunks)
 
     do_retrieval.description = Template(do_retrieval.description).substitute(
         kb_subagent_max_retrieval_calls=max_retrieval_calls,
     )
+    system_prompt = render_retrieval_agent_prompt()
+    prompt_hash = fingerprint(system_prompt)
     retrieval_agent = create_agent(
         model=_summary_model,
         tools=[do_retrieval],
-        system_prompt=render_retrieval_agent_prompt(),
+        system_prompt=system_prompt,
         middleware=[
             ToolCallLimitMiddleware(
                 tool_name="do_retrieval",
@@ -118,7 +116,7 @@ def build_retrieval_subagent(user_id: int, project_id: str):
     @traced("subagent.retrieval")
     def _invoke_with_report(state):
         """运行子代理，并由代码生成结构化检索报告。"""
-        with span("retrieval.report", prompt_hash=fingerprint(render_retrieval_agent_prompt())):
+        with span("retrieval.report", prompt_hash=prompt_hash):
             result = dict(retrieval_agent.invoke(state))
         result["structured_response"] = RetrievalReport(
             **build_report_from_messages(result["messages"])

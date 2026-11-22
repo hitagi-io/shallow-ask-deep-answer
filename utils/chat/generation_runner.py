@@ -22,12 +22,11 @@ async def run_generation(stream_factory, save_progress, finish, *, deadline, on_
     phase = "thinking"
     dirty = False
     outcome: AnswerOutcome | None = None
-    ended = False
+    result_kind = None
     error_code = "execution_interrupted"
     status, message_status, error = "failed", "error", "服务暂时不可用，回答已中断，请稍后再试。"
-    bridge = None
+    cancel_event = threading.Event()
     try:
-        cancel_event = threading.Event()
         with execution_deadline(deadline, cancel_event.is_set):
             bridge = StreamBridge(stream_factory(cancel_event.is_set), cancel_event=cancel_event)
         on_bridge(bridge)
@@ -61,7 +60,7 @@ async def run_generation(stream_factory, save_progress, finish, *, deadline, on_
                 elif kind == "end":
                     if outcome is None:
                         raise ValueError("Agent 流缺少最终结果")
-                    ended = True
+                    result_kind = outcome.result_kind
                     error_code = outcome.error_code
                     if outcome.failed:
                         error = "知识库暂时无法查询，请稍后重试。" if outcome.result_kind == "dependency_failed" else ANSWER_REJECTED_ERROR
@@ -86,9 +85,7 @@ async def run_generation(stream_factory, save_progress, finish, *, deadline, on_
         error = "抱歉，这次没能完成回答，请稍后再试。"
         logger.exception("[对话生成] 后台任务失败")
     finally:
-        if bridge is not None:
-            bridge.stop()
-        result_kind = outcome.result_kind if ended and outcome is not None else None
+        cancel_event.set()
         save_attempt = 1
         while True:
             try:

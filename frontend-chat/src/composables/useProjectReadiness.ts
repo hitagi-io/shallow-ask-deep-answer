@@ -1,4 +1,4 @@
-import { computed, onUnmounted, ref, watch, type Ref } from 'vue'
+import { computed, ref, watch, type Ref } from 'vue'
 import { fetchFileSummary, fetchUploadTasks } from '../api'
 
 type Readiness = 'checking' | 'updating' | 'recovery' | 'empty' | 'partial' | 'ready' | 'error'
@@ -20,66 +20,54 @@ export function useProjectReadiness(projectId: Readonly<Ref<string | null>>, upd
       default: return ''
     }
   })
-  let disposed = false
-  let version = 0
-  let controller: AbortController | undefined
+  let projectSignal: AbortSignal
   let pending: Promise<boolean> | undefined
-  let timer: ReturnType<typeof setTimeout> | undefined
 
   function refresh(): Promise<boolean> {
     const id = projectId.value
-    if (disposed) return Promise.resolve(false)
+    const signal = projectSignal
+    if (signal.aborted) return Promise.resolve(false)
     if (!id) return Promise.resolve(true)
     if (locallyUpdating.value) return Promise.resolve(false)
     if (pending) return pending
-    const requestVersion = version
-    controller = new AbortController()
-    const options = { signal: controller.signal }
     pending = (async () => {
       try {
-        const [tasks, summary] = await Promise.all([fetchUploadTasks(id, options), fetchFileSummary(id, options)])
-        if (disposed || requestVersion !== version) return false
+        const [tasks, summary] = await Promise.all([fetchUploadTasks(id, { signal }), fetchFileSummary(id, { signal })])
+        if (signal.aborted) return false
         remoteStatus.value = tasks.some(task => task.recovery_required) ? 'recovery'
           : tasks.some(task => task.status === 'queued' || task.status === 'running') ? 'updating'
           : summary.indexed === 0 ? 'empty'
           : summary.indexed < summary.total ? 'partial' : 'ready'
         return !blocked.value
       } catch (reason) {
-        if (disposed || requestVersion !== version) return false
+        if (signal.aborted) return false
         console.error('[读取项目入库状态失败]', reason)
         remoteStatus.value = 'error'
         return false
       } finally {
-        if (requestVersion === version) pending = undefined
+        if (!signal.aborted) pending = undefined
       }
     })()
     return pending
   }
 
-  function schedule(requestVersion: number) {
-    if (disposed || requestVersion !== version || !projectId.value) return
-    clearTimeout(timer)
-    timer = setTimeout(async () => {
-      await refresh()
-      schedule(requestVersion)
-    }, status.value === 'updating' ? 2_000 : 5_000)
-  }
-
-  watch([projectId, locallyUpdating], () => {
-    const requestVersion = ++version
-    controller?.abort()
-    pending = undefined
-    clearTimeout(timer)
+  watch([projectId, locallyUpdating], ([id, updating], _, onCleanup) => {
+    const controller = new AbortController()
+    const { signal } = controller
+    projectSignal = signal
+    let timer: ReturnType<typeof setTimeout> | undefined
+    onCleanup(() => {
+      controller.abort()
+      clearTimeout(timer)
+      pending = undefined
+    })
     remoteStatus.value = 'checking'
-    void refresh().then(() => schedule(requestVersion))
+    async function poll() {
+      await refresh()
+      if (!signal.aborted) timer = setTimeout(poll, status.value === 'updating' ? 2_000 : 5_000)
+    }
+    if (id && !updating) void poll()
   }, { immediate: true, flush: 'sync' })
-
-  onUnmounted(() => {
-    disposed = true
-    version++
-    controller?.abort()
-    clearTimeout(timer)
-  })
 
   return { status, blocked, notice, refresh }
 }

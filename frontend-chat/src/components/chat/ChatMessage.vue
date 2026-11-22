@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
+import { answerHtml } from '../../utils/answerHtml'
 import { isSourceUrl, type Message } from '../../api'
 import { formatDuration } from '../../utils/duration'
 import BrandMark from '../common/BrandMark.vue'
@@ -60,7 +59,7 @@ const html = computed(() => {
   const text = props.message.kbOnly
     ? stripInternalCitations(renderedText.value, props.message.status === 'streaming')
     : renderedText.value
-  let clean = DOMPurify.sanitize(marked.parse(text, { breaks: true, gfm: true }) as string, { FORBID_TAGS: ['button'], ALLOW_DATA_ATTR: false })
+  let clean = answerHtml(text)
   if (props.projectDeleted || props.message.kbOnly || clean.includes('来源')) {
     const doc = new DOMParser().parseFromString(clean, 'text/html')
     formatSourceReferences(doc, props.projectDeleted)

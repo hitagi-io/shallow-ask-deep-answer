@@ -1,6 +1,7 @@
 """各格式解析为可重复定位的文本单元；OCR 不调用远程模型。"""
 
 from datetime import date, datetime, time
+from contextlib import ExitStack
 from decimal import Decimal
 from html.parser import HTMLParser
 from io import BytesIO
@@ -398,7 +399,7 @@ def _display_value(value, number_format):
     return str(value)
 
 
-def _cell_value(cell, cached):
+def _cell_value(cell, cached_value):
     from openpyxl.worksheet.formula import DataTableFormula
 
     value = cell.value
@@ -407,72 +408,128 @@ def _cell_value(cell, cached):
             formula = f"模拟运算表 {value.ref}（输入单元格 {value.r1 or '无'}, {value.r2 or '无'}）"
         else:
             formula = value if isinstance(value, str) else f"{value.text}（数组范围 {value.ref}）"
-        return f"{_display_value(cached.value, cell.number_format)}（公式 {formula}；文件保存的缓存结果）" if cached.value is not None else f"{formula}（公式未保存计算结果）"
+        return f"{_display_value(cached_value, cell.number_format)}（公式 {formula}；文件保存的缓存结果）" if cached_value is not None else f"{formula}（公式未保存计算结果）"
     return _display_value(value, cell.number_format)
 
 
-def _open_xlsx(path, *, data_only):
+def _open_xlsx(stack, path, *, data_only):
     from openpyxl import load_workbook
 
-    # 非只读模式会在返回前加载工作簿。显式持有源文件，解析失败也及时关闭，
-    # 避免损坏的包在 Windows 下残留文件句柄，影响覆盖上传。
-    with open(path, "rb") as stream:
+    stream = stack.enter_context(open(path, "rb"))
+    try:
+        book = load_workbook(stream, data_only=data_only, read_only=data_only, keep_links=False)
+    except OSError as exc:
+        if str(exc) != "File contains no valid workbook part":
+            raise
+        raise ValueError("文件中没有有效的 XLSX 工作簿，请用 Excel/WPS 重新另存后上传") from exc
+    stack.callback(book.close)
+    return book
+
+
+def _check_sheet_bounds(sheet, available):
+    """按实际工作表关系流式核对坐标和展开范围，兼容缺少 dimension 或单元格坐标的文件。"""
+    from xml.parsers import expat
+    from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
+    from openpyxl.xml.constants import SHEET_MAIN_NS
+
+    row = column = seen_cells = expanded = 0
+    max_row = max_col = 1
+    ns = SHEET_MAIN_NS + "}"
+    ranges = {ns + "dimension", ns + "mergeCell", ns + "hyperlink"}
+
+    def start(tag, attrs):
+        nonlocal row, column, max_row, max_col, seen_cells, expanded
+        if tag == ns + "row":
+            # openpyxl 也接受将整数行号保存为 1.0 的工作簿。
+            number = float(attrs.get("r", row + 1))
+            if not number.is_integer():
+                raise ValueError("工作表行号无效")
+            row = int(number)
+            column = 0
+            end_row, end_col = row, 1
+        elif tag == ns + "c":
+            if attrs.get("r"):
+                end_row, column = coordinate_to_tuple(attrs["r"])
+            else:
+                column += 1
+                end_row = row
+            end_col = column
+            seen_cells += 1
+        elif tag in ranges and "ref" in attrs:
+            left, top, end_col, end_row = range_boundaries(attrs["ref"])
+            if (None in (left, top, end_col, end_row) or not 1 <= left <= end_col
+                    or not 1 <= top <= end_row):
+                raise ValueError("工作表坐标范围无效")
+            if tag != ns + "dimension":
+                expanded += (end_col - left + 1) * (end_row - top + 1)
+        else:
+            return
+        max_row, max_col = max(max_row, end_row), max(max_col, end_col)
+        if min(end_row, end_col) < 1 or max(max_row * max_col, seen_cells, expanded) > available:
+            raise ValueError("工作簿单元格范围超过解析上限，请拆分文件")
+
+    def reject_doctype(*args):
+        raise ValueError("工作表不支持 DTD 声明")
+
+    parser = expat.ParserCreate(namespace_separator="}")
+    parser.StartElementHandler = start
+    parser.StartDoctypeDeclHandler = reject_doctype
+    with sheet._get_source() as stream:
         try:
-            return load_workbook(stream, data_only=data_only, keep_links=False)
-        except OSError as exc:
-            if str(exc) != "File contains no valid workbook part":
-                raise
-            raise ValueError(
-                "文件中没有有效的 XLSX 工作簿。请用 Excel/WPS 打开后另存为"
-                "“Excel 工作簿（.xlsx）”再上传；仅修改扩展名无效"
-            ) from exc
+            parser.ParseFile(stream)
+        except expat.ExpatError as exc:
+            raise ValueError("工作表 XML 无效，请重新保存文件") from exc
+    return max(max_row * max_col, seen_cells, expanded)
 
 
-def load_xlsx(path, *, on_progress: UnitProgressCallback | None = None):
+def _xlsx_documents(path, cell_limit, text_limit, progress):
+    from utils.documents.xlsx_worker import TEXT_LIMIT_ERROR
     from openpyxl.drawing.spreadsheet_drawing import AbsoluteAnchor
 
     _check_package(path)
-    book = _open_xlsx(path, data_only=False)
-    result = []
-    try:
-        cached = _open_xlsx(path, data_only=True)
-    except Exception:
-        book.close()
-        raise
-    try:
-        if sum(sheet.max_row * sheet.max_column for sheet in book) > _settings()["max_sheet_cells"]:
-            raise ValueError("工作簿单元格范围超过解析上限，请删除多余空白行列或拆分文件")
-        total = sum(sheet.max_row + len(sheet._images) for sheet in book)
+    with ExitStack() as stack:
+        cached = _open_xlsx(stack, path, data_only=True)
+        available = cell_limit
+        for sheet in cached:
+            available -= _check_sheet_bounds(sheet, available)
+            if available < 0:
+                raise ValueError("工作簿单元格范围超过解析上限，请拆分文件")
+        # 只有通过全部工作表预检后，才加载保留公式、合并和图片的普通工作簿。
+        book = _open_xlsx(stack, path, data_only=False)
+        dimensions = [(sheet.max_row, sheet.max_column) for sheet in book]
+        if sum(rows * cols for rows, cols in dimensions) > cell_limit:
+            raise ValueError("工作簿单元格范围超过解析上限，请拆分文件")
+        total = sum(rows + len(sheet._images) for sheet, (rows, _) in zip(book, dimensions))
         completed = 0
-        for sheet in book:
-            check_shutdown()
-            first = ""
+        remaining = text_limit
+        for sheet, (height, width) in zip(book, dimensions):
+            sheet_prefix = f"工作表: {sheet.title}\n"
+            prefix = sheet_prefix
             merged = {sheet.cell(area.min_row, area.min_col).coordinate: str(area)
                       for area in sheet.merged_cells.ranges}
-            for row in sheet.iter_rows(min_row=1, max_row=sheet.max_row):
-                check_shutdown()
+            cached_rows = cached[sheet.title].iter_rows(max_row=height, max_col=width, values_only=True)
+            for row in sheet.iter_rows(min_row=1, max_row=height, max_col=width):
+                cached_row = next(cached_rows, ())
                 values = []
-                for cell in row:
-                    value = _cell_value(cell, cached[sheet.title][cell.coordinate])
+                row_chars = len(prefix)
+                for index, cell in enumerate(row):
+                    value = _cell_value(cell, cached_row[index] if index < len(cached_row) else None)
                     if value:
-                        merge = merged.get(cell.coordinate)
-                        values.append(f"{merge or cell.coordinate}: {value}")
-                if not values:
-                    completed += 1
-                    if on_progress is not None:
-                        on_progress(completed, total)
-                    continue
-                text = "；".join(values)
-                prefix = f"工作表: {sheet.title}\n"
-                if first:
-                    prefix += f"首个非空行: {first}\n\n"
-                else:
-                    first = text
-                result.extend(document(prefix + text, path,
-                                       f"工作表「{sheet.title}」 · 第 {row[0].row} 行 · {row[0].coordinate}:{row[-1].coordinate}"))
+                        label = merged.get(cell.coordinate, cell.coordinate)
+                        row_chars += len(label) + 2 + len(value) + bool(values)
+                        if row_chars > remaining:
+                            raise ValueError(TEXT_LIMIT_ERROR)
+                        values.append(f"{label}: {value}")
+                if values:
+                    remaining -= row_chars
+                    text = "；".join(values)
+                    yield from document(prefix + text, path,
+                                        f"工作表「{sheet.title}」 · 第 {row[0].row} 行 · {row[0].coordinate}:{row[-1].coordinate}")
+                    if prefix == sheet_prefix:
+                        # 复用首行前缀，复制到后续正文之前已经计入每行和整本预算。
+                        prefix = f"{sheet_prefix}首个非空行: {text}\n\n"
                 completed += 1
-                if on_progress is not None:
-                    on_progress(completed, total)
+                progress(completed, total)
             # openpyxl 暂无公开图片迭代接口；图片锚点使用工作簿内的原始位置。
             for number, picture in enumerate(sheet._images, 1):
                 if isinstance(picture.anchor, AbsoluteAnchor):
@@ -481,18 +538,26 @@ def load_xlsx(path, *, on_progress: UnitProgressCallback | None = None):
                     anchor = picture.anchor._from
                     position = f"第 {anchor.row + 1} 行，第 {anchor.col + 1} 列"
                 with Image.open(BytesIO(picture._data())) as image:
-                    result.extend(ocr_documents(image, path, f"工作表「{sheet.title}」 · 图片 {number}（{position}）"))
+                    for doc in ocr_documents(image, path, f"工作表「{sheet.title}」 · 图片 {number}（{position}）"):
+                        remaining -= len(doc.page_content)
+                        if remaining < 0:
+                            raise ValueError(TEXT_LIMIT_ERROR)
+                        yield doc
                 completed += 1
-                if on_progress is not None:
-                    on_progress(completed, total)
-    finally:
-        book.close()
-        cached.close()
-    return result
+                progress(completed, total)
+
+
+def load_xlsx(path, *, on_progress: UnitProgressCallback | None = None):
+    from utils.core.config_loader import vector_db_config
+    from utils.documents.xlsx_worker import parse_isolated
+
+    return parse_isolated(path, cell_limit=_settings()["max_sheet_cells"],
+                          limits=vector_db_config["xlsx_limits"], on_progress=on_progress)
 
 
 def _slide_shapes(shapes, path, locator):
     from pptx.enum.shapes import MSO_SHAPE_TYPE
+    from pptx.shapes.picture import Picture
 
     result, preceding = [], []
     for index, shape in enumerate(sorted(shapes, key=lambda shape: (shape.top, shape.left)), 1):
@@ -506,8 +571,11 @@ def _slide_shapes(shapes, path, locator):
         elif shape.has_text_frame:
             result.extend(document("\n\n".join(paragraph.text for paragraph in shape.text_frame.paragraphs), path, where))
             preceding.append(shape.text_frame.text)
-        elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-            result.extend(_embedded_ocr(shape.image.blob, shape.image.content_type, path, f"{where} · 图片"))
+        elif isinstance(shape, Picture):
+            # 普通图片和占位符图片共用嵌入关系，只有外部链接时跳过。
+            if shape.element.blip_rId is not None:
+                picture = shape.image
+                result.extend(_embedded_ocr(picture.blob, picture.content_type, path, f"{where} · 图片"))
         elif shape.has_chart:
             chart = shape.chart
             if chart.has_title and chart.chart_title.has_text_frame:

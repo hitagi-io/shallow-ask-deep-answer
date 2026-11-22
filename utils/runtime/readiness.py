@@ -1,7 +1,6 @@
 """有整体截止时间的存储就绪探测；独立进程拥有并回收全部连接。"""
 from __future__ import annotations
 
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 import json
@@ -39,13 +38,13 @@ def _probe_postgres(conninfo: str, deadline: float) -> dict:
         seconds = _remaining(deadline)
         # startup options 使第一条 SQL 也受约束，并保留连接串原有的选项。
         options = conninfo_to_dict(conninfo).get("options", "")
-        options = f"{options} -c statement_timeout={max(1, math.ceil(seconds * 1000))}".strip()
+        options = f"{options} -c statement_timeout={math.ceil(seconds * 1000)}".strip()
         conn = psycopg.connect(
-            conninfo, autocommit=True, connect_timeout=max(1, math.ceil(seconds)), options=options,
+            conninfo, autocommit=True, connect_timeout=math.ceil(seconds), options=options,
         )
         # 建连消耗的时间不再分配给查询。
         conn.execute("SELECT set_config('statement_timeout', %s, false)",
-                     (str(max(1, math.ceil(_remaining(deadline) * 1000))),))
+                     (str(math.ceil(_remaining(deadline) * 1000)),))
         conn.execute("SELECT 1")
         _remaining(deadline)
         return _result(started)
@@ -99,9 +98,6 @@ async def check_readiness(pg_conn: str, milvus_uri: str, timeout_seconds: float)
             {"pg_conn": pg_conn, "milvus_uri": milvus_uri, "deadline": started + timeout_seconds},
             timeout_seconds,
         )
-    except asyncio.CancelledError:
-        # runner 先终止并回收子进程，再传播取消；不能把客户端取消当作成功。
-        raise
     except TimeoutError:
         return {name: _result(started, "就绪检查超时，暂未就绪") for name in ("postgres", "milvus")}
     except Exception:

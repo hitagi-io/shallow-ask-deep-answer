@@ -302,7 +302,7 @@ class ManifestStore:
                 and record["published_source"] is not None
                 and record["size_bytes"] == info.st_size and record["mtime_ns"] == info.st_mtime_ns
             )
-            files.append({"name": os.path.basename(path), "path": path, "indexed": indexed})
+            files.append({"name": os.path.basename(path), "indexed": indexed})
         return files
 
     def forget_file(self, path: str) -> None:

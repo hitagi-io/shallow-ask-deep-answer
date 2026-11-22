@@ -39,7 +39,7 @@ class Span:
         self.attributes["error_code"] = code
 
     def end(self) -> None:
-        self.duration_ms = max(0, (time.monotonic() - self.started) * 1000)
+        self.duration_ms = (time.monotonic() - self.started) * 1000
         writer = _writer
         if writer is not None and self.context.trace_id is not None and self.context.user_id is not None:
             writer.submit(self)

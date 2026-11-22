@@ -120,6 +120,15 @@ export function setUnauthorizedHandler(fn: (() => void) | null) {
   unauthorizedHandler = fn
 }
 
+async function handleUnauthorized(token: string | null, signal?: AbortSignal | null, waitForCredentialChange = true) {
+  // 账号更新期间，旧请求可能先收到 401。等更新结束后再核对请求使用的令牌。
+  if (waitForCredentialChange && credentialChange) await credentialChange
+  if (!signal?.aborted && token === getToken()) {
+    clearAuth()
+    unauthorizedHandler?.()
+  }
+}
+
 /**
  * 已鉴权接口的请求封装：任一请求返回 401 即视为登录态失效，
  * 统一清除本地凭证并通知应用层回到登录页。
@@ -128,12 +137,7 @@ export function setUnauthorizedHandler(fn: (() => void) | null) {
 async function apiFetch(input: string, init?: RequestInit, waitForCredentialChange = true): Promise<Response> {
   const token = getToken()
   const res = await fetch(input, init)
-  // 更新账号凭证期间，旧请求可能返回 401；待变更结束后再核对令牌。
-  if (res.status === 401 && waitForCredentialChange && credentialChange) await credentialChange
-  if (!init?.signal?.aborted && res.status === 401 && token === getToken()) {
-    clearAuth()
-    unauthorizedHandler?.()
-  }
+  if (res.status === 401) await handleUnauthorized(token, init?.signal, waitForCredentialChange)
   return res
 }
 
@@ -189,8 +193,22 @@ export async function apiMe(): Promise<UserInfo> {
   }
 }
 
+export async function apiLogout(): Promise<boolean> {
+  if (credentialChange) await credentialChange
+  const token = getToken()
+  if (!token) return true
+  const res = await fetch('/api/auth/logout', {
+    method: 'POST', headers: authHeaders(), signal: AbortSignal.timeout(10000),
+  })
+  if (!res.ok && res.status !== 401) throw new Error(await errorMessage(res, '服务端暂时无法确认退出，请重试'))
+  if (getToken() !== token) return !hasAuthToken()
+  clearAuth()
+  return true
+}
+
 export async function apiUpdateAccount(changes: { username?: string; current_password?: string; new_password?: string }): Promise<UserInfo> {
   if (credentialChange) throw new Error('账号信息正在保存，请稍候')
+  const originalToken = getToken()
   let settle!: () => void
   credentialChange = new Promise<void>(resolve => { settle = resolve })
   try {
@@ -200,6 +218,7 @@ export async function apiUpdateAccount(changes: { username?: string; current_pas
     }, false)
     if (!res.ok) throw new Error(await errorMessage(res, '保存失败，请重试'))
     const data = await res.json()
+    if (originalToken !== getToken()) throw new Error('登录状态已变更')
     if (changes.new_password !== undefined || data.reauthenticate) clearAuth()
     else localStorage.setItem(TOKEN_KEY, data.token)
     return data.user
@@ -216,11 +235,13 @@ export async function apiVerifyDeletion(password: string): Promise<{ confirmatio
 }
 
 export async function apiDeleteAccount(confirmation_token: string, confirmation_text: string): Promise<void> {
+  const token = getToken()
   const res = await apiFetch('/api/auth/me', {
     method: 'DELETE', headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ confirmation_token, confirmation_text }),
   })
   if (!res.ok) throw new Error(await errorMessage(res, '未能确认注销结果，请重新登录查看账号状态后再试'))
+  if (getToken() !== token && hasAuthToken()) throw new Error('原账号已注销，当前登录状态已变更')
   clearAuth()
 }
 
@@ -515,10 +536,7 @@ export async function uploadFiles(projectId: string, files: File[], { onProgress
     xhr.upload.onprogress = event => onProgress?.(event.lengthComputable && event.total > 0
       ? Math.floor(event.loaded / event.total * 100) : null)
     xhr.upload.onload = () => onUploaded?.()
-    xhr.onload = () => {
-      if (xhr.status === 401 && getToken() === token) { clearAuth(); unauthorizedHandler?.() }
-      resolve(new Response(xhr.responseText, { status: xhr.status }))
-    }
+    xhr.onload = () => resolve(new Response(xhr.responseText, { status: xhr.status }))
     xhr.onerror = () => reject(new Error('上传连接失败，请检查网络'))
     xhr.onabort = () => reject(new DOMException('上传已取消', 'AbortError'))
     xhr.onloadend = () => signal?.removeEventListener('abort', abort)
@@ -526,6 +544,7 @@ export async function uploadFiles(projectId: string, files: File[], { onProgress
     signal?.addEventListener('abort', abort, { once: true })
     xhr.send(form)
   })
+  if (res.status === 401) await handleUnauthorized(token, signal)
   if (!res.ok) throw new Error(await errorMessage(res, '上传失败'))
   return res.json()
 }

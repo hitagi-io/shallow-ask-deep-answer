@@ -20,7 +20,7 @@ const names: Record<string, string> = {
 <template>
   <ul class="execution-steps" :class="{ nested }">
     <li v-for="step in steps" :key="step.span.span_id">
-      <component :is="step.hasChildren ? 'details' : 'div'" class="execution-step" :class="{ phase: step.hasChildren }" :open="step.hasChildren && step.depth === 0 ? true : undefined">
+      <component :is="step.hasChildren ? 'details' : 'div'" class="execution-step" :class="{ phase: step.hasChildren }" :open="step.hasChildren && !nested ? true : undefined">
         <component :is="step.hasChildren ? 'summary' : 'div'" class="step-summary">
           <span class="step-number">{{ step.stepNumber }}</span>
           <span class="step-content">

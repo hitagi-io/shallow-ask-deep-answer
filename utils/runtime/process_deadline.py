@@ -21,7 +21,6 @@ async def run_isolated_json(module: str, payload: dict, timeout_seconds: float) 
     """与独立运行的 Python 模块交换一组 JSON 请求和结果；启动耗时计入总时限。"""
     if timeout_seconds <= 0:
         raise TimeoutError("检查执行超时")
-    process = None
     startup = None
     communicate = None
     expires_at = time.monotonic() + timeout_seconds
@@ -60,37 +59,33 @@ async def run_isolated_json(module: str, payload: dict, timeout_seconds: float) 
         # 上一轮扫描仍持有套接字或锁时，不释放并发名额，也不启动替代扫描。
         # 清理过程不受调用方取消影响。
         async def cleanup():
-            nonlocal process
-            if process is None and startup is not None:
+            if startup is None:
+                return
+            try:
+                process = await startup
+            except Exception:
+                return  # Popen 失败时没有子进程可回收。
+            if process.poll() is None:
                 try:
-                    process = await startup
-                except Exception:
-                    return
-            if process is not None:
-                if process.poll() is None:
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-                if communicate is None:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            if communicate is None:
+                with process.stdin, process.stdout:
                     await loop.run_in_executor(executor, process.wait)
-                    if process.stdin is not None:
-                        process.stdin.close()
-                    if process.stdout is not None:
-                        process.stdout.close()
-            if communicate is not None:
+            else:
                 await asyncio.gather(communicate, return_exceptions=True)
 
         cleanup_task = asyncio.create_task(cleanup())
         cancelled = False
-        while not cleanup_task.done():
-            try:
-                await asyncio.shield(cleanup_task)
-            except asyncio.CancelledError:
-                # 原操作的取消会继续向上传播；即使再次收到取消，
-                # 也必须回收子进程，不能使其成为孤儿进程。
-                cancelled = True
         try:
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    # 原操作的取消会继续向上传播；即使再次收到取消，
+                    # 也必须回收子进程，不能使其成为孤儿进程。
+                    cancelled = True
             cleanup_task.result()
         finally:
             executor.shutdown(wait=True, cancel_futures=True)

@@ -23,8 +23,10 @@ from utils.core.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
 from utils.core.logging_config import get_logger
 from rag.index_manifest import ManifestStore
 from utils.indexing.upload_tasks import UploadTaskStore
+from utils.indexing.upload_quota import UploadLimits, UploadReservation, claim_upload, discard_upload, reserve_upload
 from utils.observability.schema import migrate
-from utils.observability.audit import append_audit
+from utils.observability.audit import append_audit, resource_digest
+from utils.runtime.auth_ingress import AuthIngress
 from utils.chat.outcome import ResultKind
 
 logger = get_logger(__name__)
@@ -55,8 +57,16 @@ LOGIN_ACCOUNT_IP_WINDOW_SECONDS = int(os.getenv("LOGIN_ACCOUNT_IP_WINDOW_SECONDS
 REGISTER_RATE_LIMIT = int(os.getenv("REGISTER_RATE_LIMIT", "5"))
 REGISTER_RATE_WINDOW_SECONDS = int(os.getenv("REGISTER_RATE_WINDOW_SECONDS", "3600"))
 
+auth_ingress = {
+    "auth.login": AuthIngress(LOGIN_IP_RATE_LIMIT, int(os.getenv("LOGIN_WORKER_RATE_LIMIT", "300")),
+                              LOGIN_IP_RATE_WINDOW_SECONDS),
+    "account.register": AuthIngress(REGISTER_RATE_LIMIT, int(os.getenv("REGISTER_WORKER_RATE_LIMIT", "120")),
+                                    REGISTER_RATE_WINDOW_SECONDS),
+}
+
 # 对话并发槽位的跨进程咨询锁（advisory lock）命名空间（二参数形式：classid, user_id）。
 _CHAT_SLOT_LOCK_CLASS = 0x64656573
+_SUBSCRIPTION_LOCK_CLASS = 0x64656574
 _CONVERSATION_CREATE_LOCK_CLASS = 0x64656563
 _ACCOUNT_LOCK_CLASS = 0x64656561
 
@@ -235,6 +245,23 @@ def init_db():
                     "ON chat_slots (user_id)"
                 )
                 UploadTaskStore.setup(cur)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS revoked_access_sessions (
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        session_id TEXT NOT NULL,
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (user_id, session_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_revoked_sessions_expiry ON revoked_access_sessions(expires_at);
+                    CREATE TABLE IF NOT EXISTS chat_subscriptions (
+                        token UUID PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        session_id TEXT NOT NULL,
+                        auth_version INTEGER NOT NULL,
+                        expires_at TIMESTAMPTZ NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_chat_subscriptions_user ON chat_subscriptions(user_id, expires_at);
+                """)
                 ManifestStore.setup(cur)
                 migrate(cur)
             conn.commit()
@@ -276,12 +303,14 @@ def _validate_password(password: str) -> str | None:
 
 
 
-def _create_token(user_id: int, username: str, auth_version: int = 0) -> str:
+def _create_token(user_id: int, username: str, auth_version: int = 0, *,
+                  session_id: str | None = None, expires_at: int | None = None) -> str:
     payload = {
         "user_id": user_id,
         "username": username,
         "auth_version": auth_version,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS),
+        "jti": session_id or uuid.uuid4().hex,
+        "exp": expires_at if expires_at is not None else datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
@@ -289,21 +318,77 @@ def _create_token(user_id: int, username: str, auth_version: int = 0) -> str:
 def verify_token(token: str) -> dict | None:
     """验证 JWT，返回 payload 或 None。"""
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return payload if payload.get("purpose", "access") == "access" else None
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], options={"require": ["user_id", "exp"]})
+        if payload.get("purpose", "access") != "access" or type(payload["user_id"]) is not int:
+            return None
+        # 旧版令牌没有逐次登录标识，它们按账号和凭证版本一起撤销。
+        payload.setdefault("jti", f"legacy-{payload.get('auth_version', 0)}")
+        return payload
     except jwt.PyJWTError:
         return None
 
 
-def get_user_by_id(user_id: int) -> dict | None:
-    """按 id 查询用户及凭证版本（不缓存）；不存在返回 None。"""
+def get_session_user(user_id: int, session_id: str) -> dict | None:
+    """在同一条查询中核对账号与当前会话。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT id, username, auth_version FROM users WHERE id = %s",
-                (user_id,),
+                "SELECT id, username, auth_version FROM users WHERE id = %s AND NOT EXISTS "
+                "(SELECT 1 FROM revoked_access_sessions WHERE user_id=users.id AND session_id=%s)",
+                (user_id, session_id),
             )
             return cur.fetchone()
+
+
+def revoke_session(user: dict) -> None:
+    expires = ("infinity" if user["session_id"].startswith("legacy-") else
+               datetime.fromtimestamp(user["expires_at"], timezone.utc))
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO revoked_access_sessions (user_id, session_id, expires_at) "
+                        "VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                        (user["user_id"], user["session_id"], expires))
+            append_audit(cur, user_id=user["user_id"], action="auth.logout", resource_type="account",
+                         resource_id=str(user["user_id"]), result="succeeded")
+        conn.commit()
+
+
+def audit_login_result(action: str, username: str, user_id: int | None, error: str | None = None) -> None:
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            append_audit(cur, user_id=user_id, action=action, resource_type="account",
+                         resource_id=str(user_id) if user_id is not None else resource_digest(username),
+                         result="denied" if error else "succeeded", error_code=error)
+        conn.commit()
+
+
+def maintain_access_limits() -> None:
+    with _connection() as conn:
+        conn.execute("DELETE FROM revoked_access_sessions WHERE expires_at <= now()")
+        conn.execute("DELETE FROM chat_subscriptions WHERE expires_at <= now()")
+        conn.execute("DELETE FROM upload_daily_usage WHERE usage_day < (now() AT TIME ZONE 'UTC')::date - 2")
+        with conn.cursor() as cur:
+            cur.execute("SELECT token FROM upload_receivers WHERE expires_at <= now() "
+                        "ORDER BY expires_at LIMIT 32 FOR UPDATE SKIP LOCKED")
+            for (token,) in cur.fetchall():
+                try:
+                    with conn.transaction():
+                        discard_upload(cur, str(token))
+                except (OSError, ValueError):
+                    logger.exception("[上传] 回收中断请求的暂存文件失败，将稍后重试")
+        conn.commit()
+    for action, limiter in auth_ingress.items():
+        count = limiter.take_denied()
+        if count:
+            try:
+                with _connection() as conn:
+                    with conn.cursor() as cur:
+                        append_audit(cur, user_id=None, action=action, resource_type="account", resource_id="",
+                                     result="denied", error_code="rate_limited", details={"count": count}, system=True)
+                    conn.commit()
+            except Exception:
+                limiter.record_denied(count)
+                raise
 
 
 _RATE_PURGE_PROBABILITY = 0.01
@@ -372,7 +457,7 @@ def consume_rate_limit(scope: str, key: str, limit: int, window_seconds: int) ->
 def register(username: str, password: str, ip: str | None = None) -> dict:
     """注册新用户。返回 {'ok': True} 或 {'ok': False, 'error': ...}。"""
     username = username.strip()
-    if not username or len(username) < 2:
+    if len(username) < 2:
         return {"ok": False, "error": "用户名至少 2 个字符"}
     if len(username) > USERNAME_MAX_LENGTH:
         return {"ok": False, "error": f"用户名最长 {USERNAME_MAX_LENGTH} 个字符"}
@@ -439,7 +524,6 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
             _rate_lock_keys(cur, [(scope, key) for scope, key, _, _ in checks])
             for scope, key, limit, window in checks:
                 if _rate_exceeded(cur, scope, key, limit, window, now):
-                    conn.rollback()
                     return {"ok": False, "error": "尝试过于频繁，请稍后再试", "rate_limited": True}
 
             _rate_record(cur, "login_acct", username, now)
@@ -526,6 +610,35 @@ def project_access(user_id: int, project_id: str):
         yield project
 
 
+@contextmanager
+def _upload_project_transaction(user_id: int, project_id: str):
+    with _connection() as conn, conn.transaction(), conn.cursor() as cur:
+        cur.execute("SELECT id FROM projects WHERE id=%s AND user_id=%s AND deleted_at IS NULL FOR SHARE",
+                    (project_id, user_id))
+        yield cur if cur.fetchone() is not None else None
+
+
+def reserve_upload_request(user_id: int, project_id: str, request_bytes: int, limits: UploadLimits,
+                           lifetime: int) -> UploadReservation | None:
+    with _upload_project_transaction(user_id, project_id) as cur:
+        if cur is None:
+            return None
+        return reserve_upload(cur, user_id, project_id, request_bytes, limits, lifetime)
+
+
+def release_upload_request(token: str) -> None:
+    with _connection() as conn, conn.transaction(), conn.cursor() as cur:
+        discard_upload(cur, token)
+
+
+@contextmanager
+def upload_admission(user_id: int, project_id: str, directory: str, incoming: int, limits: UploadLimits, token: str):
+    with _upload_project_transaction(user_id, project_id) as cur:
+        if cur is not None:
+            claim_upload(cur, user_id, directory, incoming, limits, token)
+        yield cur
+
+
 def account_write_access(cur, user_id: int) -> None:
     """与注销互斥；等待结束后重新验证账号，防止旧请求在删除后创建数据。"""
     cur.execute("SELECT pg_advisory_xact_lock_shared(%s, %s)", (_ACCOUNT_LOCK_CLASS, user_id))
@@ -563,7 +676,7 @@ def update_project(user_id: int, project_id: str, name: str) -> dict | None:
         return project
 
 
-def delete_project(user_id: int, project_id: str, stale_seconds: float = 120, cleanup=None) -> dict:
+def delete_project(user_id: int, project_id: str, stale_seconds: float, cleanup: Callable[[list[str]], None]) -> dict:
     """清理项目资料并保留项目删除标记及历史会话；运行中拒绝删除。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -585,8 +698,7 @@ def delete_project(user_id: int, project_id: str, stale_seconds: float = 120, cl
             if cur.fetchone() is not None:
                 conn.commit()
                 return {"status": "busy", "conversation_ids": conversation_ids}
-        if cleanup is not None:
-            cleanup(conversation_ids)
+        cleanup(conversation_ids)
         with conn.cursor() as cur:
             cur.execute("DELETE FROM upload_tasks WHERE project_id = %s AND user_id = %s", (project_id, user_id))
             # 保留项目身份供历史引用识别；文档、索引及模型上下文由 cleanup 清理。
@@ -596,6 +708,10 @@ def delete_project(user_id: int, project_id: str, stale_seconds: float = 120, cl
                          resource_id=project_id, project_id=project_id, result="succeeded")
         conn.commit()
         return {"status": "deleted", "conversation_ids": conversation_ids}
+
+
+class InvalidConversationCursor(ValueError):
+    """会话列表的客户端分页游标无法解码。"""
 
 
 def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None) -> dict:
@@ -608,8 +724,8 @@ def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None)
             stamp = datetime.fromisoformat(stamp)
             if stamp.tzinfo is not None or not isinstance(conv_id, str) or not 1 <= len(conv_id) <= 36:
                 raise ValueError()
-        except (ValueError, TypeError, UnicodeError) as exc:
-            raise ValueError("无效的会话分页游标") from exc
+        except (ValueError, TypeError) as exc:
+            raise InvalidConversationCursor("无效的会话分页游标") from exc
         boundary = " AND (c.updated_at, c.id) < (%s, %s)"
         params.extend([stamp, conv_id])
     params.append(limit + 1)
@@ -777,11 +893,17 @@ _GENERATION_REPLAY_QUERY = f"""
 """
 _GENERATION_SNAPSHOT_QUERY = f"""
     SELECT {_GENERATION_FIELDS},
+           CASE WHEN %s THEN ARRAY(
+               SELECT s.token::text FROM chat_subscriptions s
+               WHERE s.user_id=account.id AND s.auth_version=account.auth_version AND s.expires_at>now()
+                 AND NOT EXISTS (SELECT 1 FROM revoked_access_sessions r
+                                 WHERE r.user_id=s.user_id AND r.session_id=s.session_id)
+           ) END AS subscriber_tokens,
            g.status = 'running' AND g.heartbeat_at < now() - make_interval(secs => %s) AS stale
     FROM users account
-    LEFT JOIN generations g ON g.user_id = account.id AND g.conversation_id = %s AND g.request_id = %s
+    JOIN generations g ON g.user_id = account.id AND g.conversation_id = %s AND g.request_id = %s
     {_GENERATION_JOINS}
-    WHERE account.id = %s AND (%s::int IS NULL OR account.auth_version = %s)
+    WHERE account.id = %s
 """
 
 
@@ -875,10 +997,8 @@ def begin_generation(
             )
             conversation = cur.fetchone()
             if conversation is None:
-                conn.rollback()
                 return {"status": "not_found"}
             if conversation["kb_only"] is not None and conversation["kb_only"] != kb_only:
-                conn.rollback()
                 return {"status": "conversation_mode_conflict"}
             if conversation["kb_only"] is not None and conversation["project_id"] != project_id:
                 return {"status": "conversation_project_conflict"}
@@ -896,6 +1016,9 @@ def begin_generation(
                 if existing["user_content"] != content or existing["retry_of"] != retry_of:
                     return {"status": "content_conflict"}
                 return {"status": "replay", "generation": existing}
+
+            if project_id is not None and UploadTaskStore.project_has_active(cur, user_id, project_id):
+                return {"status": "upload_active"}
 
             cur.execute("SELECT 1 FROM generations WHERE conversation_id = %s AND status = 'running'",
                         (conv_id,))
@@ -955,14 +1078,32 @@ def begin_generation(
         }
 
 
-class StreamAccessRevoked(Exception):
-    """账号已注销或凭证已撤销，已建立的 SSE 应立即关闭。"""
+def acquire_subscription(user: dict, limit: int, lifetime: int) -> str | None:
+    """短事务占用账号订阅额度；发送 SSE 期间不持有数据库连接。"""
+    user_id = user["user_id"]
+    token = str(uuid.uuid4())
+    with _connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s,%s)", (_SUBSCRIPTION_LOCK_CLASS, user_id))
+        row = conn.execute("""
+            INSERT INTO chat_subscriptions(token,user_id,session_id,auth_version,expires_at)
+            SELECT %s,%s,%s,%s,LEAST(to_timestamp(%s),clock_timestamp()+make_interval(secs => %s))
+            WHERE (SELECT count(*) FROM chat_subscriptions WHERE user_id=%s AND expires_at>clock_timestamp()) < %s
+            RETURNING token
+        """, (token, user_id, user["session_id"], user["auth_version"], user["expires_at"], lifetime, user_id, limit)).fetchone()
+        conn.commit()
+    return token if row else None
+
+
+def release_subscription(token: str) -> None:
+    with _connection() as conn:
+        conn.execute("DELETE FROM chat_subscriptions WHERE token=%s", (token,))
+        conn.commit()
 
 
 def get_generation(user_id: int, conv_id: str, request_id: str, stale_seconds: float,
-                   *, auth_version: int | None = None) -> dict | None:
+                   *, include_subscribers: bool = False) -> dict | None:
     """在同一条查询中核对凭证、读取快照并检查心跳，仅失联时执行补偿。"""
-    params = (stale_seconds, conv_id, request_id, user_id, auth_version, auth_version)
+    params = (include_subscribers, stale_seconds, conv_id, request_id, user_id)
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(_GENERATION_SNAPSHOT_QUERY, params)
@@ -972,10 +1113,10 @@ def get_generation(user_id: int, conv_id: str, request_id: str, stale_seconds: f
                 cur.execute(_GENERATION_SNAPSHOT_QUERY, params)
                 row = cur.fetchone()
         conn.commit()
-    if row is None and auth_version is not None:
-        raise StreamAccessRevoked
-    if row is None or row["id"] is None:
+    if row is None:
         return None
+    if not include_subscribers:
+        del row["subscriber_tokens"]
     del row["stale"]
     row["elapsed_seconds"] = float(row["elapsed_seconds"])
     return row
@@ -1038,7 +1179,6 @@ def finish_generation(
             )
             row = cur.fetchone()
             if row is None or row["status"] != "running":
-                conn.rollback()
                 return None
             if row["cancel_requested"]:
                 status, message_status, error = "cancelled", "cancelled", "已停止回答。"
@@ -1094,45 +1234,38 @@ def delete_conversation_guarded(
     业务数据保持原样。返回 'deleted' | 'busy' | 'not_found'。
     """
     with _connection() as conn:
-        try:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
-                cur.execute(
-                    "SELECT id FROM conversations WHERE id = %s AND user_id = %s FOR UPDATE",
-                    (conv_id, user_id),
-                )
-                if cur.fetchone() is None:
-                    conn.rollback()
-                    return "not_found"
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
+            cur.execute(
+                "SELECT id FROM conversations WHERE id = %s AND user_id = %s FOR UPDATE",
+                (conv_id, user_id),
+            )
+            if cur.fetchone() is None:
+                return "not_found"
 
-                _reap_stale_generations(cur, conv_id, stale_seconds)
+            _reap_stale_generations(cur, conv_id, stale_seconds)
+            cur.execute(
+                "SELECT id FROM generations "
+                "WHERE conversation_id = %s AND status = 'running' LIMIT 1",
+                (conv_id,),
+            )
+            if cur.fetchone() is not None:
                 cur.execute(
-                    "SELECT id FROM generations "
-                    "WHERE conversation_id = %s AND status = 'running' LIMIT 1",
+                    "UPDATE generations SET cancel_requested = TRUE "
+                    "WHERE conversation_id = %s AND status = 'running'",
                     (conv_id,),
                 )
-                if cur.fetchone() is not None:
-                    cur.execute(
-                        "UPDATE generations SET cancel_requested = TRUE "
-                        "WHERE conversation_id = %s AND status = 'running'",
-                        (conv_id,),
-                    )
-                    conn.commit()
-                    return "busy"
+                conn.commit()
+                return "busy"
 
-            # 检查点清理可能包含重试等待，放在同一持锁事务内完成：
-            # 期间其他进程无法登记新的生成任务；失败则回滚，业务数据不受影响。
+            # 清理和删除共用持锁事务，失败时由 _connection 回滚。
             cleanup()
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM conversations WHERE id = %s AND user_id = %s",
-                    (conv_id, user_id),
-                )
-            conn.commit()
-            return "deleted"
-        except Exception:
-            conn.rollback()
-            raise
+            cur.execute(
+                "DELETE FROM conversations WHERE id = %s AND user_id = %s",
+                (conv_id, user_id),
+            )
+        conn.commit()
+        return "deleted"
 
 
 def acquire_chat_slot(

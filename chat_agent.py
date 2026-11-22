@@ -1,5 +1,6 @@
 """主 Agent 装配：双模式提示词、工具和流式运行时策略。"""
 
+import asyncio
 import os
 import threading
 import json
@@ -7,6 +8,7 @@ from collections import OrderedDict
 from datetime import date
 from string import Template
 
+from langchain_tavily import TavilySearch
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware, ToolCallLimitMiddleware, dynamic_prompt
 from langchain.agents.middleware.types import ModelRequest
@@ -34,7 +36,6 @@ from utils.observability.context import remaining_seconds, ExecutionStopped, Exe
 from utils.chat.search_results import SEARCH_CONTENT_LIMIT, SEARCH_MAX_CALLS, SEARCH_RESULT_LIMIT, format_search_response
 from rag.retrieval_agent import build_retrieval_subagent
 from utils.core.project_paths import knowledge_scope
-from langchain_tavily import TavilySearch
 from langchain_core.tools import tool
 from dotenv import load_dotenv
 load_dotenv(override=True)
@@ -47,9 +48,6 @@ _PG_CONNECTION_STRING = os.getenv(
 
 PG_CHECKPOINT_POOL_MIN = int(os.getenv("PG_CHECKPOINT_POOL_MIN", "2"))
 PG_CHECKPOINT_POOL_MAX = int(os.getenv("PG_CHECKPOINT_POOL_MAX", "20"))
-
-_tavily: TavilySearch | None = None
-_tavily_lock: threading.Lock = threading.Lock()
 
 def _inject_current_date(base_prompt: str) -> str:
     """在系统提示末尾追加当天日期；每次模型调用时读取，避免跨天后日期过期。"""
@@ -75,13 +73,21 @@ def build_date_prompt_middleware(static_prompt: str):
     return dynamic_prompt(_prompt)
 
 
-def _get_tavily() -> TavilySearch:
-    global _tavily
-    if _tavily is None:
-        with _tavily_lock:
-            if _tavily is None:
-                _tavily = TavilySearch(max_results=SEARCH_RESULT_LIMIT, include_answer=True)
-    return _tavily
+async def _tavily_raw_results(query: str, api_key: str) -> dict:
+    # 高层工具将空 results 转为异常；原始响应还可能含有可用的 answer。
+    wrapper = TavilySearch(tavily_api_key=api_key).api_wrapper
+    timeout = agent_config["llm_request_timeout_seconds"]
+    remaining = remaining_seconds()
+    if remaining is not None:
+        timeout = min(timeout, remaining)
+    async with asyncio.timeout(timeout):
+        return await wrapper.raw_results_async(
+            query=query, max_results=SEARCH_RESULT_LIMIT, include_answer=True,
+            search_depth=None, include_domains=None, exclude_domains=None,
+            include_raw_content=None, include_images=None, include_image_descriptions=None,
+            include_favicon=None, topic=None, time_range=None, country=None,
+            auto_parameters=None, start_date=None, end_date=None, include_usage=None, exact_match=None,
+        )
 
 
 @tool
@@ -109,15 +115,23 @@ def tavily_search(query: str) -> str:
             __SEARCH_EMPTY__。仅整条结果精确等于标记时按失败处理。
     """
     try:
-        with span("tool.tavily_search"):
+        with span("tool.tavily_search") as search:
             remaining_seconds()
-            resp = _get_tavily().invoke(query)
+            api_key = os.getenv("TAVILY_API_KEY")
+            if not api_key:
+                search.fail("missing_api_key")
+                return SEARCH_ERROR_MARKER
+            result = format_search_response(asyncio.run(_tavily_raw_results(query, api_key)))
+            if result == SEARCH_ERROR_MARKER:
+                search.fail("invalid_search_response")
+            remaining_seconds()
+            return result
     except (ExecutionStopped, ExecutionDeadlineExceeded):
         raise
     except Exception as e:
-        logger.error(f"[联网搜索] 搜索请求失败，已向模型返回故障标记：{e}")
+        remaining_seconds()
+        logger.error("[联网搜索] 搜索请求失败：%s", type(e).__name__)
         return SEARCH_ERROR_MARKER
-    return format_search_response(resp)
 
 
 tavily_search.description = Template(tavily_search.description).substitute(

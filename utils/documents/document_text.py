@@ -27,21 +27,16 @@ def document(text: str, source: str, locator: str = "", *, page: int = 0, extrac
 
 def table_documents(rows, source: str, locator: str, *, context="", **metadata) -> list[Document]:
     """逐行保留列号及首行上下文；空值不前向填充，首行不冒充已确认的表头。"""
-    rows = [[clean_text(str(cell)) if cell is not None else "" for cell in row] for row in rows]
-    if not rows or not any(any(row) for row in rows):
-        return []
-
-    def render(row):
-        return "；".join(f"第 {i} 列: {cell or '（空）'}" for i, cell in enumerate(row, 1))
-
-    first = next(i for i, row in enumerate(rows) if any(row))
     result = []
-    for index, row in enumerate(rows):
+    context_prefix = f"表格前文: {clean_text(context)}\n\n" if context else ""
+    first_row = ""
+    for index, cells in enumerate(rows):
+        row = [clean_text(str(cell)) if cell is not None else "" for cell in cells]
         if not any(row):
             continue
-        prefix = f"表格前文: {clean_text(context)}\n\n" if context else ""
-        if index > first:
-            prefix += f"表格首个非空行（第 {first + 1} 行）: {render(rows[first])}\n\n"
-        result.extend(document(f"{prefix}第 {index + 1} 行: {render(row)}", source,
+        rendered = "；".join(f"第 {i} 列: {cell or '（空）'}" for i, cell in enumerate(row, 1))
+        result.extend(document(f"{context_prefix}{first_row}第 {index + 1} 行: {rendered}", source,
                                f"{locator} · 第 {index + 1} 行", **metadata))
+        if not first_row:
+            first_row = f"表格首个非空行（第 {index + 1} 行）: {rendered}\n\n"
     return result

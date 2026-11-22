@@ -36,7 +36,7 @@ class HealthScanRunner:
             raise TimeoutError("索引检查超时，请稍后重试")
         if result.get("error"):
             raise RuntimeError("索引检查失败，详情见服务端日志")
-        return result["snapshot"]
+        return result["report"]
 
 
 def _scan_project(request: dict) -> dict:
@@ -51,14 +51,14 @@ def _scan_project(request: dict) -> dict:
     remaining = expires_at - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("检查初始化超时")
-    statement_ms = max(1, math.ceil(remaining * 1000))
+    statement_ms = math.ceil(remaining * 1000)
     lock_ms = max(1, math.ceil(min(remaining, request["lock_timeout_seconds"]) * 1000))
     options = conninfo_to_dict(request["conninfo"]).get("options", "")
     options = f"{options} -c statement_timeout={statement_ms} -c lock_timeout={lock_ms}".strip()
     # 扫描进程在同一个事务中持有项目锁和咨询锁。
     # 关闭连接或终止进程即可释放两种锁，无需额外的解锁请求。
     with psycopg.connect(
-        request["conninfo"], connect_timeout=max(1, math.ceil(remaining)),
+        request["conninfo"], connect_timeout=math.ceil(remaining),
         options=options,
     ) as conn:
         conn.execute("SELECT pg_advisory_xact_lock_shared(%s)", (
@@ -72,18 +72,19 @@ def _scan_project(request: dict) -> dict:
             return {"error": "not_found"}
         health = IndexHealth(request["user_id"], request["project_id"])
         try:
-            snapshot = health.snapshot()
+            return {"report": health.check()}
         finally:
             health.vector_store.vector_store.client.close()
-    return {"snapshot": snapshot}
 
 
 def _main():
+    from psycopg.errors import LockNotAvailable, QueryCanceled
+
     request = json.load(sys.stdin)
     with redirect_stdout(sys.stderr):
         try:
             result = _scan_project(request)
-        except TimeoutError:
+        except (TimeoutError, LockNotAvailable, QueryCanceled):
             result = {"error": "timeout"}
         except Exception:
             import logging

@@ -12,14 +12,16 @@ import stat
 from pathlib import Path
 from uuid import UUID
 from functools import partial
+from collections import defaultdict
 from collections.abc import Callable
 from contextlib import ExitStack, asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header, Request, Query
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, Query
+from starlette.datastructures import UploadFile
 
 import anyio
 import psycopg
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from chat_agent import ChatAgent, PG_CHECKPOINT_POOL_MAX
@@ -28,12 +30,14 @@ from rag.vector_store import get_vector_store
 from rag.index_health import IndexHealth
 from rag.index_manifest import ManifestStore, current_index_version, project_collection_name
 from utils.documents.knowledge_files import list_supported_files
-from utils.documents.file_listing import FileFilter, FileSort, KnowledgeFile, paginate_files, summarize_files
+from utils.documents.upload_form import upload_form, upload_request_size
+from utils.documents.file_listing import NAME_SORTS, FileFilter, FilePage, FileSort, KnowledgeFile, paginate_files, summarize_files
 from utils.retrieval.source_evidence import SourceVersionChanged, read_source_passage
 from utils.core.config_loader import vector_db_config
 from utils.core.project_paths import get_knowledge_dir, get_knowledge_storage_root, scoped_knowledge_file
 from utils.core.pg_lock import SingleInstanceGuard, exclusive_section, shared_section, project_index_lock_key
 from utils.chat.generation_runner import run_generation
+from utils.chat.subscriptions import POLL_SECONDS, SubscriptionResponse, watch_generation
 from utils.observability.context import ExecutionContext, bind_context, current_context
 from utils.observability.tracing import span, start_tracing, stop_tracing
 from utils.observability.audit import AuditResult, audit_operation, resource_digest, configure_audit
@@ -46,6 +50,7 @@ from utils.runtime.request_wait import wait_for_client
 from utils.runtime.shutdown import ServiceStopping, check_shutdown, request_shutdown, reset_shutdown
 from utils.core.logging_config import configure_logging, get_logger
 from utils.indexing.upload_tasks import UploadTaskStore
+from utils.indexing.upload_quota import UploadLimits, UploadQuotaExceeded, staged_upload_prefix
 from utils.indexing.progress import IndexProgress
 from auth import (
     PASSWORD_MAX_LENGTH,
@@ -57,14 +62,20 @@ from auth import (
     login,
     consume_rate_limit,
     verify_token,
-    get_user_by_id,
+    get_session_user,
+    revoke_session,
+    auth_ingress,
+    audit_login_result,
+    maintain_access_limits,
+    InvalidConversationCursor,
     list_conversations,
     list_messages,
     create_conversation,
     update_conversation_title,
     begin_generation,
     get_generation,
-    StreamAccessRevoked,
+    acquire_subscription,
+    release_subscription,
     cancel_generation,
     save_generation_progress,
     finish_generation,
@@ -79,6 +90,9 @@ from auth import (
     update_project,
     delete_project,
     project_access,
+    reserve_upload_request,
+    release_upload_request,
+    upload_admission,
     list_project_scopes,
 )
 from accounts import AccountError, update_account, prepare_deletion, delete_account
@@ -100,6 +114,9 @@ CHAT_RATE_LIMIT = int(os.getenv("CHAT_RATE_LIMIT", "30"))
 CHAT_RATE_WINDOW_SECONDS = int(os.getenv("CHAT_RATE_WINDOW_SECONDS", "60"))
 # 0 表示不限制同一用户同时生成的会话数；正数可恢复并发上限。
 MAX_CONCURRENT_CHAT_PER_USER = int(os.getenv("MAX_CONCURRENT_CHAT_PER_USER", "0"))
+MAX_CHAT_SUBSCRIPTIONS_PER_USER = int(os.getenv("MAX_CHAT_SUBSCRIPTIONS_PER_USER", "4"))
+if MAX_CHAT_SUBSCRIPTIONS_PER_USER < 1:
+    raise ValueError("每账号聊天订阅数上限必须为正整数")
 CHAT_SLOT_MAX_AGE_SECONDS = int(os.getenv("CHAT_SLOT_MAX_AGE_SECONDS", "1800"))
 
 # 端到端生成截止时间：超过后服务端将该任务置为 failed，不再无限等待模型。
@@ -115,6 +132,7 @@ if CHAT_GENERATION_STALE_SECONDS < CHAT_GENERATION_SAVE_SECONDS * 3:
     raise ValueError("CHAT_GENERATION_STALE_SECONDS 必须不小于保存间隔的 3 倍")
 
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+UPLOAD_ACTIVE_DETAIL = "资料正在上传、入库或仍需恢复，请稍后重试；中断的任务请执行“修复与补建”"
 
 # 就绪检查的总时限（秒），覆盖进程启动、建连、查询及 RPC。
 READINESS_TIMEOUT_SECONDS = float(os.getenv("READINESS_TIMEOUT_SECONDS", "3"))
@@ -131,7 +149,7 @@ def _warn_connection_budget() -> None:
         with psycopg.connect(PG_CONN) as conn, conn.cursor() as cur:
             cur.execute("SHOW max_connections")
             max_conn = int(cur.fetchone()[0])
-    except Exception as e:
+    except psycopg.Error as e:
         logger.warning(f"[启动] 无法读取 PostgreSQL 的 max_connections，跳过连接预算检查：{e}")
         return
     detail = f"workers={UVICORN_WORKERS} × (检查点池 {PG_CHECKPOINT_POOL_MAX} + 业务池 {PG_POOL_MAX} + Trace 写入 1) = {need}"
@@ -208,6 +226,7 @@ async def request_context(request: Request, call_next):
 async def _recovery_loop(stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
+            await asyncio.to_thread(maintain_access_limits)
             await asyncio.to_thread(reap_stale_generations, CHAT_GENERATION_STALE_SECONDS)
             await asyncio.to_thread(prune_observability, PG_CONN)
         except Exception:
@@ -222,6 +241,15 @@ agent: ChatAgent
 allowed_types = vector_db_config["allowed_types"]
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "50"))
+MAX_UPLOAD_REQUEST_MB = int(os.getenv("MAX_UPLOAD_REQUEST_MB", str(2 * MAX_UPLOAD_MB + 1)))
+UPLOAD_RECEIVE_TIMEOUT_SECONDS = int(os.getenv("UPLOAD_RECEIVE_TIMEOUT_SECONDS", "1800"))
+UPLOAD_LIMITS = UploadLimits(
+    storage_bytes=int(os.getenv("ACCOUNT_STORAGE_MB", "1024")) * 1024**2,
+    daily_bytes=int(os.getenv("ACCOUNT_DAILY_UPLOAD_MB", "250")) * 1024**2,
+    pending_tasks=int(os.getenv("ACCOUNT_PENDING_UPLOAD_TASKS", "8")),
+)
+if min(MAX_UPLOAD_MB, MAX_UPLOAD_REQUEST_MB, UPLOAD_RECEIVE_TIMEOUT_SECONDS) < 1:
+    raise ValueError("上传文件、请求大小和接收时限必须为正数")
 UPLOAD_WORKERS = int(os.getenv("UPLOAD_WORKERS", "4"))
 UPLOAD_TASK_POLL_SECONDS = float(os.getenv("UPLOAD_TASK_POLL_SECONDS", "0.5"))
 if UPLOAD_WORKERS < 1:
@@ -237,7 +265,9 @@ if not math.isfinite(HEALTH_CHECK_TIMEOUT_SECONDS) or HEALTH_CHECK_TIMEOUT_SECON
     raise ValueError("HEALTH_CHECK_TIMEOUT_SECONDS 必须为不小于 0.5 的有限数值")
 if HEALTH_CHECK_MAX_CONCURRENT < 1:
     raise ValueError("HEALTH_CHECK_MAX_CONCURRENT 必须为正整数")
-_health_reports: dict[tuple[int, str], HealthReportCache] = {}
+_health_reports: defaultdict[tuple[int, str], HealthReportCache] = defaultdict(
+    lambda: HealthReportCache(HEALTH_REPORT_TTL_SECONDS)
+)
 _health_reports_lock = threading.Lock()
 _health_scanner = HealthScanRunner(HEALTH_CHECK_TIMEOUT_SECONDS, HEALTH_CHECK_MAX_CONCURRENT)
 _readiness_report = HealthReportCache(1)
@@ -245,7 +275,7 @@ _readiness_report = HealthReportCache(1)
 
 def _health_cache(user_id: int, project_id: str) -> HealthReportCache:
     with _health_reports_lock:
-        return _health_reports.setdefault((user_id, project_id), HealthReportCache(HEALTH_REPORT_TTL_SECONDS))
+        return _health_reports[user_id, project_id]
 
 
 def _invalidate_health(user_id: int, project_id: str) -> None:
@@ -256,15 +286,14 @@ def _invalidate_health(user_id: int, project_id: str) -> None:
             cache.invalidate()
 
 
-async def _request_health_snapshot(request: Request, user_id: int, project_id: str,
-                                   refresh: bool = False) -> dict:
+async def _refresh_health_report(request: Request, user_id: int, project_id: str) -> dict:
     async def check():
         return await _health_scanner.scan(user_id, project_id, PG_CONN, INDEX_READ_LOCK_TIMEOUT_SECONDS)
 
     try:
         # require_project 已完成请求鉴权；仅由共享扫描任务
         # 获取索引锁、项目锁及存储连接。
-        return await wait_for_client(request, _health_cache(user_id, project_id).get(check, refresh=refresh))
+        return await wait_for_client(request, _health_cache(user_id, project_id).get(check, refresh=True))
     except ProjectGoneError:
         raise HTTPException(status_code=404, detail="项目不存在或已被删除")
     except HealthReportInvalidated:
@@ -345,7 +374,7 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
             except Exception as e:
                 logger.error(f"[索引自动修复] 执行失败：{e}")
                 break
-        _health_cache(user_id, project_id).set({"report": report})
+        _health_cache(user_id, project_id).set(report)
         return report
 
 
@@ -682,15 +711,13 @@ def get_current_user(authorization: str = Header(None)) -> dict:
     payload = verify_token(token)
     if payload is None:
         raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
-    user_id = payload.get("user_id")
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
-    user = get_user_by_id(user_id)
+    user = get_session_user(payload["user_id"], payload["jti"])
     if user is None:
-        raise HTTPException(status_code=401, detail="账号不存在或已被注销")
+        raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
     if payload.get("auth_version", 0) != user["auth_version"]:
         raise HTTPException(status_code=401, detail="密码已更新，请重新登录")
-    return {"user_id": user["id"], "username": user["username"], "auth_version": user["auth_version"]}
+    return {"user_id": user["id"], "username": user["username"], "auth_version": user["auth_version"],
+            "session_id": payload["jti"], "expires_at": payload["exp"]}
 
 
 def require_project(project_id: UUID, user: dict = Depends(get_current_user)) -> dict:
@@ -722,30 +749,42 @@ async def readiness(request: Request):
 
 
 
+def _auth_source(request: Request, action: str) -> str:
+    ip = request.client.host if request.client else "unknown"
+    if not auth_ingress[action].allow(ip):
+        raise HTTPException(429, "尝试过于频繁，请稍后再试")
+    return ip
+
+
+def _auth_denied(action: str, username: str, result: dict, status: int) -> None:
+    if result.get("rate_limited"):
+        auth_ingress[action].record_denied()
+        raise HTTPException(429, result["error"])
+    audit_login_result(action, username, None, f"http_{status}")
+    raise HTTPException(status, result["error"])
+
+
 @app.post("/api/auth/register")
 def api_register(req: RegisterRequest, request: Request):
-    with audit_operation(None, "account.register", "account", resource_digest(req.username), transactional=True) as operation:
-        client_ip = request.client.host if request.client else None
-        result = register(req.username, req.password, client_ip)
-        if not result["ok"]:
-            raise HTTPException(
-                status_code=429 if result.get("rate_limited") else 400, detail=result["error"]
-            )
-        return {"message": "注册成功"}
+    result = register(req.username, req.password, _auth_source(request, "account.register"))
+    if not result["ok"]:
+        _auth_denied("account.register", req.username, result, 400)
+    return {"message": "注册成功"}
 
 
 @app.post("/api/auth/login")
 def api_login(req: LoginRequest, request: Request):
-    with audit_operation(None, "auth.login", "account", resource_digest(req.username)) as operation:
-        client_ip = request.client.host if request.client else None
-        result = login(req.username, req.password, client_ip)
-        if not result["ok"]:
-            raise HTTPException(
-                status_code=429 if result.get("rate_limited") else 401, detail=result["error"]
-            )
-        operation.user_id = result["user"]["id"]
-        operation.resource_id = str(operation.user_id)
-        return {"token": result["token"], "user": result["user"]}
+    result = login(req.username, req.password, _auth_source(request, "auth.login"))
+    if not result["ok"]:
+        _auth_denied("auth.login", req.username, result, 401)
+    audit_login_result("auth.login", req.username, result["user"]["id"])
+    return {"token": result["token"], "user": result["user"]}
+
+
+@app.post("/api/auth/logout")
+def api_logout(user: dict = Depends(get_current_user)):
+    revoke_session(user)
+    return {"message": "已退出登录"}
 
 
 @app.get("/api/auth/me")
@@ -757,7 +796,8 @@ def api_me(user: dict = Depends(get_current_user)):
 def api_update_account(req: UpdateAccountRequest, user: dict = Depends(get_current_user)):
     with audit_operation(user["user_id"], "account.update", "account", str(user["user_id"]), transactional=True) as operation:
         try:
-            return update_account(user["user_id"], user["auth_version"], **req.model_dump())
+            return update_account(user["user_id"], user["auth_version"], session_id=user["session_id"],
+                                  expires_at=user["expires_at"], **req.model_dump())
         except AccountError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
@@ -817,7 +857,7 @@ def api_list_conversations(
 ):
     try:
         return list_conversations(user["user_id"], limit, cursor)
-    except ValueError as exc:
+    except InvalidConversationCursor as exc:
         raise HTTPException(status_code=400, detail="无效的会话分页游标") from exc
 
 
@@ -889,10 +929,8 @@ def api_delete_conversation(conv_id: str, user: dict = Depends(get_current_user)
 
 
 
-# 跨进程计数由 chat_slots 租约表承担；本映射只保存本进程内的取消回调，用于在
-# 租约被清理（可能由其他 worker 触发）时及时停止仍然存活的上游生成。
+# 每个 worker 的事件循环登记和移除本地取消回调；跨进程计数由 chat_slots 表承担。
 _chat_slot_cancels: dict[str, Callable[[], None]] = {}
-_chat_slot_cancels_lock = threading.Lock()
 
 
 async def _acquire_chat_slot(user_id: int) -> dict:
@@ -910,29 +948,23 @@ async def _acquire_chat_slot(user_id: int) -> dict:
         CHAT_GENERATION_STALE_SECONDS,
     )
     for token in lease["reaped"]:
-        with _chat_slot_cancels_lock:
-            cancel = _chat_slot_cancels.pop(token, None)
+        cancel = _chat_slot_cancels.pop(token, None)
         if cancel is not None:
-            try:
-                cancel()
-            except Exception as e:
-                logger.error(f"[对话流] 取消超时槽位任务失败（已忽略）：{e}")
+            cancel()
     return lease
 
 
 def _bind_chat_slot_cancel(token: str, cancel) -> None:
     """把租约与生成任务的取消入口绑定，租约清理时可以停止本进程内的任务。"""
-    with _chat_slot_cancels_lock:
-        _chat_slot_cancels[token] = cancel
+    _chat_slot_cancels[token] = cancel
 
 
 async def _release_chat_slot(user_id: int, token: str) -> None:
-    with _chat_slot_cancels_lock:
-        _chat_slot_cancels.pop(token, None)
+    _chat_slot_cancels.pop(token, None)
     try:
         await asyncio.to_thread(release_chat_slot, user_id, token)
-    except Exception as e:
-        logger.error(f"[对话流] 释放并发槽位失败（将由租约过期清理）：{e}")
+    except psycopg.Error:
+        logger.exception("[对话流] 释放并发槽位失败，将由租约过期清理")
 
 
 def _sse(payload: dict) -> str:
@@ -974,41 +1006,61 @@ async def _run_generation(req: ChatRequest, user_id: int, generation_id: int, at
         await _release_chat_slot(user_id, slot)
 
 
-async def _generation_events(user_id: int, conv_id: str, request_id: str, auth_version: int):
-    previous = None
-    while True:
-        try:
-            generation = await asyncio.to_thread(
-                get_generation, user_id, conv_id, request_id, CHAT_GENERATION_STALE_SECONDS,
-                auth_version=auth_version,
-            )
-        except StreamAccessRevoked:
-            return
-        if generation is None:
-            yield _sse({"type": "error", "status": "error", "error": "未找到这次回答，请刷新页面后重试。"})
-            return
-        generation.pop("user_content")
-        # elapsed_seconds 每次读取都会变；仅内容、阶段或状态改变时推送完整快照。
-        signature = {k: v for k, v in generation.items() if k != "elapsed_seconds"}
-        if signature != previous:
-            yield _sse({"type": "snapshot", **generation})
-            previous = signature
-        if generation["status"] != "running":
-            return
-        # 持续输出注释心跳，避免代理把思考阶段的连接视为空闲。
-        yield ": keep-alive\n\n"
-        await asyncio.sleep(0.5)
+async def subscription_user(user: dict = Depends(get_current_user)):
+    lifetime = max(60, CHAT_STREAM_DEADLINE_SECONDS + 30)
+    deadline = time.monotonic() + min(lifetime, user["expires_at"] - time.time())
+    token = await anyio.to_thread.run_sync(acquire_subscription, user, MAX_CHAT_SUBSCRIPTIONS_PER_USER, lifetime)
+    if token is None:
+        raise HTTPException(429, "同时查看的回答过多，请关闭其他订阅后重试")
+    try:
+        yield {**user, "subscription": token, "stream_deadline": deadline}
+    finally:
+        with anyio.CancelScope(shield=True):
+            try:
+                await anyio.to_thread.run_sync(release_subscription, token)
+            except psycopg.Error:
+                logger.exception("[聊天] 释放订阅额度失败，将在到期后回收")
+
+
+def _generation_stream(user: dict, conv_id: str, request_id: str):
+    key = (user["user_id"], conv_id, request_id)
+    fetch = partial(get_generation, *key, CHAT_GENERATION_STALE_SECONDS, include_subscribers=True)
+
+    async def events():
+        previous = None
+        first = True
+        with watch_generation(key) as reader:
+            while time.monotonic() < user["stream_deadline"]:
+                generation = await reader.read(fetch)
+                if generation is None:
+                    yield _sse({"type": "error", "status": "error", "error": "未找到这次回答，请刷新页面后重试。"})
+                    return
+                if user["subscription"] in generation["subscriber_tokens"]:
+                    payload = {k: v for k, v in generation.items() if k not in ("user_content", "subscriber_tokens")}
+                    signature = {k: v for k, v in payload.items() if k != "elapsed_seconds"}
+                    if signature != previous:
+                        yield _sse({"type": "snapshot", **payload})
+                        previous = signature
+                    if payload["status"] != "running":
+                        return
+                    yield ": keep-alive\n\n"
+                elif not first:
+                    return
+                # 刚加入时缓存可能早于本订阅；等第一次新快照验证后才发送正文。
+                first = False
+                await asyncio.sleep(POLL_SECONDS)
+
+    return SubscriptionResponse(events(), deadline=user["stream_deadline"], headers=SSE_HEADERS)
 
 
 @app.get("/api/conversations/{conv_id}/generations/{request_id}/stream")
-async def resume_generation(conv_id: str, request_id: str, user: dict = Depends(get_current_user)):
+async def resume_generation(conv_id: str, request_id: str, user: dict = Depends(subscription_user)):
     generation = await asyncio.to_thread(
         get_generation, user["user_id"], conv_id, request_id, CHAT_GENERATION_STALE_SECONDS,
     )
     if generation is None:
         raise HTTPException(status_code=404, detail="未找到这次回答，请刷新页面后重试。")
-    return StreamingResponse(_generation_events(user["user_id"], conv_id, request_id, user["auth_version"]),
-                             media_type="text/event-stream", headers=SSE_HEADERS)
+    return _generation_stream(user, conv_id, request_id)
 
 
 @app.post("/api/conversations/{conv_id}/generations/{request_id}/cancel")
@@ -1019,7 +1071,7 @@ async def stop_generation(conv_id: str, request_id: str, user: dict = Depends(ge
 
 
 @app.post("/api/chat/stream")
-async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
+async def chat_stream(req: ChatRequest, user: dict = Depends(subscription_user)):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="消息不能为空")
     if req.kb_only and req.project_id is None:
@@ -1037,10 +1089,9 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         if existing["user_content"] != req.message or existing["retry_of"] != req.retry_of:
             raise HTTPException(status_code=409, detail="请求编号已用于不同的问题或重试，请使用新的请求编号")
         # 幂等重放和恢复只订阅已有任务，不消耗新的并发槽位或发送额度。
-        return StreamingResponse(_generation_events(user["user_id"], req.thread_id, req.request_id, user["auth_version"]),
-                                 media_type="text/event-stream", headers=SSE_HEADERS)
-    if req.kb_only and await asyncio.to_thread(_upload_task_store.has_active, user["user_id"], req.project_id):
-        raise HTTPException(status_code=409, detail="资料正在入库或仍需恢复，请查看“最近上传”；已中断的任务请执行“修复与补建”")
+        return _generation_stream(user, req.thread_id, req.request_id)
+    if req.kb_only:
+        await asyncio.to_thread(_ensure_no_uploads, user["user_id"], req.project_id)
     if not await asyncio.to_thread(
         consume_rate_limit, "chat", str(user["user_id"]), CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_SECONDS
     ):
@@ -1074,33 +1125,23 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         logger.error(f"[对话流] 登记生成任务失败 thread_id={req.thread_id}：{e}")
         raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
 
-    if begun["status"] == "not_found":
-        await _release_chat_slot(user["user_id"], slot)
-        raise HTTPException(status_code=404, detail="会话不存在或已被删除")
-    if begun["status"] == "busy":
-        await _release_chat_slot(user["user_id"], slot)
-        raise HTTPException(status_code=409, detail="当前会话已有回答正在生成，请稍后再试")
-
-    if begun["status"] == "mode_conflict":
-        await _release_chat_slot(user["user_id"], slot)
-        raise HTTPException(status_code=409, detail="请求编号已用于其他问答模式，请重新发送")
-
-    if begun["status"] == "conversation_mode_conflict":
-        await _release_chat_slot(user["user_id"], slot)
-        raise HTTPException(status_code=409, detail="此会话的问答模式已固定，请开启新对话后切换模式")
-
-    project_errors = {
+    generation_errors = {
+        "not_found": (404, "会话不存在或已被删除"),
+        "busy": (409, "当前会话已有回答正在生成，请稍后再试"),
+        "mode_conflict": (409, "请求编号已用于其他问答模式，请重新发送"),
+        "conversation_mode_conflict": (409, "此会话的问答模式已固定，请开启新对话后切换模式"),
         "content_conflict": (409, "请求编号已用于不同的问题，请使用新的请求编号"),
         "invalid_retry": (409, "只能重新生成当前会话中已失败或已取消的原问题"),
         "project_required": (400, "请先选择知识库项目"),
         "project_not_found": (404, "项目不存在或已被删除"),
         "project_deleted": (410, "项目已删除，历史对话仅供查看，无法继续提问"),
         "project_conflict": (409, "请求的项目与问答模式或原请求不一致"),
+        "upload_active": (409, UPLOAD_ACTIVE_DETAIL),
         "conversation_project_conflict": (409, "此会话的项目已固定，请开启新对话后选择项目"),
     }
-    if begun["status"] in project_errors:
+    if begun["status"] in generation_errors:
         await _release_chat_slot(user["user_id"], slot)
-        status, detail = project_errors[begun["status"]]
+        status, detail = generation_errors[begun["status"]]
         raise HTTPException(status_code=status, detail=detail)
 
     if begun["status"] == "replay":
@@ -1121,8 +1162,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
         except Exception:
             logger.exception("[对话流] 关联并发槽位与生成任务失败")
 
-    return StreamingResponse(_generation_events(user["user_id"], req.thread_id, req.request_id, user["auth_version"]),
-                             media_type="text/event-stream", headers=SSE_HEADERS)
+    return _generation_stream(user, req.thread_id, req.request_id)
 
 
 
@@ -1190,7 +1230,6 @@ def api_delete_project(project: dict = Depends(require_project)):
                 raise HTTPException(status_code=404, detail="项目不存在或已被删除")
             if result["status"] == "busy":
                 raise HTTPException(status_code=409, detail="项目中有回答正在生成，请停止或等待完成后再删除")
-            _invalidate_health(user_id, project_id)
             return {"message": "项目文档和索引已删除，历史对话已保留，仅供查看"}
         except HTTPException:
             raise
@@ -1210,7 +1249,7 @@ def _ensure_project(project):
 
 def _ensure_no_uploads(user_id: int, project_id: str) -> None:
     if _upload_task_store.has_active(user_id, project_id):
-        raise HTTPException(status_code=409, detail="资料正在入库或仍需恢复，请查看“最近上传”；已中断的任务请执行“修复与补建”")
+        raise HTTPException(status_code=409, detail=UPLOAD_ACTIVE_DETAIL)
 
 
 def _safe_filename(filename: str) -> str:
@@ -1231,7 +1270,7 @@ def _project_file_statuses(user_id: int, project_id: str) -> list[KnowledgeFile]
     return manifests.file_statuses(paths, current_index_version(vector_db_config))
 
 
-@app.get("/api/projects/{project_id}/files")
+@app.get("/api/projects/{project_id}/files", response_model=FilePage)
 def list_files(
     limit: int = Query(10, ge=1, le=100),
     page: int = Query(1, ge=1),
@@ -1244,7 +1283,7 @@ def list_files(
     with project_access(user_id, project_id) as current:
         _ensure_project(current)
         files = _project_file_statuses(user_id, project_id)
-        uploads = _upload_task_store.file_upload_order(user_id, project_id)
+        uploads = [] if sort in NAME_SORTS else _upload_task_store.file_upload_order(user_id, project_id)
         return paginate_files(files, uploads, limit=limit, page=page, search=search, status=status, sort=sort)
 
 
@@ -1290,61 +1329,98 @@ def get_source_passage(
             raise HTTPException(status_code=503, detail="暂时无法读取原文，请稍后重试")
 
 
-def _write_upload_to(file: UploadFile, tmp_path: str) -> None:
-    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+def _write_upload_to(file: UploadFile, tmp_path: str, expected_size: int) -> None:
     size = 0
     with open(tmp_path, "wb") as output:
         while chunk := file.file.read(1024 * 1024):
             size += len(chunk)
-            if size > max_bytes:
-                raise ValueError(f"文件超过大小上限 {MAX_UPLOAD_MB} MB")
+            if size > expected_size:
+                raise ValueError("上传文件大小发生变化，请重新上传")
             output.write(chunk)
         output.flush()
         os.fsync(output.fileno())
-    if size == 0:
-        raise ValueError("文件内容不能为空")
+    if size != expected_size:
+        raise ValueError("上传文件大小发生变化，请重新上传")
 
 
-@app.post("/api/projects/{project_id}/files/upload", status_code=202)
-def upload_files(files: list[UploadFile] = File(...), project: dict = Depends(require_project)):
+@app.post("/api/projects/{project_id}/files/upload", status_code=202, openapi_extra={
+    "requestBody": {"required": True, "content": {"multipart/form-data": {"schema": {
+        "type": "object", "required": ["files"],
+        "properties": {"files": {"type": "array", "items": {"type": "string", "format": "binary"}}},
+    }}}},
+})
+async def upload_files(request: Request, project: dict = Depends(require_project)):
+    request_limit = MAX_UPLOAD_REQUEST_MB * 1024**2
+    request_bytes = upload_request_size(request, request_limit)
+    user_id, project_id = project["user_id"], project["id"]
+    reservation = None
+    queued = False
+    try:
+        reservation = await anyio.to_thread.run_sync(reserve_upload_request, user_id, project_id, request_bytes,
+                                                     UPLOAD_LIMITS, UPLOAD_RECEIVE_TIMEOUT_SECONDS)
+        if reservation is None:
+            raise HTTPException(404, "项目不存在或已被删除")
+        async with upload_form(request, file_limit=MAX_UPLOAD_MB * 1024**2, request_limit=request_limit,
+                               check_bytes=reservation.check_bytes,
+                               receive_timeout=UPLOAD_RECEIVE_TIMEOUT_SECONDS) as (files, oversized):
+            result = await anyio.to_thread.run_sync(_stage_uploads, files, oversized, project, reservation.token)
+            queued = result["task_id"] is not None
+            return result
+    except UploadQuotaExceeded as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    finally:
+        if reservation is not None and not queued:
+            with anyio.CancelScope(shield=True):
+                try:
+                    await anyio.to_thread.run_sync(release_upload_request, reservation.token)
+                except (OSError, psycopg.Error):
+                    logger.exception("[上传] 释放接收额度失败，将在到期后回收")
+
+
+def _stage_uploads(files: list[UploadFile], oversized: set[UploadFile], project: dict, reservation_token: str):
     with audit_operation(project["user_id"], "file.upload", "project", project["id"], project_id=project["id"], transactional=True) as operation:
         started = time.monotonic()
         user_id, project_id = project["user_id"], project["id"]
-        staged, errors = [], []
-        # 项目共享锁防止暂存期间项目被删除；此处不持有索引锁，
-        # 即使嵌入请求缓慢，也不会阻塞上传保存。
-        with project_access(user_id, project_id) as current:
-            _ensure_project(current)
-            knowledge_dir = get_knowledge_dir(user_id, project_id)
-            os.makedirs(knowledge_dir, exist_ok=True)
+        staged, errors, candidates = [], [], []
+        for file in files:
+            name = file.filename or ""
             try:
-                for file in files:
-                    name = file.filename or ""
-                    staged_path = scoped_knowledge_file(knowledge_dir, os.path.join(knowledge_dir, f".upload_{uuid.uuid4().hex}"))
-                    accepted = False
+                _safe_filename(name)
+                if os.path.splitext(name)[1].lower() not in allowed_types:
+                    raise ValueError("支持的文件类型：" + "、".join(ext.lstrip(".").upper() for ext in allowed_types))
+                if file in oversized:
+                    raise ValueError(f"文件超过大小上限 {MAX_UPLOAD_MB} MB")
+                if not file.size:
+                    raise ValueError("文件内容不能为空")
+                candidates.append((file, name, file.size))
+            except ValueError as exc:
+                errors.append({"name": name or "(无名文件)", "error": str(exc)})
+        if not candidates:
+            operation.record("denied", "upload_rejected")
+            return {"task_id": None, "errors": errors}
+
+        directory = get_knowledge_dir(user_id, project_id)
+        incoming = sum(size for _, _, size in candidates)
+        try:
+            with upload_admission(user_id, project_id, directory, incoming, UPLOAD_LIMITS, reservation_token) as cur:
+                if cur is None:
+                    raise HTTPException(404, "项目不存在或已被删除")
+                os.makedirs(directory, exist_ok=True)
+                for position, (file, name, size) in enumerate(candidates):
+                    path = scoped_knowledge_file(directory, f"{staged_upload_prefix(reservation_token)}{position}")
                     try:
-                        name = _safe_filename(name)
-                        if os.path.splitext(name)[1].lower() not in allowed_types:
-                            raise ValueError("支持的文件类型：" + "、".join(ext.lstrip(".").upper() for ext in allowed_types))
-                        _write_upload_to(file, staged_path)
-                        staged.append({"name": name, "staged_path": staged_path})
-                        accepted = True
-                    except ValueError as exc:
-                        errors.append({"name": name or "(无名文件)", "error": str(exc)})
-                    except Exception:
+                        _write_upload_to(file, path, size)
+                        staged.append({"name": name, "staged_path": path, "size": size})
+                    except (OSError, ValueError):
+                        _remove_staged_upload(user_id, project_id, path)
                         logger.exception("[知识库] 上传落盘失败 file=%s project_id=%s", name, project_id)
                         errors.append({"name": name, "error": "上传失败，请稍后重试"})
-                    finally:
-                        if not accepted:
-                            _remove_staged_upload(user_id, project_id, staged_path)
                 if not staged:
                     operation.record("denied", "upload_rejected")
                     return {"task_id": None, "errors": errors}
-                task_id = _upload_task_store.create(user_id, project_id, staged)
-            except BaseException:
-                for item in staged:
-                    _remove_staged_upload(user_id, project_id, item["staged_path"])
-                raise
+                task_id = _upload_task_store.create(user_id, project_id, staged, cur=cur)
+        except UploadQuotaExceeded as exc:
+            raise HTTPException(exc.status, str(exc)) from exc
         logger.info("[上传] 已保存并排队 task_id=%s 文件=%s 保存耗时=%.3fs",
                     task_id, len(staged), time.monotonic() - started)
         return {"task_id": task_id, "errors": errors}
@@ -1423,10 +1499,8 @@ def build_knowledge_index(project: dict = Depends(require_project)):
 async def get_index_health(request: Request, refresh: bool = False, project: dict = Depends(require_project)):
     user_id, project_id = project["user_id"], project["id"]
     if not refresh:
-        snapshot = _health_cache(user_id, project_id).peek()
-        return snapshot["report"] if snapshot is not None else None
-    snapshot = await _request_health_snapshot(request, user_id, project_id, refresh)
-    return snapshot["report"]
+        return _health_cache(user_id, project_id).peek()
+    return await _refresh_health_report(request, user_id, project_id)
 
 
 @app.post("/api/projects/{project_id}/index/health/repair")
@@ -1439,7 +1513,7 @@ def repair_index_health(project: dict = Depends(require_project)):
                 _resolve_pending_uploads(user_id, project_id)
                 _ensure_no_uploads(user_id, project_id)
                 report = IndexHealth(user_id, project_id).repair(include_pending=True)
-                _health_cache(user_id, project_id).set({"report": report})
+                _health_cache(user_id, project_id).set(report)
             operation.result = _repair_audit_result(report)
             return report
         except HTTPException:

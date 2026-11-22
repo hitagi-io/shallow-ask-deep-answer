@@ -71,6 +71,13 @@ def validate_parsing_config(config: dict) -> None:
     confidence = settings.get("ocr_min_confidence")
     if type(confidence) not in (int, float) or not 0 < confidence <= 1:
         raise ValueError("parsing.ocr_min_confidence 必须大于 0 且不超过 1")
+    limits = config.setdefault("xlsx_limits", {})
+    if not isinstance(limits, dict):
+        raise ValueError("xlsx_limits 必须为键值映射")
+    for key, default in (("memory_mb", 1024), ("timeout_seconds", 180), ("max_text_chars", 4_000_000)):
+        value = limits.setdefault(key, default)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"xlsx_limits.{key} 必须为正整数")
 
 
 def validate_embedding_config(config: dict) -> None:
