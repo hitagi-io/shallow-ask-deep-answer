@@ -1,10 +1,11 @@
 import { ref, computed, watch, onMounted, onUnmounted, type Ref } from 'vue'
-import { fetchFiles, fetchUploadTasks, uploadFiles, deleteFile, fetchIndexHealth, repairIndexHealth, isRequestCancelled, type FileItem, type UploadTask } from '../api'
+import { fetchFiles, fetchUploadTasks, fetchUploadQuota, uploadFiles, deleteFile, fetchIndexHealth, repairIndexHealth, isRequestCancelled, type FileItem, type UploadTask, type UploadQuota } from '../api'
 import { useNotice } from './useNotice'
 import { useHealthReport } from './useHealthReport'
 import type { ConfirmAction } from './useConfirmation'
 import { knowledgeFileTypes, supportsKnowledgeFile } from '../utils/knowledgeFormats'
 import { fileProgressStageCount, transferredPercent, taskFileDetail, taskFilePercent } from '../utils/uploadProgress'
+import { formatQuotaBytes } from '../utils/uploadQuota'
 import type { FileFilter, FileSort, FileSummary } from '../utils/knowledgeFiles'
 
 type Operation = '' | 'loading' | 'uploading' | 'checking' | 'repairing' | 'deleting'
@@ -36,6 +37,11 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   let nextUploadId = 0
   let tasksBeforeUpload = new Set<string>()
   let pollTimer: ReturnType<typeof setTimeout> | undefined
+  let quotaRequest: AbortController | null = null
+  let lastQuotaRead = 0
+  const uploadQuota = ref<UploadQuota | null>(null)
+  const quotaError = ref('')
+  const quotaLoading = ref(false)
   const files = ref<FileItem[]>([])
   const fileSummary = ref<FileSummary | null>(null)
   const matchedFiles = ref(0)
@@ -98,6 +104,29 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
       ? { label: '已入库', tone: 'success' } : { label: '部分入库', tone: 'warning' }
   })
   const errorText = (error: unknown) => error instanceof Error ? error.message : '操作失败，请稍后重试'
+
+  async function refreshQuota() {
+    if (disposed || !active.value) return
+    quotaRequest?.abort()
+    const request = new AbortController()
+    quotaRequest = request
+    quotaLoading.value = true
+    lastQuotaRead = Date.now()
+    try {
+      const result = await fetchUploadQuota({ signal: request.signal })
+      if (!request.signal.aborted) {
+        uploadQuota.value = result
+        quotaError.value = ''
+      }
+    } catch (error) {
+      if (!request.signal.aborted) quotaError.value = errorText(error)
+    } finally {
+      if (quotaRequest === request) {
+        quotaLoading.value = false
+        quotaRequest = null
+      }
+    }
+  }
 
   function cancelFileReads() {
     filesAbort.abort()
@@ -194,6 +223,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     }
   }
   async function refreshAll(id: string) {
+    void refreshQuota()
     const results = await Promise.allSettled([refreshFiles(id), refreshHealth(id), refreshTasks(id)])
     const failed = results.find(result => result.status === 'rejected')
     if (failed) throw failed.reason
@@ -216,6 +246,12 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
           const file = picked[index]
           const row = rows[index]
           if (!supportsKnowledgeFile(file.name)) { row.status = 'error'; row.detail = `支持的文件类型：${knowledgeFileTypes}`; continue }
+          const fileLimit = uploadQuota.value?.limits.file_bytes
+          if (fileLimit && !quotaError.value && file.size > fileLimit) {
+            row.status = 'error'
+            row.detail = `超过单文件上限 ${formatQuotaBytes(fileLimit)}`
+            continue
+          }
           // 不同文件并发传输；同名覆盖仍按选择顺序提交，含 Windows 大小写等价名。
           const key = file.name.toLowerCase()
           const previous = sameName.get(key)
@@ -293,6 +329,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
         healthState.rejectReport(request, errorText(error))
         throw error
       }
+      finally { void refreshQuota() }
       if (!healthState.acceptReport(request, report)) return
       await Promise.all([refreshFiles(id), refreshTasks(id)])
       const repair = report.repair
@@ -309,6 +346,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
         const before = uploadTasks.value.map(task => `${task.task_id}:${task.status}:${task.completed}`).join('|')
         await refreshTasks(id)
         const after = uploadTasks.value.map(task => `${task.task_id}:${task.status}:${task.completed}`).join('|')
+        if (!quotaRequest && (before !== after || Date.now() - lastQuotaRead > 60_000)) void refreshQuota()
         if (!knowledgeBusy.value && !filesLoading.value
             && (before !== after || Date.now() - lastFullRefresh > 60_000)) {
           await Promise.allSettled([refreshFiles(id), refreshHealth(id)])
@@ -343,11 +381,12 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   watch(active, visible => {
     viewVersion++
     if (visible) void loadKnowledgeState()
-    else { cancelReads(); healthState.beginRequest() }
+    else { cancelReads(); quotaRequest?.abort(); healthState.beginRequest() }
   }, { immediate: true })
   onMounted(() => { void poll() })
-  onUnmounted(() => { disposed = true; cancelReads(); clearTimeout(pollTimer); uploadAbort.abort() })
+  onUnmounted(() => { disposed = true; cancelReads(); quotaRequest?.abort(); clearTimeout(pollTimer); uploadAbort.abort() })
   return { updatingProjectId, indexing, recoveryRequired, taskLoadError, files, fileSummary, matchedFiles, filePage, filePageCount, filesLoading, goToFilePage, search, statusFilter, fileSort, uploadProgress, loadError, selectFiles, clearNotice,
+    uploadQuota, quotaLoading, quotaError, refreshQuota,
     knowledgeLoading, knowledgeUploading, knowledgeMsg, knowledgeMsgType, dragOver, fileInput,
     deletingName, health, healthNotice, documentStatus, indexStatus, healthChecking, healthRepairing, healthIssueCount, knowledgeBusy, loadKnowledgeState, onFileSelect,
     onDrop, handleDeleteFile, handleHealthCheck, handleHealthRepair }

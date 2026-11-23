@@ -50,7 +50,7 @@ from utils.runtime.request_wait import wait_for_client
 from utils.runtime.shutdown import ServiceStopping, check_shutdown, request_shutdown, reset_shutdown
 from utils.core.logging_config import configure_logging, get_logger
 from utils.indexing.upload_tasks import UploadTaskStore
-from utils.indexing.upload_quota import UploadLimits, UploadQuotaExceeded, staged_upload_prefix
+from utils.indexing.upload_quota import UploadLimits, UploadQuotaExceeded, daily_embedding_limit, staged_upload_prefix
 from utils.indexing.progress import IndexProgress
 from auth import (
     PASSWORD_MAX_LENGTH,
@@ -91,6 +91,7 @@ from auth import (
     update_project,
     delete_project,
     project_access,
+    get_upload_usage,
     reserve_upload_request,
     release_upload_request,
     upload_admission,
@@ -1188,6 +1189,21 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(subscription_user))
 @app.get("/api/projects")
 def api_list_projects(user: dict = Depends(get_current_user)):
     return {"projects": list_projects(user["user_id"])}
+
+
+@app.get("/api/account/upload-quota")
+def api_upload_quota(user: dict = Depends(get_current_user)):
+    return {
+        "usage": get_upload_usage(user["user_id"]),
+        "limits": {
+            "storage_bytes": UPLOAD_LIMITS.storage_bytes,
+            "daily_bytes": UPLOAD_LIMITS.daily_bytes,
+            "pending_tasks": UPLOAD_LIMITS.pending_tasks,
+            "embedding_chars": daily_embedding_limit(),
+            "file_bytes": MAX_UPLOAD_MB * 1024**2,
+            "request_bytes": MAX_UPLOAD_REQUEST_MB * 1024**2,
+        },
+    }
 
 
 @app.get("/api/generations/{generation_id}/trace")

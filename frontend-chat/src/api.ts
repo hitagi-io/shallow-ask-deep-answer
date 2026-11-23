@@ -1,4 +1,6 @@
 import { parseUploadTasks, type UploadTask } from './utils/uploadProgress'
+import { parseUploadQuota, type UploadQuota } from './utils/uploadQuota'
+export type { UploadQuota } from './utils/uploadQuota'
 import { parseGeneration, parseTrace, parseAuditPage, parseMessageHistory, type GenerationSnapshot, type ResultKind } from './utils/generation'
 import { isRecord } from './utils/validation'
 export type { GenerationSnapshot } from './utils/generation'
@@ -512,6 +514,10 @@ export async function fetchFiles(projectId: string, options: FileRequestOptions 
 
 export async function fetchFileSummary(projectId: string, options: KnowledgeRequestOptions = {}): Promise<FileSummary> {
   return parseFileSummary(await fetchKnowledgeJson<unknown>(`${projectPath(projectId)}/files/summary`, '读取项目资料统计失败', options))
+}
+
+export async function fetchUploadQuota(options: KnowledgeRequestOptions = {}): Promise<UploadQuota> {
+  return parseUploadQuota(await fetchKnowledgeJson('/api/account/upload-quota', '读取上传额度失败', options))
 }
 
 export interface UploadRequestOptions {

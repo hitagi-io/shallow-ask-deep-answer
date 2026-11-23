@@ -7,6 +7,8 @@ import AppNotice from '../components/common/AppNotice.vue'
 import AppDialog from '../components/common/AppDialog.vue'
 import AppProgress from '../components/common/AppProgress.vue'
 import PageHeader from '../components/layout/PageHeader.vue'
+import UploadQuotaPanel from '../components/knowledge/UploadQuotaPanel.vue'
+import { formatQuotaBytes } from '../utils/uploadQuota'
 import { knowledgeFileAccept, knowledgeFileTypes } from '../utils/knowledgeFormats'
 import { fileSortLabels, type FileSort } from '../utils/knowledgeFiles'
 const props = defineProps<{ knowledge: ReturnType<typeof useKnowledge>; projects: ReturnType<typeof useProjects> }>()
@@ -15,6 +17,7 @@ const { files, knowledgeLoading, knowledgeUploading, knowledgeMsg, knowledgeMsgT
 const { fileSummary, matchedFiles, filePage, filePageCount, filesLoading, goToFilePage, search, statusFilter, fileSort, uploadProgress, loadError, selectFiles, clearNotice } = props.knowledge
 const { healthNotice, documentStatus, indexStatus } = props.knowledge
 const { indexing, recoveryRequired, taskLoadError } = props.knowledge
+const { uploadQuota, quotaLoading, quotaError, refreshQuota } = props.knowledge
 const { projects: projectList, selectedId, selected, loading, saving, error, load, save, remove } = props.projects
 const projectSearch = ref('')
 const filteredProjects = computed(() => projectList.value.filter(project => project.name.toLocaleLowerCase().includes(projectSearch.value.trim().toLocaleLowerCase())))
@@ -134,9 +137,10 @@ async function removeProject() {
         <div class="dropzone" role="button" :tabindex="busy ? -1 : 0" :aria-disabled="busy" :aria-busy="knowledgeUploading" aria-label="选择文件上传到当前项目" @keydown.enter.prevent="!busy && selectFiles()" @keydown.space.prevent="!busy && selectFiles()" :class="{ over: dragOver, busy }" @dragover.prevent="dragOver = !busy" @dragleave="dragOver = false" @drop.prevent="!busy && onDrop($event)" @click="!busy && selectFiles()">
           <input ref="fileInput" type="file" :accept="knowledgeFileAccept" :disabled="busy" multiple hidden @change="onFileSelect" />
           <span class="upload-icon"><AppIcon name="upload" :size="22" /></span>
-          <div><strong>{{ knowledgeUploading ? '正在上传资料…' : '拖拽文档至此，或点击上传' }}</strong><p>{{ knowledgeFileTypes }}</p><p id="project-upload-hint">图片与扫描 PDF 自动识别文字 · 入库完成后可用于回答</p></div>
+          <div><strong>{{ knowledgeUploading ? '正在上传资料…' : '拖拽文档至此，或点击上传' }}</strong><p>{{ knowledgeFileTypes }}<template v-if="uploadQuota"> · 单文件最大 {{ formatQuotaBytes(uploadQuota.limits.file_bytes) }}</template></p><p id="project-upload-hint">图片与扫描 PDF 自动识别文字 · 入库完成后可用于回答</p></div>
           <span class="upload-label"><AppIcon name="plus" :size="14" />选择文件</span>
         </div>
+        <UploadQuotaPanel :quota="uploadQuota" :loading="quotaLoading" :error="quotaError" @refresh="refreshQuota" />
         <section v-if="uploadProgress.length || taskLoadError" class="upload-progress" aria-label="上传和入库进度">
           <div class="section-heading"><h3>最近上传</h3><span class="hint upload-history-hint">最近 7 条，新上传在前；有未完成记录时，总数可能超过 7 条。</span></div>
           <p v-if="taskLoadError" class="health-notice" role="alert">{{ taskLoadError }}</p>
@@ -151,7 +155,6 @@ async function removeProject() {
             <p v-if="task.error" class="health-notice">{{ task.error }}</p>
           </div>
         </section>
-
         <details class="health-section">
           <summary><AppIcon class="health-chevron" name="chevron-right" :size="16" /><span>索引维护</span><span class="health-indicator" :class="indexStatus.tone"><span class="status-dot"></span>{{ indexStatus.label }}</span></summary>
           <div class="health-content">

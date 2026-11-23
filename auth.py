@@ -23,7 +23,7 @@ from utils.core.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
 from utils.core.logging_config import get_logger
 from rag.index_manifest import ManifestStore
 from utils.indexing.upload_tasks import UploadTaskStore
-from utils.indexing.upload_quota import UploadLimits, UploadReservation, claim_upload, discard_upload, reserve_upload
+from utils.indexing.upload_quota import UploadLimits, UploadReservation, account_upload_usage, claim_upload, discard_upload, reserve_upload
 from utils.observability.schema import migrate
 from utils.observability.audit import append_audit, resource_digest
 from utils.runtime.auth_ingress import AuthIngress
@@ -624,6 +624,11 @@ def _upload_project_transaction(user_id: int, project_id: str):
         cur.execute("SELECT id FROM projects WHERE id=%s AND user_id=%s AND deleted_at IS NULL FOR SHARE",
                     (project_id, user_id))
         yield cur if cur.fetchone() is not None else None
+
+
+def get_upload_usage(user_id: int) -> dict:
+    with _connection() as conn, conn.cursor() as cur:
+        return account_upload_usage(cur, user_id)
 
 
 def reserve_upload_request(user_id: int, project_id: str, request_bytes: int, limits: UploadLimits,

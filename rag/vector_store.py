@@ -25,7 +25,7 @@ from utils.retrieval.source_evidence import (
 from utils.core.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
 from utils.core.logging_config import get_logger
 from utils.indexing.progress import IndexProgress, IndexStage, ProgressCallback
-from utils.indexing.upload_quota import moving_upload_files, reserve_embedding_chars, UploadQuotaExceeded
+from utils.indexing.upload_quota import daily_embedding_limit, moving_upload_files, reserve_embedding_chars, UploadQuotaExceeded
 from utils.indexing.recovery import UploadJournal, PublicationUncertain, UploadRecoveryResult
 from utils.observability.tracing import span, traced
 from utils.runtime.shutdown import ServiceStopping, check_shutdown, interruptible_lock
@@ -73,9 +73,7 @@ class VectorStore:
         collection_name = project_collection_name(vector_db_config, self.user_id, self.project_id)
         self.manifests = ManifestStore({**vector_db_config, "collection_name": collection_name})
         self.index_version = current_index_version(vector_db_config)
-        self.daily_embedding_chars = int(os.getenv("ACCOUNT_DAILY_EMBEDDING_CHARS", "10000000"))
-        if self.daily_embedding_chars < 1:
-            raise ValueError("每日入库文本额度必须为正整数")
+        self.daily_embedding_chars = daily_embedding_limit()
         self.embeddings = DashScopeEmbeddings(vector_db_config)
         self.vector_store = Milvus(
             collection_name=collection_name,

@@ -1,12 +1,13 @@
 """按账号计算实际源文件占用。暂存文件、覆盖备份和旧版上传都计入总量。"""
 from dataclasses import dataclass
+from datetime import datetime
 import os
 from pathlib import Path
 import uuid
 import psycopg
 
 from utils.core.pg_lock import shared_section
-from utils.core.project_paths import get_knowledge_dir
+from utils.core.project_paths import get_account_knowledge_dir, get_knowledge_dir
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,13 @@ class UploadLimits:
     def __post_init__(self):
         if min(self.storage_bytes, self.daily_bytes, self.pending_tasks) < 1:
             raise ValueError("账号存储、每日上传量和待处理任务上限必须为正数")
+
+
+def daily_embedding_limit() -> int:
+    limit = int(os.getenv("ACCOUNT_DAILY_EMBEDDING_CHARS", "10000000"))
+    if limit < 1:
+        raise ValueError("每日入库文本额度必须为正整数")
+    return limit
 
 
 class UploadQuotaExceeded(ValueError):
@@ -47,10 +55,13 @@ def moving_upload_files(conninfo: str, user_id: int):
     return shared_section(conninfo, storage_lock_key(user_id), timeout_seconds=30)
 
 
-def _storage_available(account_dir: Path, remaining: int) -> int:
-    if remaining <= 0 or not account_dir.exists():
-        return remaining
-    with os.scandir(account_dir) as projects:
+def _storage_bytes(account_dir: Path, stop_at: int | None = None) -> int:
+    used = 0
+    try:
+        projects = os.scandir(account_dir)
+    except FileNotFoundError:
+        return used
+    with projects:
         for project in projects:
             if not project.is_dir(follow_symlinks=False) or project.is_junction():
                 continue
@@ -59,31 +70,67 @@ def _storage_available(account_dir: Path, remaining: int) -> int:
                     for file in files:
                         try:
                             if file.is_file(follow_symlinks=False):
-                                remaining -= file.stat(follow_symlinks=False).st_size
+                                used += file.stat(follow_symlinks=False).st_size
                         except FileNotFoundError:
                             continue  # 并发删除释放容量。
-                        if remaining <= 0:
-                            return remaining
+                        if stop_at is not None and used >= stop_at:
+                            return used
             except FileNotFoundError:
                 continue
-    return remaining
+    return used
+
+
+@dataclass(frozen=True)
+class _UploadActivity:
+    reserved_bytes: int
+    pending_tasks: int
+    daily_bytes: int
+    embedding_chars: int
+    resets_at: datetime
+
+
+def _upload_activity(cur, user_id: int) -> _UploadActivity:
+    # 在同一个数据库快照中统计预留和已入队用量，避免交接时重复计数。
+    cur.execute("""
+        WITH today AS (SELECT (now() AT TIME ZONE 'UTC')::date AS day),
+        receiving AS (
+            SELECT count(*) AS slots, COALESCE(sum(reserved_bytes), 0)::bigint AS bytes
+            FROM upload_receivers WHERE user_id=%s AND expires_at>clock_timestamp()
+        )
+        SELECT receiving.bytes, receiving.slots + (
+                   SELECT count(*) FROM upload_tasks WHERE user_id=%s AND status IN ('queued','running')
+               ), COALESCE(usage.bytes, 0), COALESCE(usage.embedding_chars, 0),
+               (today.day + 1)::timestamp AT TIME ZONE 'UTC'
+        FROM today CROSS JOIN receiving
+        LEFT JOIN upload_daily_usage usage ON usage.user_id=%s AND usage.usage_day=today.day
+    """, (user_id, user_id, user_id))
+    return _UploadActivity(*cur.fetchone())
+
+
+def account_upload_usage(cur, user_id: int) -> dict:
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (storage_lock_key(user_id),))
+    activity = _upload_activity(cur, user_id)
+    return {
+        "storage_bytes": _storage_bytes(get_account_knowledge_dir(user_id)) + activity.reserved_bytes,
+        "daily_bytes": activity.daily_bytes + activity.reserved_bytes,
+        "pending_tasks": activity.pending_tasks,
+        "embedding_chars": activity.embedding_chars,
+        "reserved_bytes": activity.reserved_bytes,
+        "resets_at": activity.resets_at,
+    }
 
 
 def _capacity(cur, user_id: int, directory: str, limits: UploadLimits) -> tuple[int, str, int]:
-    cur.execute("SELECT count(*), COALESCE(sum(reserved_bytes),0)::bigint FROM upload_receivers "
-                "WHERE user_id=%s AND expires_at>clock_timestamp()", (user_id,))
-    receivers, reserved = cur.fetchone()
-    cur.execute("SELECT count(*) FROM upload_tasks WHERE user_id=%s AND status IN ('queued','running')", (user_id,))
-    if cur.fetchone()[0] + receivers >= limits.pending_tasks:
+    activity = _upload_activity(cur, user_id)
+    if activity.pending_tasks >= limits.pending_tasks:
         raise UploadQuotaExceeded("账号待处理上传任务已满，请等待任务完成")
-    cur.execute("SELECT bytes FROM upload_daily_usage WHERE user_id=%s AND usage_day=(now() AT TIME ZONE 'UTC')::date",
-                (user_id,))
-    row = cur.fetchone()
-    daily = limits.daily_bytes - (row[0] if row else 0) - reserved
+    daily = limits.daily_bytes - activity.daily_bytes - activity.reserved_bytes
     daily_error = "账号今日可用上传量不足，请在 UTC 零点后重试"
     if daily <= 0:
         raise UploadQuotaExceeded(daily_error)
-    storage = _storage_available(Path(directory).parent, limits.storage_bytes - reserved)
+    storage = limits.storage_bytes - activity.reserved_bytes
+    if storage > 0:
+        storage -= _storage_bytes(Path(directory).parent, stop_at=storage)
     if storage <= daily:
         return storage, "账号存储空间不足，请先删除不再使用的资料", 413
     return daily, daily_error, 429

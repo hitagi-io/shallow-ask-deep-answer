@@ -31,10 +31,17 @@ def get_knowledge_storage_root() -> str:
     return str(root)
 
 
+def get_account_knowledge_dir(user_id: int) -> Path:
+    if type(user_id) is not int or user_id <= 0:
+        raise ValueError("无效的账号 ID")
+    directory = Path(get_knowledge_storage_root()) / str(user_id)
+    if directory.resolve() != directory:
+        raise ValueError("知识库目录不能通过链接重定向")
+    return directory
+
+
 def get_knowledge_dir(user_id: int, project_id: str) -> str:
-    user_id, project_id = knowledge_scope(user_id, project_id)
-    root = Path(get_knowledge_storage_root())
-    directory = root / str(user_id) / project_id
+    directory = get_account_knowledge_dir(user_id) / str(uuid.UUID(str(project_id)))
     # 不允许现有符号链接将一个项目重定向到另一个项目或源码目录。
     if directory.resolve() != directory:
         raise ValueError("知识库目录不能通过链接重定向")

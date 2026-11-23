@@ -1,6 +1,6 @@
 <script setup lang="ts">
 withDefaults(defineProps<{
-  name: 'close' | 'plus' | 'arrow-up' | 'arrow-up-right' | 'arrow-left' | 'arrow-right' | 'chevron-right' | 'filter' | 'check' | 'upload' | 'success' | 'error' | 'folder' | 'book' | 'file'
+  name: 'close' | 'plus' | 'arrow-up' | 'arrow-up-right' | 'arrow-left' | 'arrow-right' | 'chevron-right' | 'filter' | 'check' | 'upload' | 'refresh' | 'success' | 'error' | 'folder' | 'book' | 'file'
   size?: number
 }>(), { size: 18 })
 </script>
@@ -17,6 +17,7 @@ withDefaults(defineProps<{
     <path v-else-if="name === 'filter'" d="M4 5h16l-6 7v6l-4 2v-8L4 5Z" />
     <path v-else-if="name === 'check'" d="m5 12 4 4L19 6" />
     <path v-else-if="name === 'upload'" d="M12 16V3m-5 5 5-5 5 5M4 16v5h16v-5" />
+    <path v-else-if="name === 'refresh'" d="M20 7v5h-5M4 17v-5h5m10.5-.5a7.5 7.5 0 0 0-13-4.6m-2 5.6a7.5 7.5 0 0 0 13 4.6" />
     <path v-else-if="name === 'folder'" d="M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z" />
     <path v-else-if="name === 'book'" d="M12 5v15M3 4h5a4 4 0 0 1 4 2 4 4 0 0 1 4-2h5v15h-5a4 4 0 0 0-4 2 4 4 0 0 0-4-2H3V4Z" />
     <path v-else-if="name === 'file'" d="M14 3H5v18h14V8l-5-5Zm0 0v5h5M8 12h8m-8 4h6" />
