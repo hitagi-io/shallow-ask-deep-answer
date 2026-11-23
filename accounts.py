@@ -16,11 +16,6 @@ class AccountError(ValueError):
         self.status = status
 
 
-def _check_rate(user_id: int):
-    if not auth.consume_rate_limit("account_change", str(user_id), 10, 60):
-        raise AccountError("操作过于频繁，请稍后再试", 429)
-
-
 def _locked_user(cur, user_id: int, version: int):
     cur.execute("SELECT id, username, password, auth_version FROM users WHERE id = %s FOR UPDATE", (user_id,))
     user = cur.fetchone()
@@ -31,7 +26,6 @@ def _locked_user(cur, user_id: int, version: int):
 
 def update_account(user_id: int, version: int, *, session_id: str, expires_at: int, username: str | None = None,
                    current_password: str | None = None, new_password: str | None = None) -> dict:
-    _check_rate(user_id)
     if username is None and new_password is None:
         raise AccountError("请填写要修改的信息")
     if username is not None:
@@ -72,7 +66,6 @@ def update_account(user_id: int, version: int, *, session_id: str, expires_at: i
 
 
 def prepare_deletion(user_id: int, version: int, password: str) -> dict:
-    _check_rate(user_id)
     with auth._connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             user = _locked_user(cur, user_id, version)
@@ -102,7 +95,6 @@ def _deletion_claims(token: str, user_id: int, version: int, confirmation: str) 
 def delete_account(user_id: int, version: int, token: str, confirmation: str, *,
                    cleanup, stale_seconds: float, slot_max_age: int) -> None:
     """持账号排他锁，按索引→项目→会话顺序清理；外部失败保留账号以便重试。"""
-    _check_rate(user_id)
     claims = _deletion_claims(token, user_id, version, confirmation)
     with auth._connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:

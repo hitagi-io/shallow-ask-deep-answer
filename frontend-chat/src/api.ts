@@ -92,7 +92,6 @@ export async function apiSourcePassage(url: string, signal: AbortSignal): Promis
 // ---------- 认证辅助函数 ----------
 
 const TOKEN_KEY = 'shallow_ask_deep_answer_token'
-const USER_KEY = 'shallow_ask_deep_answer_user'
 
 function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)
@@ -105,8 +104,6 @@ export function hasAuthToken(): boolean {
 
 export function clearAuth() {
   localStorage.removeItem(TOKEN_KEY)
-  // 同时清除旧版存储的用户副本；它不再参与登录状态判断。
-  localStorage.removeItem(USER_KEY)
 }
 
 function authHeaders(): Record<string, string> {

@@ -56,6 +56,10 @@ LOGIN_ACCOUNT_IP_MAX_ATTEMPTS = int(os.getenv("LOGIN_ACCOUNT_IP_MAX_ATTEMPTS", "
 LOGIN_ACCOUNT_IP_WINDOW_SECONDS = int(os.getenv("LOGIN_ACCOUNT_IP_WINDOW_SECONDS", "900"))
 REGISTER_RATE_LIMIT = int(os.getenv("REGISTER_RATE_LIMIT", "5"))
 REGISTER_RATE_WINDOW_SECONDS = int(os.getenv("REGISTER_RATE_WINDOW_SECONDS", "3600"))
+ACCOUNT_CHANGE_SESSION_LIMIT = 5
+ACCOUNT_CHANGE_ACCOUNT_LIMIT = 10
+ACCOUNT_CHANGE_WINDOW_SECONDS = 60
+ACCOUNT_CHANGE_WORKER_RATE_LIMIT = int(os.getenv("ACCOUNT_CHANGE_WORKER_RATE_LIMIT", "120"))
 
 auth_ingress = {
     "auth.login": AuthIngress(LOGIN_IP_RATE_LIMIT, int(os.getenv("LOGIN_WORKER_RATE_LIMIT", "300")),
@@ -63,6 +67,9 @@ auth_ingress = {
     "account.register": AuthIngress(REGISTER_RATE_LIMIT, int(os.getenv("REGISTER_WORKER_RATE_LIMIT", "120")),
                                     REGISTER_RATE_WINDOW_SECONDS),
 }
+for action in ("account.update", "account.verify_deletion", "account.delete"):
+    auth_ingress[action] = AuthIngress(ACCOUNT_CHANGE_SESSION_LIMIT, ACCOUNT_CHANGE_WORKER_RATE_LIMIT,
+                                       ACCOUNT_CHANGE_WINDOW_SECONDS)
 
 # 对话并发槽位的跨进程咨询锁（advisory lock）命名空间（二参数形式：classid, user_id）。
 _CHAT_SLOT_LOCK_CLASS = 0x64656573
@@ -303,7 +310,7 @@ def _validate_password(password: str) -> str | None:
 
 
 
-def _create_token(user_id: int, username: str, auth_version: int = 0, *,
+def _create_token(user_id: int, username: str, auth_version: int, *,
                   session_id: str | None = None, expires_at: int | None = None) -> str:
     payload = {
         "user_id": user_id,
@@ -318,11 +325,12 @@ def _create_token(user_id: int, username: str, auth_version: int = 0, *,
 def verify_token(token: str) -> dict | None:
     """验证 JWT，返回 payload 或 None。"""
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], options={"require": ["user_id", "exp"]})
-        if payload.get("purpose", "access") != "access" or type(payload["user_id"]) is not int:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"],
+                             options={"require": ["user_id", "auth_version", "jti", "exp"]})
+        if "purpose" in payload or type(payload["user_id"]) is not int or type(payload["auth_version"]) is not int:
             return None
-        # 旧版令牌没有逐次登录标识，它们按账号和凭证版本一起撤销。
-        payload.setdefault("jti", f"legacy-{payload.get('auth_version', 0)}")
+        if not isinstance(payload["jti"], str) or not re.fullmatch(r"[0-9a-f]{32}", payload["jti"]):
+            return None
         return payload
     except jwt.PyJWTError:
         return None
@@ -341,8 +349,7 @@ def get_session_user(user_id: int, session_id: str) -> dict | None:
 
 
 def revoke_session(user: dict) -> None:
-    expires = ("infinity" if user["session_id"].startswith("legacy-") else
-               datetime.fromtimestamp(user["expires_at"], timezone.utc))
+    expires = datetime.fromtimestamp(user["expires_at"], timezone.utc)
     with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO revoked_access_sessions (user_id, session_id, expires_at) "
@@ -429,28 +436,29 @@ def _rate_record(cur, scope: str, key: str, now: datetime) -> None:
         cur.execute("DELETE FROM rate_limits WHERE attempted_at <= %s", (now - _RATE_RETENTION,))
 
 
-def _rate_consume(cur, scope: str, key: str, limit: int, window_seconds: int, now: datetime) -> bool:
-    """原子地「检查并记录」一次尝试：先获取该限流键的事务级咨询锁（advisory lock）。"""
-    _rate_lock_keys(cur, [(scope, key)])
-    if _rate_exceeded(cur, scope, key, limit, window_seconds, now):
-        return False
-    _rate_record(cur, scope, key, now)
-    return True
+def _consume_rate_limits(limits: list[tuple[str, str, int]], window_seconds: int) -> bool:
+    """同一事务按固定顺序加锁，全部限额通过才扣减，拒绝时不占用其他额度。"""
+    with _connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            _rate_lock_keys(cur, [(scope, key) for scope, key, _ in limits])
+            now = datetime.now()
+            if any(_rate_exceeded(cur, scope, key, limit, window_seconds, now) for scope, key, limit in limits):
+                return False
+            for scope, key, _ in limits:
+                _rate_record(cur, scope, key, now)
+        conn.commit()
+        return True
 
 
 def consume_rate_limit(scope: str, key: str, limit: int, window_seconds: int) -> bool:
-    """检查限额并在获准时记录一次尝试、返回 True；超限返回 False。
+    return _consume_rate_limits([(scope, key, limit)], window_seconds)
 
-    以数据库为计数载体，并在同一事务内按 (scope, key) 持有事务级咨询锁（advisory lock）：
-    检查与插入因此成为原子操作，多进程部署下同一限流键也只会放行到上限，
-    且不依赖长期驻留内存的字典。锁在事务提交/回滚时自动释放。
-    """
-    with _connection() as conn:
-        now = datetime.now()
-        with conn.cursor(row_factory=dict_row) as cur:
-            allowed = _rate_consume(cur, scope, key, limit, window_seconds, now)
-        conn.commit()
-        return allowed
+
+def consume_account_change_limit(user_id: int, session_id: str) -> bool:
+    return _consume_rate_limits([
+        ("account_session", f"{user_id}:{session_id}", ACCOUNT_CHANGE_SESSION_LIMIT),
+        ("account_change", str(user_id), ACCOUNT_CHANGE_ACCOUNT_LIMIT),
+    ], ACCOUNT_CHANGE_WINDOW_SECONDS)
 
 
 

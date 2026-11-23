@@ -61,6 +61,7 @@ from auth import (
     register,
     login,
     consume_rate_limit,
+    consume_account_change_limit,
     verify_token,
     get_session_user,
     revoke_session,
@@ -703,21 +704,39 @@ class ProjectRequest(BaseModel):
 
 
 
-def get_current_user(authorization: str = Header(None)) -> dict:
-    """复核账号与凭证版本，让改密和注销在所有 worker 上立即生效。"""
+def get_access_claims(authorization: str = Header(None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="未登录")
     token = authorization[7:]
     payload = verify_token(token)
     if payload is None:
         raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+    return payload
+
+
+def get_current_user(payload: dict = Depends(get_access_claims)) -> dict:
+    """复核账号与凭证版本，让改密和注销在所有 worker 上立即生效。"""
     user = get_session_user(payload["user_id"], payload["jti"])
     if user is None:
         raise HTTPException(status_code=401, detail="登录已失效，请重新登录")
-    if payload.get("auth_version", 0) != user["auth_version"]:
+    if payload["auth_version"] != user["auth_version"]:
         raise HTTPException(status_code=401, detail="密码已更新，请重新登录")
     return {"user_id": user["id"], "username": user["username"], "auth_version": user["auth_version"],
             "session_id": payload["jti"], "expires_at": payload["exp"]}
+
+
+def account_change_user(action: str):
+    def admit(payload: dict = Depends(get_access_claims)) -> dict:
+        limiter = auth_ingress[action]
+        if not limiter.allow(f"{payload['user_id']}:{payload['jti']}"):
+            raise HTTPException(429, "操作过于频繁，请稍后再试")
+        user = get_current_user(payload)
+        if not consume_account_change_limit(user["user_id"], user["session_id"]):
+            limiter.record_denied()
+            raise HTTPException(429, "操作过于频繁，请稍后再试")
+        return user
+
+    return admit
 
 
 def require_project(project_id: UUID, user: dict = Depends(get_current_user)) -> dict:
@@ -793,7 +812,7 @@ def api_me(user: dict = Depends(get_current_user)):
 
 
 @app.patch("/api/auth/me")
-def api_update_account(req: UpdateAccountRequest, user: dict = Depends(get_current_user)):
+def api_update_account(req: UpdateAccountRequest, user: dict = Depends(account_change_user("account.update"))):
     with audit_operation(user["user_id"], "account.update", "account", str(user["user_id"]), transactional=True) as operation:
         try:
             return update_account(user["user_id"], user["auth_version"], session_id=user["session_id"],
@@ -803,7 +822,7 @@ def api_update_account(req: UpdateAccountRequest, user: dict = Depends(get_curre
 
 
 @app.post("/api/auth/deletion-verification")
-def api_prepare_deletion(req: DeletionVerificationRequest, user: dict = Depends(get_current_user)):
+def api_prepare_deletion(req: DeletionVerificationRequest, user: dict = Depends(account_change_user("account.verify_deletion"))):
     with audit_operation(user["user_id"], "account.verify_deletion", "account", str(user["user_id"])) as operation:
         try:
             return prepare_deletion(user["user_id"], user["auth_version"], req.password)
@@ -812,7 +831,7 @@ def api_prepare_deletion(req: DeletionVerificationRequest, user: dict = Depends(
 
 
 @app.delete("/api/auth/me")
-def api_delete_account(req: DeleteAccountRequest, user: dict = Depends(get_current_user)):
+def api_delete_account(req: DeleteAccountRequest, user: dict = Depends(account_change_user("account.delete"))):
     with audit_operation(user["user_id"], "account.delete", "account", str(user["user_id"]), transactional=True) as operation:
         user_id = user["user_id"]
 
