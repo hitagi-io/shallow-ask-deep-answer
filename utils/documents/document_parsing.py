@@ -2,7 +2,8 @@
 
 from datetime import date, datetime, time
 from contextlib import ExitStack, nullcontext
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
@@ -719,7 +720,108 @@ def _slide_blocks(slide, markdown):
     return blocks
 
 
+@lru_cache(maxsize=128)
+def _chart_date_kind(number_format):
+    from openpyxl.styles.numbers import is_date_format, is_timedelta_format
+
+    # 引号中的单位、转义字符和区域代码都不是日期标记。
+    code = re.sub(r'"[^"]*"|[\\_*].', "", number_format).split(";", 1)[0].lower()
+    if not is_date_format(code) or is_timedelta_format(code):
+        return None
+    tokens = re.sub(r"\[[^]]*\]", "", code)
+    if not any(marker in tokens for marker in ("h", "s", "am/pm", "a/p")):
+        return "date"
+    return "datetime" if any(marker in tokens for marker in ("d", "y", "mmm")) else "time"
+
+
+def _chart_axis_date_formats(plot, xy):
+    from pptx.oxml.ns import qn
+
+    # 组合图的各个绘图区可能引用不同的主轴和次轴。
+    axis_ids = plot._element.xpath("c:axId/@val")
+    formats = {}
+    for axis in plot._element.xpath("../c:catAx | ../c:dateAx | ../c:valAx"):
+        axis_id = axis.xpath("string(c:axId/@val)")
+        if axis_id not in axis_ids:
+            continue
+        if xy:
+            field = "xVal" if axis_id == axis_ids[0] else "yVal"
+        else:
+            field = "val" if axis.tag == qn("c:valAx") else "cat"
+        code = axis.xpath("string(c:numFmt/@formatCode)")
+        if _chart_date_kind(code):
+            formats[field] = code
+        elif axis.tag == qn("c:dateAx"):
+            formats[field] = "yyyy-mm-dd"
+    return formats
+
+
+def _chart_date_text(raw, kind, epoch):
+    from openpyxl.utils.datetime import WINDOWS_EPOCH, from_excel
+
+    try:
+        serial = float(raw)
+        stamp = from_excel(serial, epoch)
+    except (ValueError, OverflowError):
+        return None
+
+    if kind == "time":
+        return (stamp.time() if isinstance(stamp, datetime) else stamp).isoformat()
+    # 1900 日期系统的第 0 天和虚构的 2 月 29 日没有对应的公历日期。
+    if epoch == WINDOWS_EPOCH and (0 <= serial < 1 or 60 <= serial < 61):
+        return None
+    if isinstance(stamp, time):
+        stamp = datetime.combine(epoch.date(), stamp)  # 1904-01-01 的序列号为 0
+    if kind == "date" and stamp.time() == time.min:
+        return stamp.date().isoformat()
+    return stamp.isoformat()
+
+
+def _chart_points(source, epoch, axis_format, number_type):
+    from pptx.oxml.ns import qn
+
+    points = {}
+    if source is None:
+        return points
+    caches = source.xpath("c:numRef/c:numCache | c:numLit | c:strRef/c:strCache | c:strLit")
+    for cache in caches:
+        numeric = cache.tag in (qn("c:numCache"), qn("c:numLit"))
+        cache_format = cache.findtext(qn("c:formatCode")) or "General"
+        if axis_format and not _chart_date_kind(cache_format):
+            cache_format = axis_format
+        for point in cache.findall(qn("c:pt")):
+            raw = point.findtext(qn("c:v"))
+            idx = int(point.get("idx"))
+            points[idx] = raw
+            if not raw or not numeric:
+                continue
+            number_format = point.get("formatCode") or cache_format
+            if axis_format and number_format.lower() == "general":
+                number_format = axis_format
+            kind = _chart_date_kind(number_format)
+            if kind:
+                date_text = _chart_date_text(raw, kind, epoch)
+                if date_text is not None:
+                    points[idx] = date_text
+                    continue
+            try:
+                number = number_type(raw)
+            except (ValueError, InvalidOperation):
+                continue  # 保留 #N/A 等缓存原文
+            points[idx] = _display_value(number, number_format)
+    return points
+
+
+def _chart_column(source, epoch, axis_format, number_type):
+    if source is None:
+        return []
+    points = _chart_points(source, epoch, axis_format, number_type)
+    count = int(source.xpath("string(.//c:ptCount/@val)") or 0)
+    return [points.get(i) for i in range(count)]
+
+
 def _slide_shapes(shapes, path, locator, converted=None):
+    from openpyxl.utils.datetime import MAC_EPOCH, WINDOWS_EPOCH
     from pptx.enum.shapes import MSO_SHAPE_TYPE
     from pptx.shapes.picture import Picture
 
@@ -749,40 +851,36 @@ def _slide_shapes(shapes, path, locator, converted=None):
                 result.extend(_embedded_ocr(picture.blob, picture.content_type, path, f"{where} · 图片"))
         elif shape.has_chart:
             chart = shape.chart
+            epoch = MAC_EPOCH if chart._chartSpace.date_1904 else WINDOWS_EPOCH
             if chart.has_title and chart.chart_title.has_text_frame:
                 result.extend(document(chart.chart_title.text_frame.text, path, f"{where} · 图表标题"))
             # 类别图表使用原始系列数据；不从柱子高度推测数值。
             for plot_number, plot in enumerate(chart.plots, 1):
                 plot_locator = f"{where} · 图表 {plot_number}"
-                categories = [" / ".join(labels) for labels in plot.categories.flattened_labels]
-                if plot._element.tag.rsplit("}", 1)[-1] in ("scatterChart", "bubbleChart"):
+                xy = plot._element.tag.rsplit("}", 1)[-1] in ("scatterChart", "bubbleChart")
+                axis_formats = _chart_axis_date_formats(plot, xy)
+                if xy:
                     # 散点/气泡图没有类别轴；从 OOXML 缓存读取实际点坐标。
                     for series_number, series in enumerate(plot.series, 1):
-                        axes = {}
                         names = ["xVal", "yVal"]
                         if series._element.xpath("./c:bubbleSize"):
                             names.append("bubbleSize")
-                        for axis in names:
-                            axes[axis] = {}
-                            formats = series._element.xpath(f"./c:{axis}//c:formatCode")
-                            number_format = formats[0].text if formats else "General"
-                            for point in series._element.xpath(f"./c:{axis}//c:pt"):
-                                value = point.find("{http://schemas.openxmlformats.org/drawingml/2006/chart}v")
-                                axes[axis][int(point.get("idx"))] = (
-                                    None if value is None or value.text is None
-                                    else _display_value(Decimal(value.text), number_format))
+                        axes = {name: _chart_points(getattr(series._element, name), epoch, axis_formats.get(name), Decimal)
+                                for name in names}
                         rows = [["X", "Y", *(["气泡大小"] if "bubbleSize" in names else [])]]
                         for i in sorted(set().union(*(axis.keys() for axis in axes.values()))):
                             rows.append([axes[axis].get(i) for axis in names])
                         result.extend(table_documents(rows, path, f"{plot_locator} · 系列 {series_number}「{series.name}」",
                                                       context=f"图表系列: {series.name}"))
                     continue
+                category = plot._element.cat
+                if category is not None and category.xpath("c:numRef | c:numLit"):
+                    categories = _chart_column(category, epoch, axis_formats.get("cat"), str)
+                else:
+                    categories = [" / ".join(labels) for labels in plot.categories.flattened_labels]
                 rows = [["类别", *[series.name for series in plot.series]]]
-                values = []
-                for series in plot.series:
-                    formats = series._element.xpath("./c:val//c:formatCode")
-                    number_format = formats[0].text if formats else "General"
-                    values.append([_display_value(value, number_format) for value in series.values])
+                values = [_chart_column(series._element.val, epoch, axis_formats.get("val"), float)
+                          for series in plot.series]
                 for i in range(max([len(categories), *map(len, values)])):
                     rows.append([categories[i] if i < len(categories) else None,
                                  *[series[i] if i < len(series) else None for series in values]])
