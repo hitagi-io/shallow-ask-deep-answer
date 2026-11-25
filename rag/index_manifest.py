@@ -57,10 +57,16 @@ class IndexManifest:
     expected_chunks: int
     chunk_hashes: tuple[str, ...]
     state: str = "ready"
+    published_source: str | None = None
 
     @property
     def identity(self) -> tuple[str, str]:
         return self.content_sha256, self.source_format
+
+    @property
+    def current_source(self) -> str:
+        """已发布文件优先，未发布的清单仍可按最初的来源修复。"""
+        return self.published_source or self.source
 
     def ready(self) -> IndexManifest:
         return replace(self, state="ready")
@@ -172,9 +178,13 @@ class ManifestStore:
     def all(self) -> dict[tuple[str, str], IndexManifest]:
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT content_sha256, source, source_format, index_version, index_id,
-                       expected_chunks, chunk_hashes, state
-                FROM index_manifests WHERE namespace = %s
+                SELECT DISTINCT ON (m.content_sha256, m.source_format)
+                       m.content_sha256, m.source, m.source_format, m.index_version, m.index_id,
+                       m.expected_chunks, m.chunk_hashes, m.state, f.source AS published_source
+                FROM index_manifests m LEFT JOIN published_source_files f
+                  USING (namespace, content_sha256, source_format)
+                WHERE m.namespace = %s
+                ORDER BY m.content_sha256, m.source_format, (f.source = m.source) DESC, f.source
             """, (self.namespace,)).fetchall()
         records = [IndexManifest(**{**row, "chunk_hashes": tuple(row["chunk_hashes"])}) for row in rows]
         return {record.identity: record for record in records}
@@ -237,18 +247,18 @@ class ManifestStore:
             self._record_files(conn, {source: digest})
             self._publish_file(conn, source, digest)
 
-    def published_index_ids(self, index_version: str) -> list[str]:
-        """读取已提交的检索批次白名单；存储错误必须继续抛出。"""
+    def published_index_sources(self, index_version: str) -> dict[str, str]:
+        """同一次查询取得可检索代次及其引用文件，优先使用仍在发布的原文件。"""
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT DISTINCT m.index_id
+                SELECT DISTINCT ON (m.index_id) m.index_id, f.source
                 FROM published_source_files f JOIN index_manifests m
                   ON m.namespace = f.namespace AND m.content_sha256 = f.content_sha256
                   AND m.source_format = f.source_format
                 WHERE f.namespace = %s AND m.state = 'ready' AND m.index_version = %s
-                ORDER BY m.index_id
+                ORDER BY m.index_id, (f.source = m.source) DESC, f.source
             """, (self.namespace, index_version)).fetchall()
-        return [row["index_id"] for row in rows]
+        return {row["index_id"]: row["source"] for row in rows}
 
     def is_published(self, source: str, digest: str, index_id: str) -> bool:
         """先等待同一清单的未决事务结束，再核对发布映射，处理提交回执丢失。"""

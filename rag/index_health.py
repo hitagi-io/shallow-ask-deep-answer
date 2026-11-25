@@ -76,33 +76,37 @@ class IndexHealth:
             identity = (row.get("content_sha256"), row.get("source_format"))
             rows_by_identity[identity].append(row)
             source = row.get("source")
+            record = records.get(identity)
+            if record is not None and row.get("index_id") == record.index_id and source == record.source:
+                source = record.current_source
             if not isinstance(source, str) or os.path.normcase(source) not in by_norm:
                 issue("ghost_vectors", "向量库存在残留分块", "对应源文件不存在或来源元数据缺失", source or str(row.get("pk")))
-            if identity not in records:
+            if record is None:
                 issue("missing_manifest", "分块缺少索引清单", "现有分块不能证明完整性，需从源文件重新索引", source or str(row.get("pk")))
 
         for identity, record in records.items():
             digest = record.content_sha256
-            path = by_norm.get(os.path.normcase(record.source))
+            source = record.current_source
+            path = by_norm.get(os.path.normcase(source))
             source_current = path is not None and disk[path] == digest
             if not by_identity.get(identity) and (path is None or disk[path] is not None):
-                issue("orphan_manifest", "索引清单对应内容已不在磁盘", "源文件已删除或被修改，需重建或清理旧索引", record.source)
+                issue("orphan_manifest", "索引清单对应内容已不在磁盘", "源文件已删除或被修改，需重建或清理旧索引", source)
             if path is None:
-                issue("missing_source", "索引来源文件已丢失", "存在同内容副本时会转移索引来源", record.source)
+                issue("missing_source", "索引来源文件已丢失", "存在同内容副本时会转移索引来源", source)
             elif disk[path] is not None and disk[path] != digest:
                 issue("stale_content", "索引内容已陈旧", "源文件 SHA-256 与入库时不一致", path)
             if record.state != "ready":
-                issue("incomplete_index", "索引构建未完成", "上次写入未完成校验和提交，需要重建", record.source)
+                issue("incomplete_index", "索引构建未完成", "上次写入未完成校验和提交，需要重建", source)
             if record.index_version != self.vector_store.index_version:
-                issue("outdated_index_version", "索引版本已过期", "解析、分块或嵌入配置已改变，需要重建", record.source)
+                issue("outdated_index_version", "索引版本已过期", "解析、分块或嵌入配置已改变，需要重建", source)
             actual = rows_by_identity.get(identity, [])
             matched = chunks_match(record, actual)
             if not actual:
-                issue("missing_vectors", "索引分块全部缺失", "清单存在，但 Milvus 中没有对应分块", record.source)
+                issue("missing_vectors", "索引分块全部缺失", "清单存在，但 Milvus 中没有对应分块", source)
             elif len(actual) != record.expected_chunks:
-                issue("chunk_count_mismatch", "索引分块数量不符", "存在部分缺失、重复或残留分块", f"{record.source}（预期 {record.expected_chunks}，实际 {len(actual)}）")
+                issue("chunk_count_mismatch", "索引分块数量不符", "存在部分缺失、重复或残留分块", f"{source}（预期 {record.expected_chunks}，实际 {len(actual)}）")
             elif not matched:
-                issue("chunk_integrity_mismatch", "索引分块内容或身份不符", "分块正文、引用坐标、来源、版本或写入代次与清单不一致", record.source)
+                issue("chunk_integrity_mismatch", "索引分块内容或身份不符", "分块正文、引用坐标、来源、版本或写入代次与清单不一致", source)
             if source_current and record.state == "ready" and record.index_version == self.vector_store.index_version and matched:
                 state["healthy_keys"].add(identity)
         for path, digest in disk.items():
@@ -138,7 +142,7 @@ class IndexHealth:
                 copies = state["by_identity"].get(identity)
                 if copies:
                     targets[identity] = copies[0]
-                source = state["by_norm"].get(os.path.normcase(record.source))
+                source = state["by_norm"].get(os.path.normcase(record.current_source))
                 if source and state["disk"][source]:
                     targets[(state["disk"][source], document_format(source))] = source
             # 清单遗失时重新解析源文件，不信任现存块数和元数据。
@@ -174,7 +178,7 @@ class IndexHealth:
             for identity, record in after["records"].items():
                 if after["by_identity"].get(identity) or unreadable:
                     continue
-                path = after["by_norm"].get(os.path.normcase(record.source))
+                path = after["by_norm"].get(os.path.normcase(record.current_source))
                 if path and (after["disk"][path], document_format(path)) not in after["healthy_keys"]:
                     continue  # 文件不可读或新版本仍未成功，保留旧清单以便再次修复。
                 try:

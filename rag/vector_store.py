@@ -152,7 +152,7 @@ class VectorStore:
         return self.chunk_rows(f"content_sha256 == {json.dumps(digest)} and source_format == {json.dumps(kind)}")
 
     def manifest_is_current(self, manifest: IndexManifest, rows: list[dict] | None = None) -> bool:
-        source = scoped_knowledge_file(self.knowledge_dir, manifest.source)
+        source = scoped_knowledge_file(self.knowledge_dir, manifest.current_source)
         if (manifest.state != "ready" or manifest.index_version != self.index_version
                 or compute_file_sha256(source) != manifest.content_sha256):
             return False
@@ -165,12 +165,14 @@ class VectorStore:
         )
         failures = []
         with interruptible_lock(self._store_lock):
+            previously_published = self.manifests.published_files()
             for path in paths:
                 check_shutdown()
                 try:
                     result = self.index_file(path)
                     if result["ok"]:
-                        self._retire_source_versions(path, result["content_sha256"])
+                        self._retire_source_versions(result["file"], result["content_sha256"],
+                                                     previous_sha256=previously_published.get(result["file"]))
                     else:
                         if result.get("content_sha256"):
                             self.manifests.record_files({path: result["content_sha256"]})
@@ -369,29 +371,42 @@ class VectorStore:
                 return path
         return None
 
-    def _retire_source_versions(self, file_path: str, keep_sha256: str | None = None) -> None:
-        """过期内容先转移到同内容副本；无副本时先删向量再删清单，失败仍可追踪。"""
+    def _retire_source_versions(self, file_path: str, keep_sha256: str | None = None, *,
+                                previous_sha256: str | None = None) -> None:
+        """有同内容副本时保留已验证的代次，最后一份移除时清理分块和清单。"""
         file_path = scoped_knowledge_file(self.knowledge_dir, file_path)
-        for identity, record in self.manifests.all().items():
+        normalized_path = os.path.normcase(file_path)
+        previous_identity = (previous_sha256, document_format(file_path)) if previous_sha256 else None
+        records = self.manifests.all()
+        for identity, record in records.items():
             sha256 = record.content_sha256
-            if os.path.normcase(record.source) != os.path.normcase(file_path) or sha256 == keep_sha256:
+            # 覆盖最后一个副本后，旧代次已经没有发布路径，须按覆盖前的内容找到它。
+            last_publication_replaced = record.published_source is None and identity == previous_identity
+            owns_source = os.path.normcase(record.current_source) == normalized_path
+            if sha256 == keep_sha256 or not (owns_source or last_publication_replaced):
                 continue
             survivor = self._another_file_with_same_content(file_path, sha256)
-            if survivor:
-                result = self.index_file(survivor)
-                if not result["ok"]:
-                    raise RuntimeError(f"同内容副本重建失败：{survivor}")
-            else:
-                self._delete_pks([row["pk"] for row in self._content_rows(identity)])
-                self.manifests.delete(identity)
+            rows = self._content_rows(identity)
+            if survivor and record.state == "ready":
+                current_rows = [row for row in rows if row.get("index_id") == record.index_id]
+                if chunks_match(record, current_rows):
+                    self.manifests.publish_existing_file(survivor, sha256)
+                    continue
+                if record.published_source is not None:
+                    raise RuntimeError("同内容副本的共享索引校验失败，请先执行索引修复")
+            self._delete_pks([row["pk"] for row in rows])
+            self.manifests.delete(identity)
+        # 分块保留首次入库路径。这个路径名下也可能有仍由其他文件发布的代次。
+        known_ids = {record.index_id for record in records.values()}
         self._delete_pks([row["pk"] for row in self.chunk_rows(f"source == {json.dumps(file_path)}")
-                          if keep_sha256 is None or row.get("content_sha256") != keep_sha256])
+                          if row.get("index_id") not in known_ids
+                          and (keep_sha256 is None or row.get("content_sha256") != keep_sha256)])
 
     def delete_file_index(self, file_path: str) -> None:
-        """调用方先删除磁盘文件；清单中的原始 SHA-256 不依赖文件仍存在。"""
+        """在项目写锁内先处理共享索引和发布记录，成功后调用方再移除磁盘文件。"""
         with self._store_lock:
-            self.manifests.forget_file(file_path)
             self._retire_source_versions(file_path)
+            self.manifests.forget_file(file_path)
 
     @traced("upload.replace")
     def replace_and_index_file(self, file_path: str, tmp_path: str, *, journal: UploadJournal,
@@ -439,7 +454,7 @@ class VectorStore:
             raise RuntimeError("备份文件校验失败，停止清理")
         self._delete_pks([row["pk"] for row in self._content_rows((record.new_hash, document_format(record.destination)))
                           if row["index_id"] != record.index_id])
-        self._retire_source_versions(record.destination, record.new_hash)
+        self._retire_source_versions(record.destination, record.new_hash, previous_sha256=record.old_hash)
         if backup_path is not None:
             os.remove(backup_path)
         journal.advance("cleaned")

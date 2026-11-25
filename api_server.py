@@ -1501,9 +1501,9 @@ def delete_file(filename: str, project: dict = Depends(require_project)):
                 _ensure_no_uploads(user_id, project_id)
                 if not os.path.isfile(file_path):
                     raise HTTPException(status_code=404, detail="文件不存在")
-                os.remove(file_path)
                 _invalidate_health(user_id, project_id)
                 get_vector_store(user_id, project_id).delete_file_index(file_path)
+                os.remove(file_path)
             return {"message": f"已删除: {filename}"}
         except HTTPException:
             raise
@@ -1511,8 +1511,7 @@ def delete_file(filename: str, project: dict = Depends(require_project)):
             raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
         except Exception:
             logger.exception("[知识库] 删除失败 file=%s project_id=%s", filename, project_id)
-            detail = "删除文件失败，请稍后重试" if os.path.exists(file_path) else "文件已删除，但索引清理失败，请执行索引修复"
-            raise HTTPException(status_code=500, detail=detail)
+            raise HTTPException(status_code=500, detail="删除文件失败，请重试或执行索引修复")
 
 
 @app.post("/api/projects/{project_id}/vector/build")

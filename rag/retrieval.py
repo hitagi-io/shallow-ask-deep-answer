@@ -105,10 +105,10 @@ class HybridRetriever:
         # 调用方在两路检索期间持有项目读锁；只读取一次发布白名单，
         # 确保稠密向量与稀疏向量召回使用同一份发布快照。
         # 白名单为空时不回退到无过滤检索。
-        index_ids = self.store.manifests.published_index_ids(self.store.index_version)
-        if not index_ids:
+        published_sources = self.store.manifests.published_index_sources(self.store.index_version)
+        if not published_sources:
             return []
-        expression = f"index_id in {json.dumps(index_ids)}"
+        expression = f"index_id in {json.dumps(list(published_sources))}"
         self.store.ensure_search_ready()
         vector_store = self.store.vector_store
         if not {"vector", "sparse"}.issubset(vector_store.fields):
@@ -139,6 +139,8 @@ class HybridRetriever:
         # 保留两路候选的完整并集（最多 40），不能先截成 Top5 再精排。
         with span("retrieval.fusion", config_hash=fingerprint(json.dumps(SETTINGS, sort_keys=True))) as fusion:
             candidates = fuse_rrf([dense, sparse], SETTINGS["rrf_k"])
+            for doc in candidates:
+                doc.metadata["source"] = published_sources[doc.metadata["index_id"]]
             fusion.attributes["count"] = len(candidates)
         logger.info("[混合召回] 向量=%s BM25=%s 融合候选=%s 耗时=%.0fms",
                     len(dense), len(sparse), len(candidates), (time.perf_counter() - started) * 1000)
