@@ -925,18 +925,12 @@ def _purge_thread_checkpoints(thread_id: str) -> None:
 
 @app.delete("/api/conversations/{conv_id}")
 def api_delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
-    """删除会话：与生成任务互斥，运行中的回答会先收到取消信号，本次删除返回 409。
-
-    检查点清理与会话删除放在同一个持锁事务里：清理失败时整体回滚，
-    不会出现「上下文已删、业务会话还在」的状态。
-    """
-    thread_id = f"{user['user_id']}:{conv_id}"
+    """删除会话及检查点。运行中的回答会先收到取消信号，本次删除返回 409。"""
     try:
         result = delete_conversation_guarded(
             user["user_id"],
             conv_id,
             CHAT_GENERATION_STALE_SECONDS,
-            lambda: _purge_thread_checkpoints(thread_id),
         )
     except Exception as e:
         logger.error(f"[会话] 删除失败 conversation_id={conv_id}：{e}")

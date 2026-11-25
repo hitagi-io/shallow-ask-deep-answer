@@ -10,6 +10,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
+from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg import Connection
 from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
@@ -1239,13 +1240,8 @@ def delete_conversation_guarded(
     user_id: int,
     conv_id: str,
     stale_seconds: float,
-    cleanup,
 ) -> str:
-    """删除会话：与生成任务共用会话锁，运行中的任务会先收到取消请求并拒绝本次删除。
-
-    cleanup 在持锁事务内执行（用于清理 LangGraph 检查点），失败时整体回滚，
-    业务数据保持原样。返回 'deleted' | 'busy' | 'not_found'。
-    """
+    """在同一事务中删除检查点和会话。运行中的任务先收到取消请求，本次返回 busy。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
@@ -1271,8 +1267,7 @@ def delete_conversation_guarded(
                 conn.commit()
                 return "busy"
 
-            # 清理和删除共用持锁事务，失败时由 _connection 回滚。
-            cleanup()
+            PostgresSaver(conn).delete_thread(f"{user_id}:{conv_id}")
             cur.execute(
                 "DELETE FROM conversations WHERE id = %s AND user_id = %s",
                 (conv_id, user_id),
