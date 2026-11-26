@@ -1,4 +1,4 @@
-"""校验磁盘 SHA-256、PostgreSQL 清单与 Milvus 中每一块实际内容。"""
+"""校验源文件、PostgreSQL 清单及原文快照、Milvus 分块。"""
 from __future__ import annotations
 
 import os
@@ -52,16 +52,20 @@ class IndexHealth:
         report["stats"]["files"] = len(disk)
         state = {"disk": disk, "by_norm": by_norm, "by_identity": by_identity,
                  "records": {}, "rows": [], "healthy_keys": set(), "unpublished_files": {}}
+
+        def manifest_unavailable(resource):
+            logger.exception("[索引健康检查] PostgreSQL %s读取失败", resource)
+            report["manifest_error"] = f"无法读取 PostgreSQL {resource}，详情见服务端日志"
+            issue("manifest_unreachable", "索引清单不可用", report["manifest_error"], "PostgreSQL")
+            report["issues"] = list(issues.values())
+            return report, state
+
         try:
             records = state["records"] = self.vector_store.manifests.all()
             published = {os.path.normcase(path): digest for path, digest in
                          self.vector_store.manifests.published_files().items()}
         except Exception:
-            logger.exception("[索引健康检查] PostgreSQL 清单读取失败")
-            report["manifest_error"] = "无法读取 PostgreSQL 索引清单，详情见服务端日志"
-            issue("manifest_unreachable", "索引清单不可用", report["manifest_error"], "PostgreSQL")
-            report["issues"] = list(issues.values())
-            return report, state
+            return manifest_unavailable("索引清单")
         try:
             rows = state["rows"] = self.vector_store.chunk_rows()
         except Exception:
@@ -84,6 +88,14 @@ class IndexHealth:
             if record is None:
                 issue("missing_manifest", "分块缺少索引清单", "现有分块不能证明完整性，需从源文件重新索引", source or str(row.get("pk")))
 
+        matched = {identity for identity, record in records.items()
+                   if chunks_match(record, rows_by_identity.get(identity, []))}
+        try:
+            invalid_snapshots = self.vector_store.manifests.invalid_snapshot_sources(
+                row for identity in matched for row in rows_by_identity[identity])
+        except Exception:
+            return manifest_unavailable("原文快照")
+
         for identity, record in records.items():
             digest = record.content_sha256
             source = record.current_source
@@ -100,14 +112,15 @@ class IndexHealth:
             if record.index_version != self.vector_store.index_version:
                 issue("outdated_index_version", "索引版本已过期", "解析、分块或嵌入配置已改变，需要重建", source)
             actual = rows_by_identity.get(identity, [])
-            matched = chunks_match(record, actual)
             if not actual:
                 issue("missing_vectors", "索引分块全部缺失", "清单存在，但 Milvus 中没有对应分块", source)
             elif len(actual) != record.expected_chunks:
                 issue("chunk_count_mismatch", "索引分块数量不符", "存在部分缺失、重复或残留分块", f"{source}（预期 {record.expected_chunks}，实际 {len(actual)}）")
-            elif not matched:
+            elif identity not in matched:
                 issue("chunk_integrity_mismatch", "索引分块内容或身份不符", "分块正文、引用坐标、来源、版本或写入代次与清单不一致", source)
-            if source_current and record.state == "ready" and record.index_version == self.vector_store.index_version and matched:
+            elif identity in invalid_snapshots:
+                issue("invalid_source_snapshot", "引用的原文快照缺失或损坏", "分块引用的解析快照不存在或内容摘要不符，需要从源文件重建", source)
+            elif source_current and record.state == "ready" and record.index_version == self.vector_store.index_version:
                 state["healthy_keys"].add(identity)
         for path, digest in disk.items():
             if (digest, document_format(path)) in state["healthy_keys"] and published.get(os.path.normcase(path)) != digest:

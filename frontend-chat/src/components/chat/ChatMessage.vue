@@ -20,7 +20,7 @@ const props = defineProps<{
   thinkingPhase: string
   busy: boolean
 }>()
-const emit = defineEmits<{ retry: [] }>()
+const emit = defineEmits<{ retry: []; sync: [] }>()
 const feedback = ref<'like' | 'dislike' | null>(null)
 function toggleFeedback(value: 'like' | 'dislike') {
   feedback.value = feedback.value === value ? null : value
@@ -94,6 +94,7 @@ const html = computed(() => {
       </div>
       <div v-if="message.role === 'assistant' && !(thinking && !message.content)" ref="body" class="bubble markdown-body" @click="copyCode" v-html="html"></div>
       <div v-if="message.role === 'assistant' && !thinking && !streaming" class="message-actions">
+        <button v-if="message.status === 'streaming'" class="text-action" :disabled="busy" @click="emit('sync')">同步回答</button>
         <button v-if="message.generation_id && message.trace_id" class="text-action" @click="showExecution = true">执行过程</button>
         <button v-if="message.content" class="icon-button" aria-label="复制回答" title="复制回答" @click="copy(message.content)">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>

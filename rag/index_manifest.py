@@ -5,6 +5,7 @@ import json
 import os
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from importlib.metadata import version
 
@@ -15,7 +16,7 @@ from psycopg.types.json import Jsonb
 from utils.core.project_paths import knowledge_scope
 from utils.documents.knowledge_files import document_format
 from utils.documents.file_listing import KnowledgeFile
-from utils.retrieval.source_evidence import chunk_signature, text_digest
+from utils.retrieval.source_evidence import chunk_signature, snapshot_digest, text_digest
 from utils.indexing.progress import UnitProgressCallback
 
 
@@ -211,7 +212,9 @@ class ManifestStore:
                     cur.executemany("""
                         INSERT INTO indexed_source_snapshots
                             (namespace, content_sha256, source_format, snapshot, payload)
-                        VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (namespace, content_sha256, source_format, snapshot) DO UPDATE
+                        SET payload = EXCLUDED.payload
                     """, ((self.namespace, *manifest.identity, key, Jsonb(data)) for key, data in snapshots))
                 self._record_files(conn, {manifest.source: manifest.content_sha256})
                 self._publish_file(conn, manifest.source, manifest.content_sha256)
@@ -223,6 +226,24 @@ class ManifestStore:
                 WHERE namespace = %s AND content_sha256 = %s AND source_format = %s AND snapshot = %s
             """, (self.namespace, *identity, key)).fetchone()
         return row["payload"] if row else None
+
+    def invalid_snapshot_sources(self, chunks: Iterable[dict]) -> set[tuple[str, str]]:
+        """按文件核对已通过分块校验的引用，每份快照只读取和计算一次摘要。"""
+        refs = {(row["content_sha256"], row["source_format"], row["source_snapshot"]) for row in chunks}
+        if not refs:
+            return set()
+        digests, formats, snapshots = zip(*refs)
+        with self._connect() as conn, conn.cursor(name="verify_source_snapshots") as cur:
+            cur.execute("""
+                SELECT s.content_sha256, s.source_format, s.snapshot, s.payload
+                FROM unnest(%s::text[], %s::text[], %s::text[]) AS refs(content_sha256, source_format, snapshot)
+                JOIN indexed_source_snapshots s USING (content_sha256, source_format, snapshot)
+                WHERE s.namespace = %s
+            """, (list(digests), list(formats), list(snapshots), self.namespace))
+            for row in cur:
+                if isinstance(row["payload"], dict) and snapshot_digest(row["payload"]) == row["snapshot"]:
+                    refs.remove((row["content_sha256"], row["source_format"], row["snapshot"]))
+        return {(digest, kind) for digest, kind, _ in refs}
 
     def _publish_file(self, conn, source: str, digest: str) -> None:
         conn.execute("""

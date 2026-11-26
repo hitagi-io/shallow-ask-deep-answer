@@ -14,7 +14,7 @@ const { input, inputEl, chatArea, current, isProcessing, isThinking, thinkingSec
   kbOnly, switchMode, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice, projectId, selectedProject, projectReady, projectDeleted, selectProject, newConversation,
   loading, loadError, initConversations, conversationBusy, following, onScroll, jumpToLatest,
   knowledgeBlocked, knowledgeNotice, knowledgeStatus, refreshKnowledgeReadiness, checkingSend,
-  hasEarlier, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend } = props.chat
+  hasEarlier, visibleMessages, messageOffset, showEarlier, loadMessages, retryMessage, canRetrySend, retryFailedSend } = props.chat
 const suggestions = computed(() => kbOnly.value ? [
   { icon: 'file' as const, title: '提炼重点', detail: '快速读懂项目资料', prompt: '请总结这个项目资料中的核心内容，并列出关键要点。' },
   { icon: 'book' as const, title: '查找依据', detail: '让答案有据可查', prompt: '请帮我查找资料中关于以下问题的规定，并注明来源：' },
@@ -84,9 +84,9 @@ async function clearInput() {
       <button v-if="hasEarlier" class="history-button text-action" :disabled="current.messagesLoading" @click="showEarlier">{{ current.messagesLoading ? '正在加载…' : '查看更早的消息' }}</button>
       <ChatMessage v-for="(msg, i) in visibleMessages" :key="`${current.id}:${kbOnly ? 'kb' : 'general'}:${msg.id ?? `local-${messageOffset + i}`}`"
         :message="msg" :project-deleted="projectDeleted" :thinking="isThinking && i === visibleMessages.length - 1"
-        :streaming="isProcessing && !isThinking && i === visibleMessages.length - 1" :busy="isProcessing"
+        :streaming="isProcessing && !isThinking && i === visibleMessages.length - 1" :busy="isProcessing || !!current.messagesLoading"
         :thinking-seconds="i === visibleMessages.length - 1 ? thinkingSeconds : 0" :thinking-phase="i === visibleMessages.length - 1 ? thinkingPhase : ''"
-        @retry="retryMessage(messageOffset + i)" />
+        @sync="loadMessages(current.id)" @retry="retryMessage(messageOffset + i)" />
     </template>
   </div>
   <div v-if="current?.messages.length" class="chat-navigation">

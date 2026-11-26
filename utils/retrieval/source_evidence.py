@@ -141,7 +141,7 @@ def read_source_passage(file_path: str, version: str, unit: int, start: int, end
     if compute_file_sha256(file_path) != version:
         raise SourceVersionChanged("原文件已更新，无法用当前版本核验这条历史引用。请重新提问。")
     saved = lookup(snapshot)
-    if saved is None or saved.get("unit") != unit or snapshot_digest(saved) != snapshot:
+    if not isinstance(saved, dict) or saved.get("unit") != unit or snapshot_digest(saved) != snapshot:
         raise SourceVersionChanged("此引用对应的解析快照不可用。")
     text = saved["text"]
     page_number = saved["page"]

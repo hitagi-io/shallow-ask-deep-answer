@@ -156,7 +156,9 @@ class VectorStore:
         if (manifest.state != "ready" or manifest.index_version != self.index_version
                 or compute_file_sha256(source) != manifest.content_sha256):
             return False
-        return chunks_match(manifest, self._content_rows(manifest.identity) if rows is None else rows)
+        if rows is None:
+            rows = self._content_rows(manifest.identity)
+        return chunks_match(manifest, rows) and not self.manifests.invalid_snapshot_sources(rows)
 
     def index_pending_files(self, file_paths=None) -> list[dict]:
         """补建未入库或校验失败的内容；成功后清理同路径的过期版本。"""

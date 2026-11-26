@@ -148,14 +148,15 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     finally { loadingMore.value = false }
   }
 
-  async function loadMessages(id = currentId.value, before: number | null = null) {
+  async function loadMessages(id = currentId.value, before: number | null = null, interruptedRequestId?: string) {
     const conv = conversations.value[id]
     if (!conv) return
-    if (conv.messagesError?.before === before) return conv.messagesError.retry()
+    // 刷新最近消息时从最新页核对终态，翻阅旧消息时可继续上次的读取。
+    if (before !== null && conv.messagesError?.before === before) return conv.messagesError.retry()
     const pages: HistoryPage[] = []
     let cursor = before
     const refreshThrough = before === null && conv.messages.length ? conv.latestHistoryId ?? 0 : null
-    async function read() {
+    async function read(skipSubscription?: string) {
       if (disposed || conversations.value[id] !== conv || conv.messagesLoading) return
       if (before === null && (runs.value[id] || checkingSendFor.value === id)) return
       conv.messagesLoading = true
@@ -193,7 +194,8 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
           conv.project_deleted = page.project_deleted
         }
         if (page.project_deleted && page.project_id) markProjectDeleted(page.project_id)
-        if (page.active_generation) {
+        // 恢复的订阅再次中断时只同步历史，避免循环订阅同一任务。
+        if (page.active_generation && page.active_generation.request_id !== skipSubscription) {
           void observeGeneration(id, page.active_generation.request_id)
         }
       } catch (e) {
@@ -205,7 +207,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
         conv.messagesLoading = false
       }
     }
-    await read()
+    await read(interruptedRequestId)
   }
 
   watch(isProcessing, (processing) => {
@@ -356,9 +358,11 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     }
   }
   function retryMessage(index: number) {
+    const assistant = current.value?.messages[index]
+    if (assistant?.status !== 'error' && assistant?.status !== 'cancelled') return
     const question = current.value?.messages.slice(0, index).reverse().find(m => m.role === 'user')
-    if (question && !isProcessing.value) void sendMessage(question.content, current.value?.messages[index].kbOnly ?? kbOnly.value,
-      undefined, current.value?.messages[index].generation_id ?? undefined)
+    if (question && !isProcessing.value) void sendMessage(question.content, assistant.kbOnly ?? kbOnly.value,
+      undefined, assistant.generation_id ?? undefined)
   }
   function retryFailedSend() {
     const attempt = failedAttempts.value[currentId.value]
@@ -394,7 +398,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     const run = runs.value[id]
     const ac = new AbortController()
     controllers.set(id, ac)
-    let lastAssistant = submission?.assistant
+    let interrupted = false
     try {
       const outcome = await streamChat(id, requestId, snapshot => {
         if (disposed) return
@@ -430,7 +434,6 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
         conv.project_name = snapshot.project_name
         conv.project_deleted = snapshot.project_deleted
         assistant.status = snapshot.status === 'running' ? 'streaming' : snapshot.status === 'failed' ? 'error' : snapshot.status
-        lastAssistant = assistant
         if (submission) {
           const savedUser = conv.messages.find(m => m.id === snapshot.user_message_id)
           if (savedUser && savedUser !== submission.user) conv.messages = conv.messages.filter(m => m !== submission.user)
@@ -450,8 +453,8 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
         handlePersistError('发送消息', new Error(outcome.error || '未能确认是否发送成功，请重试'))
       } else {
         delete failedAttempts.value[id]
+        interrupted = outcome.status === 'interrupted'
         if (outcome.status === 'error' && outcome.error) {
-          if (lastAssistant?.status === 'streaming') lastAssistant.status = 'error'
           console.error('[回答失败]', outcome.error)
           showNotice(outcome.error, 'error')
         }
@@ -459,7 +462,9 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     } finally {
       delete runs.value[id]
       controllers.delete(id)
-      if (!disposed && submission && !run.confirmed) void loadMessages(id)
+      if (!disposed && (interrupted || (submission && !run.confirmed))) {
+        await loadMessages(id, null, submission ? undefined : requestId)
+      }
       if (currentId.value === id) scrollToBottom()
     }
   }

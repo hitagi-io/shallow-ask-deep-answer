@@ -318,7 +318,7 @@ export async function apiAuditEvents(before: number | null = null) {
 }
 
 export interface StreamOutcome {
-  status: 'completed' | 'error' | 'cancelled'
+  status: 'completed' | 'error' | 'cancelled' | 'interrupted'
   started: boolean
   error?: string
 }
@@ -376,7 +376,7 @@ export async function streamChat(
         // 首次 POST 回执丢失时，给登记事务留出完成时间，再确认任务是否存在。
         if (!initial && res.status === 404 && !started && ++missingAttempts < 3) throw new StreamConnectionError('等待任务登记')
         if (res.status >= 500) throw new StreamConnectionError('服务暂时不可用')
-        return { status: 'error', started, error: await errorMessage(res, `请求失败: ${res.status}`) }
+        return { status: 'interrupted', started, error: await errorMessage(res, `请求失败: ${res.status}`) }
       }
       started = true
       reader = res.body?.getReader()
@@ -387,7 +387,7 @@ export async function streamChat(
         if (!line.startsWith('data: ')) return null
         const event: unknown = JSON.parse(line.slice(6))
         if (!isRecord(event)) throw new Error('回答事件格式无效')
-        if (event.type === 'error' && typeof event.error === 'string') return { status: 'error', started, error: event.error }
+        if (event.type === 'error' && typeof event.error === 'string') return { status: 'interrupted', started, error: event.error }
         if (event.type !== 'snapshot') throw new Error('未知的回答事件')
         const data = parseGeneration(event)
         onConnection(false)
@@ -414,14 +414,14 @@ export async function streamChat(
       if (signal.aborted) break
       if (!(error instanceof StreamConnectionError)) {
         console.error('[回答流] 响应处理失败', error)
-        return { status: 'error', started, error: '回答数据处理失败，请刷新页面后重试。' }
+        return { status: 'interrupted', started, error: '回答数据处理失败，请重新同步回答。' }
       }
     } finally {
       await reader?.cancel().catch(() => {})
     }
     if (!signal.aborted) {
       if (++reconnectAttempts >= 5) {
-        return { status: 'error', started, error: '多次连接回答服务失败，请检查网络后刷新页面重试。' }
+        return { status: 'interrupted', started, error: '多次连接回答服务失败，请检查网络后重试。' }
       }
       onConnection(true)
       await reconnectDelay(signal)
