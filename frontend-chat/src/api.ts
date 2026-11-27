@@ -86,9 +86,7 @@ export function isSourceUrl(value: string): boolean {
 
 export async function apiSourcePassage(url: string, signal: AbortSignal): Promise<SourcePassage> {
   if (!isSourceUrl(url)) throw new Error('无效的原文链接')
-  const res = await apiFetch(url, { headers: authHeaders(), signal })
-  if (!res.ok) throw new Error(await errorMessage(res, '无法读取原文，请稍后重试'))
-  return res.json()
+  return apiJson(url, '无法读取原文，请稍后重试', { signal })
 }
 
 // ---------- 认证辅助函数 ----------
@@ -129,10 +127,10 @@ function clearAuth() {
   localStorage.removeItem(TOKEN_KEY)
 }
 
-function authHeaders(): Record<string, string> {
+function verifiedAuthorization(): string {
   const verifiedToken = verifiedSession?.token
   if (!verifiedToken || verifiedToken !== getToken()) throw new Error('登录状态已变更，正在复核身份')
-  return { Authorization: `Bearer ${verifiedToken}` }
+  return `Bearer ${verifiedToken}`
 }
 
 // 401 统一回调：由应用层注册（清空登录态并展示登录页）
@@ -157,10 +155,13 @@ async function handleUnauthorized(token: string | null, signal?: AbortSignal | n
  * 统一清除本地凭证并通知应用层回到登录页。
  * 登录接口不使用它——那里的 401 表示账号密码错误，而非会话过期。
  */
-async function apiFetch(input: string, init?: RequestInit, waitForCredentialChange = true): Promise<Response> {
-  const token = new Headers(init?.headers).get('Authorization')?.slice(7) ?? null
-  const res = await fetch(input, init)
-  if (res.status === 401) await handleUnauthorized(token, init?.signal, waitForCredentialChange)
+async function apiFetch(input: string, init: RequestInit = {}, waitForCredentialChange = true): Promise<Response> {
+  const headers = new Headers(init.headers)
+  // apiMe 在会话确认前携带待验证令牌，其余请求使用已确认的凭证。
+  if (!headers.has('Authorization')) headers.set('Authorization', verifiedAuthorization())
+  const token = headers.get('Authorization')!.slice(7)
+  const res = await fetch(input, { ...init, headers })
+  if (res.status === 401) await handleUnauthorized(token, init.signal, waitForCredentialChange)
   if (token !== getToken()) throw new Error('登录状态已变更')
   return res
 }
@@ -175,14 +176,20 @@ async function errorMessage(res: Response, fallback: string): Promise<string> {
   return typeof detail === 'string' && detail ? detail : fallback
 }
 
+function jsonRequest(method: string, body: object): RequestInit {
+  return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+}
+
+async function apiJson<T>(url: string, fallback: string, init?: RequestInit): Promise<T> {
+  const res = await apiFetch(url, init)
+  if (!res.ok) throw new Error(await errorMessage(res, fallback))
+  return res.json()
+}
+
 // ---------- 认证接口 ----------
 
 export async function apiRegister(username: string, password: string): Promise<void> {
-  const res = await fetch('/api/auth/register', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
-  })
+  const res = await fetch('/api/auth/register', jsonRequest('POST', { username, password }))
   if (!res.ok) {
     throw new Error(await errorMessage(res, '注册失败'))
   }
@@ -190,11 +197,7 @@ export async function apiRegister(username: string, password: string): Promise<v
 
 export async function apiLogin(username: string, password: string): Promise<UserInfo> {
   const originalToken = getToken()
-  const res = await fetch('/api/auth/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
-  })
+  const res = await fetch('/api/auth/login', jsonRequest('POST', { username, password }))
   if (!res.ok) {
     throw new Error(await errorMessage(res, '登录失败'))
   }
@@ -224,7 +227,7 @@ export async function apiLogout(): Promise<boolean> {
   if (getToken() !== token) throw new Error('登录状态已变更')
   if (!token) return true
   const res = await fetch('/api/auth/logout', {
-    method: 'POST', headers: authHeaders(), signal: AbortSignal.timeout(10000),
+    method: 'POST', headers: { Authorization: verifiedAuthorization() }, signal: AbortSignal.timeout(10000),
   })
   if (!res.ok && res.status !== 401) throw new Error(await errorMessage(res, '服务端暂时无法确认退出，请重试'))
   if (getToken() !== token) return !hasAuthToken()
@@ -238,10 +241,7 @@ export async function apiUpdateAccount(changes: { username?: string; current_pas
   let settle!: () => void
   credentialChange = new Promise<void>(resolve => { settle = resolve })
   try {
-    const res = await apiFetch('/api/auth/me', {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify(changes),
-    }, false)
+    const res = await apiFetch('/api/auth/me', jsonRequest('PATCH', changes), false)
     if (!res.ok) throw new Error(await errorMessage(res, '保存失败，请重试'))
     const data = await res.json()
     if (originalToken !== getToken()) throw new Error('登录状态已变更')
@@ -252,20 +252,12 @@ export async function apiUpdateAccount(changes: { username?: string; current_pas
 }
 
 export async function apiVerifyDeletion(password: string): Promise<{ confirmation_token: string; confirmation_text: string }> {
-  const res = await apiFetch('/api/auth/deletion-verification', {
-    method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ password }),
-  })
-  if (!res.ok) throw new Error(await errorMessage(res, '身份验证失败，请重试'))
-  return res.json()
+  return apiJson('/api/auth/deletion-verification', '身份验证失败，请重试', jsonRequest('POST', { password }))
 }
 
 export async function apiDeleteAccount(confirmation_token: string, confirmation_text: string): Promise<string> {
   const token = getToken()
-  const res = await apiFetch('/api/auth/me', {
-    method: 'DELETE', headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ confirmation_token, confirmation_text }),
-  })
+  const res = await apiFetch('/api/auth/me', jsonRequest('DELETE', { confirmation_token, confirmation_text }))
   if (!res.ok) throw new Error(await errorMessage(res, '未能确认注销结果，请重新登录查看账号状态后再试'))
   if (getToken() !== token && hasAuthToken()) throw new Error('原账号已注销，当前登录状态已变更')
   clearAuth()
@@ -279,9 +271,7 @@ export async function fetchConversations(cursor?: string | null): Promise<{
 }> {
   const query = new URLSearchParams({ limit: '20' })
   if (cursor) query.set('cursor', cursor)
-  const res = await apiFetch(`/api/conversations?${query}`, { headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '获取会话列表失败'))
-  return res.json()
+  return apiJson(`/api/conversations?${query}`, '获取会话列表失败')
 }
 
 export async function fetchMessages(id: string, before?: number | null) {
@@ -289,37 +279,23 @@ export async function fetchMessages(id: string, before?: number | null) {
   if (before != null) query.set('before', String(before))
   const controller = new AbortController()
   return chatIO(controller, async () => {
-    const res = await apiFetch(`/api/conversations/${encodeURIComponent(id)}/messages?${query}`, { headers: authHeaders(), signal: controller.signal })
-    if (!res.ok) throw new Error(await errorMessage(res, '获取消息失败'))
-    return parseMessageHistory(await res.json())
+    const url = `/api/conversations/${encodeURIComponent(id)}/messages?${query}`
+    return parseMessageHistory(await apiJson(url, '获取消息失败', { signal: controller.signal }))
   })
 }
 
 export async function createConversationApi(title: string): Promise<Conversation> {
-  const res = await apiFetch('/api/conversations', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ title }),
-  })
-  if (!res.ok) throw new Error(await errorMessage(res, '创建会话失败'))
-  const summary: ConversationSummary = await res.json()
+  const summary = await apiJson<ConversationSummary>('/api/conversations', '创建会话失败', jsonRequest('POST', { title }))
   return withEmptyHistory(summary)
 }
 
 export async function updateConversationTitle(id: string, title: string): Promise<void> {
-  const res = await apiFetch(`/api/conversations/${encodeURIComponent(id)}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ title }),
-  })
+  const res = await apiFetch(`/api/conversations/${encodeURIComponent(id)}`, jsonRequest('PATCH', { title }))
   if (!res.ok) throw new Error(await errorMessage(res, '更新标题失败'))
 }
 
 export async function deleteConversationApi(id: string): Promise<void> {
-  const res = await apiFetch(`/api/conversations/${encodeURIComponent(id)}`, {
-    method: 'DELETE',
-    headers: authHeaders(),
-  })
+  const res = await apiFetch(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' })
   if (!res.ok) throw new Error(await errorMessage(res, '删除会话失败'))
 }
 
@@ -334,16 +310,12 @@ export function newRequestId(): string {
 }
 
 export async function apiGenerationTrace(generationId: number) {
-  const res = await apiFetch(`/api/generations/${generationId}/trace`, { headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '无法读取执行记录'))
-  return parseTrace(await res.json())
+  return parseTrace(await apiJson(`/api/generations/${generationId}/trace`, '无法读取执行记录'))
 }
 
 export async function apiAuditEvents(before: number | null = null) {
   const query = before === null ? '' : `?before=${before}`
-  const res = await apiFetch(`/api/audit-events${query}`, { headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '无法读取操作记录'))
-  return parseAuditPage(await res.json())
+  return parseAuditPage(await apiJson(`/api/audit-events${query}`, '无法读取操作记录'))
 }
 
 export interface StreamOutcome {
@@ -358,10 +330,12 @@ function generationPath(conversationId: string, requestId: string) {
 
 const CHAT_IDLE_TIMEOUT_MS = 15_000
 
-async function chatIO<T>(controller: AbortController, operation: () => Promise<T>): Promise<T> {
+async function withRequestTimeout<T>(
+  controller: AbortController, timeoutMs: number, message: string, operation: () => Promise<T>,
+): Promise<T> {
   const { signal } = controller
   signal.throwIfAborted()
-  const timer = setTimeout(() => controller.abort(new DOMException('回答连接超时', 'TimeoutError')), CHAT_IDLE_TIMEOUT_MS)
+  const timer = setTimeout(() => controller.abort(new DOMException(message, 'TimeoutError')), timeoutMs)
   let onAbort!: () => void
   const aborted = new Promise<never>((_, reject) => {
     onAbort = () => reject(signal.reason)
@@ -375,13 +349,15 @@ async function chatIO<T>(controller: AbortController, operation: () => Promise<T
   }
 }
 
+function chatIO<T>(controller: AbortController, operation: () => Promise<T>) {
+  return withRequestTimeout(controller, CHAT_IDLE_TIMEOUT_MS, '回答连接超时', operation)
+}
+
 export async function cancelGeneration(conversationId: string, requestId: string, beforeStart: boolean) {
   const controller = new AbortController()
   return chatIO(controller, async (): Promise<'registered' | 'before_start'> => {
     const path = generationPath(conversationId, requestId) + '/cancel' + (beforeStart ? '?before_start=true' : '')
-    const res = await apiFetch(path, { method: 'POST', headers: authHeaders(), signal: controller.signal })
-    if (!res.ok) throw new Error(await errorMessage(res, '暂时无法停止回答，请重试'))
-    const data = await res.json()
+    const data = await apiJson<{ state: unknown }>(path, '暂时无法停止回答，请重试', { method: 'POST', signal: controller.signal })
     if (data.state !== 'registered' && data.state !== 'before_start') throw new Error('服务端尚未确认停止回答')
     return data.state
   })
@@ -425,7 +401,7 @@ export async function streamChat(
       submit = undefined
       const res = await chatIO(connection, () => apiFetch(initial ? '/api/chat/stream' : `${generationPath(conversationId, requestId)}/stream`, {
         method: initial ? 'POST' : 'GET',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        headers: { 'Content-Type': 'application/json' },
         body: initial ? JSON.stringify({ message: initial.message, thread_id: conversationId, request_id: requestId, kb_only: initial.kbOnly, project_id: initial.projectId, retry_of: initial.retryOf ?? null }) : undefined,
         signal: connection.signal,
       })).catch(error => { throw new StreamConnectionError('连接回答服务失败', error) })
@@ -515,51 +491,36 @@ export function isRequestCancelled(error: unknown): boolean {
 async function fetchKnowledgeJson<T>(url: string, fallback: string, options: KnowledgeRequestOptions): Promise<T> {
   const controller = new AbortController()
   const cancel = () => controller.abort(new DOMException('请求已取消', 'AbortError'))
-  const timeout = setTimeout(() => controller.abort(new DOMException('读取知识库状态超时，请稍后重试', 'TimeoutError')),
-    options.timeoutMs === undefined ? KNOWLEDGE_REQUEST_TIMEOUT_MS : knowledgeTimeout(options.timeoutMs))
-  let rejectAborted: () => void = () => {}
-  const aborted = new Promise<never>((_, reject) => {
-    rejectAborted = () => reject(controller.signal.reason)
-    controller.signal.addEventListener('abort', rejectAborted, { once: true })
-  })
+  const timeoutMs = options.timeoutMs === undefined ? KNOWLEDGE_REQUEST_TIMEOUT_MS : knowledgeTimeout(options.timeoutMs)
   options.signal?.addEventListener('abort', cancel, { once: true })
   if (options.signal?.aborted) cancel()
   try {
     // 响应解析期间仍受截止时间约束，错误响应也不例外。
-    const request = async () => {
-      controller.signal.throwIfAborted()
-      const res = await apiFetch(url, { headers: authHeaders(), signal: controller.signal })
+    return await withRequestTimeout(controller, timeoutMs, '读取知识库状态超时，请稍后重试', async () => {
+      const res = await apiFetch(url, { signal: controller.signal })
       controller.signal.throwIfAborted()
       if (!res.ok) throw new Error(await errorMessage(res, fallback))
-      return await res.json() as T
-    }
-    return await Promise.race([request(), aborted])
+      return res.json() as Promise<T>
+    })
   } finally {
-    clearTimeout(timeout)
     options.signal?.removeEventListener('abort', cancel)
-    controller.signal.removeEventListener('abort', rejectAborted)
   }
 }
 
 export async function fetchProjects(): Promise<Project[]> {
-  const res = await apiFetch('/api/projects', { headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '获取项目失败'))
-  return (await res.json()).projects
+  const data = await apiJson<{ projects: Project[] }>('/api/projects', '获取项目失败')
+  return data.projects
 }
 
 export async function saveProject(name: string, id?: string): Promise<Project> {
-  const res = await apiFetch(id ? projectPath(id) : '/api/projects', {
-    method: id ? 'PATCH' : 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ name }),
-  })
-  if (!res.ok) throw new Error(await errorMessage(res, id ? '重命名项目失败' : '创建项目失败'))
-  return (await res.json()).project
+  const data = await apiJson<{ project: Project }>(id ? projectPath(id) : '/api/projects',
+    id ? '重命名项目失败' : '创建项目失败', jsonRequest(id ? 'PATCH' : 'POST', { name }))
+  return data.project
 }
 
 export async function deleteProject(id: string): Promise<string> {
-  const res = await apiFetch(projectPath(id), { method: 'DELETE', headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '删除项目失败'))
-  return (await res.json()).message
+  const data = await apiJson<{ message: string }>(projectPath(id), '删除项目失败', { method: 'DELETE' })
+  return data.message
 }
 
 export interface FileRequestOptions extends KnowledgeRequestOptions {
@@ -600,7 +561,7 @@ export async function uploadFiles(projectId: string, files: File[], { onProgress
   const res = await new Promise<Response>((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `${projectPath(projectId)}/files/upload`)
-    for (const [key, value] of Object.entries(authHeaders())) xhr.setRequestHeader(key, value)
+    xhr.setRequestHeader('Authorization', verifiedAuthorization())
     const abort = () => xhr.abort()
     xhr.upload.onprogress = event => onProgress?.(event.lengthComputable && event.total > 0
       ? Math.floor(event.loaded / event.total * 100) : null)
@@ -624,9 +585,8 @@ export async function fetchUploadTasks(projectId: string, options: KnowledgeRequ
 }
 
 export async function deleteFile(projectId: string, name: string): Promise<string> {
-  const res = await apiFetch(`${projectPath(projectId)}/files/${encodeURIComponent(name)}`, { method: 'DELETE', headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '删除失败'))
-  return (await res.json()).message
+  const data = await apiJson<{ message: string }>(`${projectPath(projectId)}/files/${encodeURIComponent(name)}`, '删除失败', { method: 'DELETE' })
+  return data.message
 }
 
 export interface HealthIssue {
@@ -664,7 +624,5 @@ export async function fetchIndexHealth(projectId: string, refresh = false, optio
 }
 
 export async function repairIndexHealth(projectId: string): Promise<IndexRepairReport> {
-  const res = await apiFetch(`${projectPath(projectId)}/index/health/repair`, { method: 'POST', headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '修复与补建失败'))
-  return res.json()
+  return apiJson(`${projectPath(projectId)}/index/health/repair`, '修复与补建失败', { method: 'POST' })
 }

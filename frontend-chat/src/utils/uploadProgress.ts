@@ -1,4 +1,4 @@
-import { isRecord, isCount } from './validation'
+import { isRecord, isCount, nullableText } from './validation'
 
 export const indexStages = ['preparing', 'parsing', 'splitting', 'embedding', 'writing', 'verifying', 'finalizing'] as const
 export type IndexStage = typeof indexStages[number]
@@ -55,9 +55,6 @@ export function taskFilePercent(file: UploadTask['files'][number]): number {
   return file.progress === null ? transferredPercent : file.progress.percent
 }
 
-function isNullableText(value: unknown): value is string | null {
-  return value === null || typeof value === 'string'
-}
 function isNullableBoolean(value: unknown): value is boolean | null {
   return value === null || typeof value === 'boolean'
 }
@@ -84,11 +81,11 @@ export function parseUploadTasks(value: unknown): { activity: ProjectActivity; t
     if (!isRecord(task) || typeof task.task_id !== 'string'
         || (task.status !== 'queued' && task.status !== 'running' && task.status !== 'completed' && task.status !== 'failed')
         || !isCount(task.total) || !isCount(task.completed) || !isCount(task.succeeded) || !isCount(task.failed)
-        || !isNullableText(task.error) || typeof task.recovery_required !== 'boolean' || !Array.isArray(task.files)) return invalidProgress()
+        || !nullableText(task.error) || typeof task.recovery_required !== 'boolean' || !Array.isArray(task.files)) return invalidProgress()
     const files = task.files.map((file: unknown): UploadTask['files'][number] => {
       if (!isRecord(file) || typeof file.name !== 'string'
           || (file.status !== 'queued' && file.status !== 'running' && file.status !== 'success' && file.status !== 'error')
-          || !isNullableBoolean(file.overwritten) || !isNullableBoolean(file.indexed) || !isNullableText(file.error)) return invalidProgress()
+          || !isNullableBoolean(file.overwritten) || !isNullableBoolean(file.indexed) || !nullableText(file.error)) return invalidProgress()
       if (!isNullableBoolean(file.file_exists)
           || (file.status === 'success' ? file.file_exists === null : file.file_exists !== null)) return invalidProgress()
       return { name: file.name, status: file.status, overwritten: file.overwritten, indexed: file.indexed,

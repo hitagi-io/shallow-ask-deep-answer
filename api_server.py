@@ -840,7 +840,7 @@ def api_me(user: dict = Depends(get_current_user)):
 
 @app.patch("/api/auth/me")
 def api_update_account(req: UpdateAccountRequest, user: dict = Depends(account_change_user("account.update"))):
-    with audit_operation(user["user_id"], "account.update", "account", str(user["user_id"]), transactional=True) as operation:
+    with audit_operation(user["user_id"], "account.update", "account", str(user["user_id"]), transactional=True):
         try:
             return update_account(user["user_id"], user["auth_version"], session_id=user["session_id"],
                                   expires_at=user["expires_at"], **req.model_dump())
@@ -850,7 +850,7 @@ def api_update_account(req: UpdateAccountRequest, user: dict = Depends(account_c
 
 @app.post("/api/auth/deletion-verification")
 def api_prepare_deletion(req: DeletionVerificationRequest, user: dict = Depends(account_change_user("account.verify_deletion"))):
-    with audit_operation(user["user_id"], "account.verify_deletion", "account", str(user["user_id"])) as operation:
+    with audit_operation(user["user_id"], "account.verify_deletion", "account", str(user["user_id"])):
         try:
             return prepare_deletion(user["user_id"], user["auth_version"], req.password)
         except AccountError as exc:
@@ -1179,13 +1179,13 @@ def get_audit_events(before: int | None = Query(None, gt=0), limit: int = Query(
 
 @app.post("/api/projects", status_code=201)
 def api_create_project(req: ProjectRequest, user: dict = Depends(get_current_user)):
-    with audit_operation(user["user_id"], "project.create", "project", "new", transactional=True) as operation:
+    with audit_operation(user["user_id"], "project.create", "project", "new", transactional=True):
         return {"project": create_project(user["user_id"], req.name)}
 
 
 @app.patch("/api/projects/{project_id}")
 def api_update_project(req: ProjectRequest, project: dict = Depends(require_project)):
-    with audit_operation(project["user_id"], "project.rename", "project", project["id"], project_id=project["id"], transactional=True) as operation:
+    with audit_operation(project["user_id"], "project.rename", "project", project["id"], project_id=project["id"], transactional=True):
         updated = update_project(project["user_id"], project["id"], req.name)
         if updated is None:
             raise HTTPException(status_code=404, detail="项目不存在或已被删除")
@@ -1324,7 +1324,7 @@ def get_source_passage(
     project: dict = Depends(require_project),
 ):
     """按项目读取入库快照并核对原文件版本。"""
-    with audit_operation(project["user_id"], "source.read", "file", resource_digest(filename), project_id=project["id"]) as operation:
+    with audit_operation(project["user_id"], "source.read", "file", resource_digest(filename), project_id=project["id"]):
         user_id, project_id = project["user_id"], project["id"]
         try:
             filename = _safe_filename(filename)

@@ -5,3 +5,7 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 export function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
+
+export function nullableText(value: unknown): value is string | null {
+  return value === null || typeof value === 'string'
+}

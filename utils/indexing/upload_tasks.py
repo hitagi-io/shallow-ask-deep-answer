@@ -20,6 +20,15 @@ from utils.observability.audit import append_audit
 
 
 _TASK_PROJECT_LOCK_NAMESPACE = "knowledge-upload-queue"
+_PENDING_RECOVERY = "i.recovery IS NOT NULL AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished')"
+_TASK_ITEM_COUNTS = """
+    SELECT task_id,
+           COUNT(*) FILTER (WHERE status IN ('success', 'error')) AS completed,
+           COUNT(*) FILTER (WHERE status = 'success') AS succeeded,
+           COUNT(*) FILTER (WHERE status = 'error') AS failed
+    FROM upload_task_items WHERE task_id = %s
+    GROUP BY task_id
+"""
 
 
 class FileUploadOrder(BaseModel):
@@ -41,6 +50,24 @@ class FileUploadOrder(BaseModel):
 def _project_queue_lock_key(user_id: int, project_id: str) -> int:
     scope = f"{_TASK_PROJECT_LOCK_NAMESPACE}:{int(user_id)}:{project_id}"
     return int.from_bytes(hashlib.sha256(scope.encode()).digest()[:8], "big", signed=True)
+
+
+def _load_task_files(conn: psycopg.Connection, tasks: list[dict]) -> None:
+    if not tasks:
+        return
+    files_by_task = {task["id"]: [] for task in tasks}
+    for item in conn.execute(f"""
+        SELECT i.task_id, i.position, i.name, i.status, i.overwritten, i.indexed, i.error, i.progress,
+               {_PENDING_RECOVERY} AS recovery_pending
+        FROM upload_task_items i WHERE i.task_id = ANY(%s) ORDER BY i.position
+    """, (list(files_by_task),)):
+        files_by_task[item.pop("task_id")].append(item)
+    for task in tasks:
+        files = files_by_task[task["id"]]
+        task["files"] = files
+        task["recovery_required"] = task["status"] in ("failed", "completed") and any(
+            item["recovery_pending"] for item in files
+        )
 
 
 class UploadTaskStore:
@@ -161,20 +188,9 @@ class UploadTaskStore:
                 """,
                 (task_id, user_id, project_id),
             ).fetchone()
-            if task is None:
-                return None
-            items = conn.execute(
-                """
-                SELECT position, name, status, overwritten, indexed, error, progress,
-                       recovery IS NOT NULL AND recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished') AS recovery_pending
-                FROM upload_task_items
-                WHERE task_id = %s
-                ORDER BY position
-                """,
-                (task_id,),
-            ).fetchall()
-        return {**task, "files": items,
-                "recovery_required": task["status"] in ("failed", "completed") and any(item["recovery_pending"] for item in items)}
+            if task is not None:
+                _load_task_files(conn, [task])
+            return task
 
     def worker_pool(self, max_workers: int) -> ConnectionPool:
         return ConnectionPool(self.conninfo, min_size=0, max_size=max_workers, open=False,
@@ -228,27 +244,18 @@ class UploadTaskStore:
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             with conn.cursor() as cur:
                 activity = self.project_activity(cur, user_id, project_id)
-            tasks = conn.execute("""
+            tasks = conn.execute(f"""
                 SELECT * FROM upload_tasks WHERE user_id = %s AND project_id = %s
                   AND (status IN ('queued', 'running') OR EXISTS (
                       SELECT 1 FROM upload_task_items i WHERE i.task_id=upload_tasks.id
-                        AND i.recovery IS NOT NULL AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished')
+                        AND {_PENDING_RECOVERY}
                   ) OR id IN (
                       SELECT id FROM upload_tasks WHERE user_id = %s AND project_id = %s
                       ORDER BY created_at DESC, sequence DESC LIMIT 7))
                 ORDER BY created_at DESC, sequence DESC
             """, (user_id, project_id, user_id, project_id)).fetchall()
-            if not tasks:
-                return activity, []
-            grouped = {task["id"]: [] for task in tasks}
-            for item in conn.execute("""
-                SELECT task_id, position, name, status, overwritten, indexed, error, progress,
-                       recovery IS NOT NULL AND recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished') AS recovery_pending
-                FROM upload_task_items WHERE task_id = ANY(%s) ORDER BY position
-            """, (list(grouped),)).fetchall():
-                grouped[item.pop("task_id")].append(item)
-        return activity, [{**task, "files": grouped[task["id"]], "recovery_required": task["status"] in ("failed", "completed")
-                 and any(item["recovery_pending"] for item in grouped[task["id"]])} for task in tasks]
+            _load_task_files(conn, tasks)
+            return activity, tasks
 
     def items(self, task_id: str) -> list[dict]:
         with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
@@ -278,7 +285,7 @@ class UploadTaskStore:
 
     @staticmethod
     def project_activity(cur, user_id: int, project_id: str) -> str:
-        cur.execute("""
+        cur.execute(f"""
             SELECT CASE
               WHEN EXISTS (SELECT 1 FROM upload_receivers WHERE user_id=%(user)s AND project_id=%(project)s
                            AND expires_at > clock_timestamp())
@@ -286,8 +293,7 @@ class UploadTaskStore:
                            AND status IN ('queued','running')) THEN 'updating'
               WHEN EXISTS (SELECT 1 FROM pending_file_deletions WHERE user_id=%(user)s AND project_id=%(project)s)
                 OR EXISTS (SELECT 1 FROM upload_tasks t JOIN upload_task_items i ON i.task_id=t.id
-                           WHERE t.user_id=%(user)s AND t.project_id=%(project)s AND i.recovery IS NOT NULL
-                           AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished')) THEN 'recovery'
+                           WHERE t.user_id=%(user)s AND t.project_id=%(project)s AND {_PENDING_RECOVERY}) THEN 'recovery'
               ELSE 'idle' END AS activity
         """, {"user": user_id, "project": project_id})
         return cur.fetchone()["activity"]
@@ -302,11 +308,12 @@ class UploadTaskStore:
 
     def pending_recoveries(self, user_id: int, project_id: str) -> list[dict]:
         with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
-            return conn.execute("SELECT i.*, t.user_id,t.project_id FROM upload_task_items i "
-                                "JOIN upload_tasks t ON t.id=i.task_id WHERE t.user_id=%s AND t.project_id=%s "
-                                "AND t.status IN ('failed','completed') AND i.recovery IS NOT NULL "
-                                "AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished') ORDER BY t.sequence,i.position",
-                                (user_id,project_id)).fetchall()
+            return conn.execute(f"""
+                SELECT i.*, t.user_id, t.project_id FROM upload_task_items i
+                JOIN upload_tasks t ON t.id=i.task_id WHERE t.user_id=%s AND t.project_id=%s
+                  AND t.status IN ('failed','completed') AND {_PENDING_RECOVERY}
+                ORDER BY t.sequence, i.position
+            """, (user_id, project_id)).fetchall()
 
     def journal(self, task: dict, item: dict) -> UploadJournal:
         return UploadJournal(self.conninfo, task["id"], item["id"], task["user_id"], task["project_id"], item["recovery"])
@@ -362,19 +369,11 @@ class UploadTaskStore:
                  Jsonb(IndexProgress(stage="finalizing", completed=1, total=1).model_dump()), item_id, task_id),
             )
             conn.execute(
-                """
+                f"""
                 UPDATE upload_tasks t
                 SET completed = q.completed, succeeded = q.succeeded,
                     failed = q.failed, updated_at = CURRENT_TIMESTAMP
-                FROM (
-                    SELECT task_id,
-                           COUNT(*) FILTER (WHERE status IN ('success', 'error')) AS completed,
-                           COUNT(*) FILTER (WHERE status = 'success') AS succeeded,
-                           COUNT(*) FILTER (WHERE status = 'error') AS failed
-                    FROM upload_task_items
-                    WHERE task_id = %s
-                    GROUP BY task_id
-                ) q
+                FROM ({_TASK_ITEM_COUNTS}) q
                 WHERE t.id = q.task_id
                 """,
                 (task_id,),
@@ -392,21 +391,13 @@ class UploadTaskStore:
     def finish(self, task_id: str, *, lease: psycopg.Connection | None = None) -> None:
         with self._write_transaction(lease) as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE upload_tasks t
                 SET status = 'completed', error = CASE WHEN q.failed = 0 THEN NULL ELSE t.error END,
                     completed = q.completed, succeeded = q.succeeded,
                     failed = q.failed, finished_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
-                FROM (
-                    SELECT task_id,
-                           COUNT(*) FILTER (WHERE status IN ('success', 'error')) AS completed,
-                           COUNT(*) FILTER (WHERE status = 'success') AS succeeded,
-                           COUNT(*) FILTER (WHERE status = 'error') AS failed
-                    FROM upload_task_items
-                    WHERE task_id = %s
-                    GROUP BY task_id
-                ) q
+                FROM ({_TASK_ITEM_COUNTS}) q
                 WHERE t.id = q.task_id AND q.completed = t.total
                 """,
                 (task_id,),
@@ -424,21 +415,13 @@ class UploadTaskStore:
                 (error, task_id),
             )
             result = conn.execute(
-                """
+                f"""
                 UPDATE upload_tasks t
                 SET status = 'failed', error = %s,
                     completed = q.completed, succeeded = q.succeeded,
                     failed = q.failed, finished_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
-                FROM (
-                    SELECT task_id,
-                           COUNT(*) FILTER (WHERE status IN ('success', 'error')) AS completed,
-                           COUNT(*) FILTER (WHERE status = 'success') AS succeeded,
-                           COUNT(*) FILTER (WHERE status = 'error') AS failed
-                    FROM upload_task_items
-                    WHERE task_id = %s
-                    GROUP BY task_id
-                ) q
+                FROM ({_TASK_ITEM_COUNTS}) q
                 WHERE t.id = q.task_id AND t.status = 'running'
                 RETURNING t.user_id,t.project_id,t.trace_id
                 """,

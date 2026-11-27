@@ -1,5 +1,7 @@
-import { isRecord, isCount } from './validation'
+import { isRecord, isCount, nullableText } from './validation'
 import type { Message } from '../api'
+
+export { nullableText }
 
 type SavedMessage = Message & { id: number }
 
@@ -23,9 +25,6 @@ export interface GenerationSnapshot {
   error_code: string | null
 }
 
-export function nullableText(value: unknown): value is string | null {
-  return value === null || typeof value === 'string'
-}
 export function resultKind(value: unknown): value is ResultKind | null {
   return value === null || value === 'answered' || value === 'clarification' || value === 'no_evidence'
     || value === 'answer_rejected' || value === 'dependency_failed'
