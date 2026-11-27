@@ -7,6 +7,13 @@ from utils.retrieval.source_evidence import passage_digest, text_digest
 
 CITATION_RE = re.compile(r"\[\[cite:([0-9a-f]{64})\]\]")
 _SOURCE_PATH_RE = re.compile(r"/api/projects/[0-9a-f-]{36}/sources/[^/]+")
+# 手写链接可能使用错误的项目编号。排除路由模板与空目录后的 Markdown / HTML 结束符。
+_SOURCE_LINK_RE = re.compile(r"""
+    /api/projects/ [^/\s?#`:{}<>"'()\[\]]+ /sources/
+    (?![{:])                           # 排除 {filename} 和 :filename
+    (?: [^/\s?#`<>]+ \?               # 文件地址带查询参数
+      | [^/\s?#`<>"')\]] )             # 裸路径含有文件名
+""", re.VERBOSE)
 
 
 def valid_evidence(item: dict) -> bool:
@@ -41,7 +48,7 @@ def cited_evidence_ids(text: str, evidence: list[dict]) -> list[str]:
     """缺失、残缺或越界标记拒绝输出；不猜测哪份证据支持某条结论。"""
     ids = list(dict.fromkeys(CITATION_RE.findall(text)))
     remaining = CITATION_RE.sub("", text)
-    if not ids or "[[cite:" in remaining or "/api/projects/" in remaining:
+    if not ids or "[[cite:" in remaining or _SOURCE_LINK_RE.search(remaining):
         raise ValueError("回答缺少有效的证据标记或自行拼接了原文链接")
     allowed = {item["citation_id"] for item in evidence}
     if any(identifier not in allowed for identifier in ids):

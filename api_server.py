@@ -4,7 +4,6 @@ import json
 import time
 import uuid
 import asyncio
-import threading
 import shutil
 import re
 import math
@@ -12,7 +11,6 @@ import stat
 from pathlib import Path
 from uuid import UUID
 from functools import partial
-from collections import defaultdict
 from collections.abc import Callable
 from contextlib import ExitStack, asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +19,7 @@ from starlette.datastructures import UploadFile
 
 import anyio
 import psycopg
+from psycopg_pool import ConnectionPool
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
@@ -43,7 +42,7 @@ from utils.observability.tracing import span, start_tracing, stop_tracing
 from utils.observability.audit import AuditResult, audit_operation, resource_digest, configure_audit
 from utils.observability.queries import generation_trace, audit_page, prune_observability
 from utils.indexing.recovery import PublicationUncertain
-from utils.indexing.health_report_cache import HealthReportCache, HealthReportInvalidated
+from utils.indexing.health_report_cache import HealthReportCache, HealthReportInvalidated, ProjectHealthReports
 from utils.indexing.health_scan import HealthScanRunner, ProjectGoneError
 from utils.runtime.readiness import check_readiness
 from utils.runtime.request_wait import wait_for_client
@@ -147,7 +146,7 @@ if not math.isfinite(READINESS_TIMEOUT_SECONDS) or READINESS_TIMEOUT_SECONDS < 0
 
 def _warn_connection_budget() -> None:
     """启动时核算 PG 连接需求，超出上限时明确告警（多 worker 时最容易踩）。"""
-    per_worker = PG_CHECKPOINT_POOL_MAX + PG_POOL_MAX + 1
+    per_worker = PG_CHECKPOINT_POOL_MAX + PG_POOL_MAX + UPLOAD_WORKERS + 1
     need = UVICORN_WORKERS * per_worker
     try:
         with psycopg.connect(PG_CONN) as conn, conn.cursor() as cur:
@@ -156,7 +155,8 @@ def _warn_connection_budget() -> None:
     except psycopg.Error as e:
         logger.warning(f"[启动] 无法读取 PostgreSQL 的 max_connections，跳过连接预算检查：{e}")
         return
-    detail = f"workers={UVICORN_WORKERS} × (检查点池 {PG_CHECKPOINT_POOL_MAX} + 业务池 {PG_POOL_MAX} + Trace 写入 1) = {need}"
+    detail = (f"workers={UVICORN_WORKERS} × (检查点池 {PG_CHECKPOINT_POOL_MAX} + 业务池 {PG_POOL_MAX} "
+              f"+ 上传队列池 {UPLOAD_WORKERS} + Trace 写入 1) = {need}")
     if need > max_conn - 5:
         state = "超出" if need > max_conn else "接近"
         logger.warning(f"[启动] PostgreSQL 预计连接占用约 {need}，已{state}连接上限（max_connections={max_conn}；{detail}）。"
@@ -184,6 +184,7 @@ async def lifespan(_app: FastAPI):
         resources.callback(agent.close)
         _warn_connection_budget()
         background_stop = asyncio.Event()
+        upload_pool = resources.enter_context(_upload_task_store.worker_pool(UPLOAD_WORKERS))
         upload_executor = resources.enter_context(
             ThreadPoolExecutor(max_workers=UPLOAD_WORKERS, thread_name_prefix="upload-index")
         )
@@ -192,7 +193,7 @@ async def lifespan(_app: FastAPI):
         recovery_task = asyncio.create_task(_recovery_loop(background_stop), name="generation-recovery")
         recovery_task.add_done_callback(_background_task_done)
         deletion_task = asyncio.create_task(_deletion_recovery_loop(background_stop), name="deletion-recovery")
-        upload_workers = [asyncio.create_task(_upload_worker_loop(i, background_stop, upload_executor),
+        upload_workers = [asyncio.create_task(_upload_worker_loop(i, background_stop, upload_executor, upload_pool),
                                              name=f"upload-index-{i}") for i in range(UPLOAD_WORKERS)]
         try:
             yield
@@ -231,6 +232,7 @@ async def request_context(request: Request, call_next):
 async def _recovery_loop(stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
+            _health_reports.prune()
             await asyncio.to_thread(maintain_access_limits)
             await asyncio.to_thread(reap_stale_generations, CHAT_GENERATION_STALE_SECONDS)
             await asyncio.to_thread(prune_observability, PG_CONN)
@@ -304,25 +306,9 @@ if not math.isfinite(HEALTH_CHECK_TIMEOUT_SECONDS) or HEALTH_CHECK_TIMEOUT_SECON
     raise ValueError("HEALTH_CHECK_TIMEOUT_SECONDS 必须为不小于 0.5 的有限数值")
 if HEALTH_CHECK_MAX_CONCURRENT < 1:
     raise ValueError("HEALTH_CHECK_MAX_CONCURRENT 必须为正整数")
-_health_reports: defaultdict[tuple[int, str], HealthReportCache] = defaultdict(
-    lambda: HealthReportCache(HEALTH_REPORT_TTL_SECONDS)
-)
-_health_reports_lock = threading.Lock()
+_health_reports = ProjectHealthReports(HEALTH_REPORT_TTL_SECONDS)
 _health_scanner = HealthScanRunner(HEALTH_CHECK_TIMEOUT_SECONDS, HEALTH_CHECK_MAX_CONCURRENT)
 _readiness_report = HealthReportCache(1)
-
-
-def _health_cache(user_id: int, project_id: str) -> HealthReportCache:
-    with _health_reports_lock:
-        return _health_reports[user_id, project_id]
-
-
-def _invalidate_health(user_id: int, project_id: str) -> None:
-    with _health_reports_lock:
-        cache = _health_reports.get((user_id, project_id))
-        if cache is not None:
-            # 正在执行的任务释放资源前，保留其登记状态。
-            cache.invalidate()
 
 
 async def _refresh_health_report(request: Request, user_id: int, project_id: str) -> dict:
@@ -332,7 +318,7 @@ async def _refresh_health_report(request: Request, user_id: int, project_id: str
     try:
         # require_project 已完成请求鉴权；仅由共享扫描任务
         # 获取索引锁、项目锁及存储连接。
-        return await wait_for_client(request, _health_cache(user_id, project_id).get(check, refresh=True))
+        return await wait_for_client(request, _health_reports.refresh((user_id, project_id), check))
     except ProjectGoneError:
         raise HTTPException(status_code=404, detail="项目不存在或已被删除")
     except HealthReportInvalidated:
@@ -413,7 +399,7 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
             except Exception as e:
                 logger.error(f"[索引自动修复] 执行失败：{e}")
                 break
-        _health_cache(user_id, project_id).set(report)
+        _health_reports.set((user_id, project_id), report)
         return report
 
 
@@ -504,7 +490,7 @@ def _process_upload_task(task: dict, lease: psycopg.Connection, queued_items: li
                     indexed = result["committed"]
                     error = result["error"]
                     status = "success" if indexed and not error else "error"
-                _invalidate_health(user_id, project_id)
+                _health_reports.invalidate((user_id, project_id))
             except (ServiceStopping, psycopg.OperationalError):
                 raise
             except PublicationUncertain as exc:
@@ -538,12 +524,15 @@ def _process_upload_task(task: dict, lease: psycopg.Connection, queued_items: li
         return False
 
 
-def _run_next_upload() -> bool:
+def _run_next_upload(pool: ConnectionPool) -> bool:
     check_shutdown()
-    claimed = _upload_task_store.claim_next()
-    if claimed is None:
-        return False
-    task, lease = claimed
+    with pool.connection() as lease, _upload_task_store.claim_next(lease) as task:
+        if task is None:
+            return False
+        return _run_claimed_upload(task, lease)
+
+
+def _run_claimed_upload(task: dict, lease: psycopg.Connection) -> bool:
     try:
         with bind_context(ExecutionContext(trace_id=task["trace_id"],
                           user_id=task["user_id"], project_id=task["project_id"])), span("upload.execute") as execution:
@@ -586,8 +575,6 @@ def _run_next_upload() -> bool:
     except Exception:
         _upload_task_store.fail(task["id"], "上传恢复未完成，请执行索引修复", lease=lease)
         raise
-    finally:
-        lease.close()
 
 
 def _resolve_pending_uploads(user_id: int, project_id: str) -> None:
@@ -621,10 +608,11 @@ def _remove_staged_upload(user_id: int, project_id: str, path: str) -> None:
         pass
 
 
-async def _upload_worker_loop(worker_id: int, stop: asyncio.Event, executor: ThreadPoolExecutor) -> None:
+async def _upload_worker_loop(worker_id: int, stop: asyncio.Event, executor: ThreadPoolExecutor,
+                              pool: ConnectionPool) -> None:
     while not stop.is_set():
         try:
-            worked = await asyncio.get_running_loop().run_in_executor(executor, _run_next_upload)
+            worked = await asyncio.get_running_loop().run_in_executor(executor, _run_next_upload, pool)
             if worked:
                 continue
         except ServiceStopping:
@@ -1245,7 +1233,7 @@ def _complete_project_deletion(user_id: int, project_id: str) -> None:
         drop_project_vectors(user_id, project_id)
         agent.forget_project(user_id, project_id)
         finish_project_deletion(user_id, project_id)
-        _invalidate_health(user_id, project_id)
+        _health_reports.invalidate((user_id, project_id))
 
 
 @app.delete("/api/projects/{project_id}")
@@ -1262,7 +1250,7 @@ def api_delete_project(project_id: UUID, user: dict = Depends(get_current_user))
         if status == "busy":
             raise HTTPException(status_code=409, detail="项目中有回答正在生成，请停止或等待完成后再删除")
         if status == "pending":
-            _invalidate_health(user_id, pid)
+            _health_reports.invalidate((user_id, pid))
             try:
                 _complete_project_deletion(user_id, pid)
             except Exception:
@@ -1486,7 +1474,7 @@ def _finish_file_deletions(user_id: int, project_id: str) -> None:
         def delete_index(path):
             get_vector_store(user_id, project_id, location=job).delete_file_index(path)
         finish_file_deletion(PG_CONN, user_id, project_id, directory, job, delete_index)
-        _invalidate_health(user_id, project_id)
+        _health_reports.invalidate((user_id, project_id))
 
 
 @app.delete("/api/projects/{project_id}/files/{filename}")
@@ -1504,7 +1492,7 @@ def delete_file(filename: str, project: dict = Depends(require_project)):
                     if not source.is_file():
                         raise HTTPException(status_code=404, detail="文件不存在")
                     begin_file_deletion(_project_manifests(user_id, project_id), source.name)
-                _invalidate_health(user_id, project_id)
+                _health_reports.invalidate((user_id, project_id))
                 try:
                     _finish_file_deletions(user_id, project_id)
                 except Exception:
@@ -1527,7 +1515,7 @@ def build_knowledge_index(project: dict = Depends(require_project)):
                 _ensure_project(current)
                 _ensure_no_uploads(user_id, project_id)
                 failures = get_vector_store(user_id, project_id).index_pending_files()
-                _invalidate_health(user_id, project_id)
+                _health_reports.invalidate((user_id, project_id))
             # API只暴露用户可理解的文件名，绝对存储路径保留在后端。
             failures = [{**item, "file": os.path.basename(item["file"])} for item in failures]
             operation.result = "partial" if failures else "succeeded"
@@ -1545,7 +1533,7 @@ def build_knowledge_index(project: dict = Depends(require_project)):
 async def get_index_health(request: Request, refresh: bool = False, project: dict = Depends(require_project)):
     user_id, project_id = project["user_id"], project["id"]
     if not refresh:
-        return _health_cache(user_id, project_id).peek()
+        return _health_reports.peek((user_id, project_id))
     return await _refresh_health_report(request, user_id, project_id)
 
 
@@ -1559,7 +1547,7 @@ def repair_index_health(project: dict = Depends(require_project)):
                 _resolve_pending_uploads(user_id, project_id)
                 _ensure_no_uploads(user_id, project_id)
                 report = IndexHealth(user_id, project_id).repair(include_pending=True)
-                _health_cache(user_id, project_id).set(report)
+                _health_reports.set((user_id, project_id), report)
             operation.result = _repair_audit_result(report)
             return report
         except HTTPException:

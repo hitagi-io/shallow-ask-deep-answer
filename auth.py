@@ -231,7 +231,8 @@ def init_db():
                         id           BIGSERIAL PRIMARY KEY,
                         scope        VARCHAR(20) NOT NULL,
                         key          VARCHAR(128) NOT NULL,
-                        attempted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        attempted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        expires_at   TIMESTAMP NOT NULL
                     );
                 """)
                 cur.execute(
@@ -239,8 +240,8 @@ def init_db():
                     "ON rate_limits (scope, key, attempted_at)"
                 )
                 cur.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_rate_limits_attempted_at "
-                    "ON rate_limits (attempted_at)"
+                    "CREATE INDEX IF NOT EXISTS idx_rate_limits_expires_at "
+                    "ON rate_limits (expires_at)"
                 )
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS chat_slots (
@@ -411,7 +412,6 @@ def maintain_access_limits() -> None:
 
 
 _RATE_PURGE_PROBABILITY = 0.01
-_RATE_RETENTION = timedelta(hours=2)
 
 
 def _rate_lock_key(scope: str, key: str) -> int:
@@ -432,20 +432,20 @@ def _rate_exceeded(cur, scope: str, key: str, limit: int, window_seconds: int, n
     """在已有游标上判断 key 在窗口期内的记录数是否已达上限。"""
     cur.execute(
         "SELECT COUNT(*) AS cnt FROM rate_limits "
-        "WHERE scope = %s AND key = %s AND attempted_at > %s",
-        (scope, key, now - timedelta(seconds=window_seconds)),
+        "WHERE scope = %s AND key = %s AND attempted_at > %s AND expires_at > %s",
+        (scope, key, now - timedelta(seconds=window_seconds), now),
     )
     return cur.fetchone()["cnt"] >= limit
 
 
-def _rate_record(cur, scope: str, key: str, now: datetime) -> None:
+def _rate_record(cur, scope: str, key: str, now: datetime, window_seconds: int) -> None:
     """在已有游标上记录一次尝试，并惰性清理过期行。"""
     cur.execute(
-        "INSERT INTO rate_limits (scope, key, attempted_at) VALUES (%s, %s, %s)",
-        (scope, key, now),
+        "INSERT INTO rate_limits (scope, key, attempted_at, expires_at) VALUES (%s, %s, %s, %s)",
+        (scope, key, now, now + timedelta(seconds=window_seconds)),
     )
     if random.random() < _RATE_PURGE_PROBABILITY:
-        cur.execute("DELETE FROM rate_limits WHERE attempted_at <= %s", (now - _RATE_RETENTION,))
+        cur.execute("DELETE FROM rate_limits WHERE expires_at <= %s", (now,))
 
 
 def _consume_rate_limits(limits: list[tuple[str, str, int]], window_seconds: int) -> bool:
@@ -457,7 +457,7 @@ def _consume_rate_limits(limits: list[tuple[str, str, int]], window_seconds: int
             if any(_rate_exceeded(cur, scope, key, limit, window_seconds, now) for scope, key, limit in limits):
                 return False
             for scope, key, _ in limits:
-                _rate_record(cur, scope, key, now)
+                _rate_record(cur, scope, key, now, window_seconds)
         conn.commit()
         return True
 
@@ -546,9 +546,9 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
                 if _rate_exceeded(cur, scope, key, limit, window, now):
                     return {"ok": False, "error": "尝试过于频繁，请稍后再试", "rate_limited": True}
 
-            _rate_record(cur, "login_acct", username, now)
+            _rate_record(cur, "login_acct", username, now, LOGIN_ACCOUNT_RATE_WINDOW_SECONDS)
             if ip:
-                _rate_record(cur, "login_ip", ip, now)
+                _rate_record(cur, "login_ip", ip, now, LOGIN_IP_RATE_WINDOW_SECONDS)
 
             cur.execute(
                 "SELECT id, username, password, auth_version FROM users WHERE username = %s AND NOT deletion_pending",
@@ -1124,7 +1124,7 @@ def begin_generation(
             generation_id = cur.fetchone()["id"]
             cur.execute("INSERT INTO chat_slots(token,user_id,generation_id) VALUES (%s,%s,%s)",
                         (slot, user_id, generation_id))
-            _rate_record(cur, "chat", key, now)
+            _rate_record(cur, "chat", key, now, limits.window_seconds)
             cur.execute("INSERT INTO generation_attempts(id,generation_id,trace_id,worker_id,status) VALUES(%s,%s,%s,%s,'running')",
                         (attempt_id, generation_id, trace_id, f"{os.getpid()}:{threading.get_ident()}"))
             append_audit(cur, user_id=user_id, action="generation.retry" if retry_of is not None else "generation.start",

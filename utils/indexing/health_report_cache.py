@@ -3,8 +3,10 @@
 import asyncio
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from weakref import WeakValueDictionary
 
 
 class HealthReportInvalidated(RuntimeError):
@@ -46,7 +48,12 @@ class HealthReportCache:
     def peek(self) -> dict | None:
         """只读取有效缓存；过期或缺失时返回 None，不触发扫描。"""
         with self._lock:
-            return self._report if time.monotonic() - self._updated_at < self._ttl else None
+            return self._fresh_report()
+
+    def _fresh_report(self) -> dict | None:
+        if self._report is not None and time.monotonic() - self._updated_at >= self._ttl:
+            self._report = None
+        return self._report
 
     async def _refresh(self, check: Callable[[], Awaitable[dict]], revision: int) -> dict:
         report = await check()
@@ -58,7 +65,7 @@ class HealthReportCache:
                 self._report = report
                 self._updated_at = time.monotonic()
                 self._revision += 1
-            elif self._report is None:
+            elif self._fresh_report() is None:
                 raise HealthReportInvalidated("项目状态已变更，请重新检查")
             else:
                 report = self._report
@@ -81,8 +88,10 @@ class HealthReportCache:
         """
         while True:
             with self._lock:
-                if not refresh and self._report is not None and time.monotonic() - self._updated_at < self._ttl:
-                    return self._report
+                if not refresh:
+                    report = self._fresh_report()
+                    if report is not None:
+                        return report
                 pending = self._pending
                 if pending is None:
                     loop = asyncio.get_running_loop()
@@ -109,3 +118,69 @@ class HealthReportCache:
                     if not pending.task.cancelling():
                         pending.task.cancel()
                     await asyncio.shield(pending.settled)
+
+
+class ProjectHealthReports:
+    """只强引用最近的有效报告；扫描及等待者自行持有其缓存，直到清理完毕。"""
+
+    def __init__(self, ttl: float, max_entries: int = 128):
+        self._ttl = ttl
+        self._max_entries = max_entries
+        self._lock = threading.Lock()
+        self._recent: OrderedDict[tuple[int, str], HealthReportCache] = OrderedDict()
+        self._live: WeakValueDictionary[tuple[int, str], HealthReportCache] = WeakValueDictionary()
+
+    def _cache(self, key: tuple[int, str]) -> HealthReportCache:
+        cache = self._live.get(key)
+        if cache is None:
+            cache = HealthReportCache(self._ttl)
+            self._live[key] = cache
+        return cache
+
+    def _retain(self, key: tuple[int, str], cache: HealthReportCache) -> None:
+        if cache.peek() is None:
+            self._recent.pop(key, None)
+            return
+        self._recent[key] = cache
+        self._recent.move_to_end(key)
+        if len(self._recent) > self._max_entries:
+            self._recent.popitem(last=False)
+
+    def peek(self, key: tuple[int, str]) -> dict | None:
+        with self._lock:
+            cache = self._recent.get(key)
+            if cache is None:
+                return None
+            report = cache.peek()
+            if report is None:
+                del self._recent[key]
+            else:
+                self._recent.move_to_end(key)
+            return report
+
+    def set(self, key: tuple[int, str], report: dict) -> None:
+        with self._lock:
+            cache = self._cache(key)
+            cache.set(report)
+            self._retain(key, cache)
+
+    def invalidate(self, key: tuple[int, str]) -> None:
+        with self._lock:
+            cache = self._live.get(key)
+            if cache is not None:
+                cache.invalidate()
+            self._recent.pop(key, None)
+
+    async def refresh(self, key: tuple[int, str], check: Callable[[], Awaitable[dict]]) -> dict:
+        with self._lock:
+            cache = self._cache(key)
+        report = await cache.get(check, refresh=True)
+        with self._lock:
+            self._retain(key, cache)
+        return report
+
+    def prune(self) -> None:
+        with self._lock:
+            for key, cache in list(self._recent.items()):
+                if cache.peek() is None:
+                    del self._recent[key]

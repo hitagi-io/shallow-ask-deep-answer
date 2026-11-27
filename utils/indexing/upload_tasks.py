@@ -4,12 +4,14 @@ from __future__ import annotations
 import hashlib
 import os
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from utils.indexing.progress import IndexProgress
@@ -174,14 +176,13 @@ class UploadTaskStore:
         return {**task, "files": items,
                 "recovery_required": task["status"] in ("failed", "completed") and any(item["recovery_pending"] for item in items)}
 
-    def claim_next(self) -> tuple[dict, psycopg.Connection] | None:
-        """持有会话锁，直到调用方处理完任务。
+    def worker_pool(self, max_workers: int) -> ConnectionPool:
+        return ConnectionPool(self.conninfo, min_size=0, max_size=max_workers, open=False,
+                              kwargs={"autocommit": True, "row_factory": dict_row}, name="upload-queue")
 
-        任务仍标记为运行中但锁已可获取，说明原工作进程已失去租约。
-        返回该任务以执行明确的中断恢复，避免与仍在运行的长任务竞争。
-        调用方必须关闭租约连接，即使处理失败也不例外。
-        """
-        lease = psycopg.connect(self.conninfo, autocommit=True, row_factory=dict_row)
+    @contextmanager
+    def claim_next(self, lease: psycopg.Connection) -> Iterator[dict | None]:
+        """领取期间独占会话和项目队列锁；取得 running 的任务时由调用方恢复。"""
         try:
             candidates = lease.execute("""
                 SELECT user_id, project_id, MIN(sequence) AS first_sequence
@@ -212,12 +213,14 @@ class UploadTaskStore:
                         UPDATE upload_tasks SET status = 'running', started_at = CURRENT_TIMESTAMP,
                             updated_at = CURRENT_TIMESTAMP WHERE id = %s
                     """, (row["id"],))
-                return row, lease
-            lease.close()
-            return None
+                yield row
+                lease.execute("SELECT pg_advisory_unlock(%s)", (key,))
+                return
         except BaseException:
+            # 查询或处理失败时丢弃会话，避免将仍持锁的连接归池。
             lease.close()
             raise
+        yield None
 
     def list_tasks(self, user_id: int, project_id: str) -> tuple[str, list[dict]]:
         # 活动状态包含尚未入队的接收租约，和任务列表读取同一个事务快照。
