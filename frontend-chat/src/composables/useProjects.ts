@@ -28,7 +28,7 @@ export function useProjects(confirmAction: ConfirmAction, initialSelectedId: str
   }
 
   async function save(name: string, id?: string) {
-    if (saving.value || loading.value || !name.trim()) return false
+    if (disposed || saving.value || loading.value || !name.trim()) return false
     saving.value = true
     error.value = ''
     try {
@@ -46,7 +46,7 @@ export function useProjects(confirmAction: ConfirmAction, initialSelectedId: str
   async function remove(id: string) {
     const project = projects.value.find(item => item.id === id)
     if (!project || saving.value || !await confirmAction(`删除项目“${project.name}”及其所有文档和索引？历史对话将保留供查看，来源标记为“已删除”，无法继续使用该项目提问。文档和索引删除后无法恢复。`)) return false
-    if (saving.value) return
+    if (disposed || saving.value) return
     saving.value = true
     error.value = ''
     try {

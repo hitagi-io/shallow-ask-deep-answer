@@ -28,7 +28,7 @@ from utils.core.project_paths import get_knowledge_dir, knowledge_scope, scoped_
 from utils.core.logging_config import get_logger, private_vector_write
 from utils.indexing.progress import IndexProgress, IndexStage, ProgressCallback
 from utils.indexing.upload_quota import daily_embedding_limit, moving_upload_files, reserve_embedding_chars, UploadQuotaExceeded
-from utils.indexing.recovery import UploadJournal, PublicationUncertain, UploadRecoveryResult
+from utils.indexing.recovery import UploadJournal, PublicationUncertain, UploadRecovery, UploadRecoveryResult
 from utils.observability.tracing import span, traced
 from utils.runtime.shutdown import ServiceStopping, check_shutdown, interruptible_lock
 
@@ -225,6 +225,9 @@ class VectorStore:
             return False
         if rows is None:
             rows = self._content_rows(manifest.identity)
+        return self._published_chunks_intact(manifest, rows)
+
+    def _published_chunks_intact(self, manifest: IndexManifest, rows: list[dict]) -> bool:
         return chunks_match(manifest, rows) and not self.manifests.invalid_snapshot_sources(rows)
 
     def index_pending_files(self, file_paths=None) -> list[dict]:
@@ -395,6 +398,9 @@ class VectorStore:
             # 清单已提交，此后清理失败不能回滚磁盘到旧内容。
             result = {**result, "chunks": len(documents), "ok": True,
                       "error": None, "committed": True}
+            if journal is not None:
+                # 上传在共用收尾流程中验证原文快照后，才可清理旧代次和备份。
+                return result
             try:
                 self._delete_pks([row["pk"] for row in self._content_rows(identity)
                                   if row.get("index_id") != manifest.index_id])
@@ -464,7 +470,7 @@ class VectorStore:
             rows = self._content_rows(identity)
             if survivor and record.state == "ready":
                 current_rows = [row for row in rows if row.get("index_id") == record.index_id]
-                if chunks_match(record, current_rows):
+                if self._published_chunks_intact(record, current_rows):
                     self.manifests.publish_existing_file(survivor, sha256)
                     continue
                 if record.published_source is not None:
@@ -516,18 +522,28 @@ class VectorStore:
                         "error": "新版本已入库，清理未完成，请执行索引修复"}
             return {**result, "ok": True, "error": None, "committed": True, "overwritten": record.old_hash is not None}
 
-    def _finish_uploaded_version(self, journal: UploadJournal) -> None:
-        record = journal.validated_record(self.knowledge_dir)
+    def _verify_uploaded_version(self, record: UploadRecovery) -> tuple[str, str]:
         if record.index_id is None:
             raise RuntimeError("已发布上传缺少索引代次")
         if compute_file_sha256(record.destination) != record.new_hash:
             raise RuntimeError("源文件版本已变化，停止自动恢复")
+        identity = record.new_hash, document_format(record.destination)
+        manifest = self.manifests.all().get(identity)
+        rows = self.chunk_rows(f"index_id == {json.dumps(record.index_id)}")
+        if (manifest is None or manifest.state != "ready" or manifest.index_id != record.index_id
+                or not self._published_chunks_intact(manifest, rows)):
+            raise PublicationUncertain("已发布版本的分块或原文快照校验失败，无法确认恢复成功")
+        return identity
+
+    def _finish_uploaded_version(self, journal: UploadJournal) -> None:
+        record = journal.validated_record(self.knowledge_dir)
+        identity = self._verify_uploaded_version(record)
         backup_path = record.backup_path
         if backup_path is not None and not os.path.exists(backup_path):
             backup_path = None  # 上次清理可能已删备份，尚未写回 cleaned。
         if backup_path is not None and compute_file_sha256(backup_path) != record.old_hash:
             raise RuntimeError("备份文件校验失败，停止清理")
-        self._delete_pks([row["pk"] for row in self._content_rows((record.new_hash, document_format(record.destination)))
+        self._delete_pks([row["pk"] for row in self._content_rows(identity)
                           if row["index_id"] != record.index_id])
         self._retire_source_versions(record.destination, record.new_hash, previous_sha256=record.old_hash)
         if backup_path is not None:
@@ -543,6 +559,10 @@ class VectorStore:
                       "error": "上传已中断，原文件已恢复，请重新上传" if record.old_hash is not None
                                else "上传尚未发布，请重新上传或执行修复与补建"}
             if record.stage == "cleaned":
+                # 可能在清理完成与任务结果写回之间重启。若仍发布该代次，再次核对其完整性。
+                if record.index_id is not None and self.manifests.is_published(
+                        record.destination, record.new_hash, record.index_id):
+                    self._verify_uploaded_version(record)
                 return {**result, "ok": True, "committed": True, "error": None}
             if record.stage in ("rolled_back", "unpublished"):
                 return result
@@ -553,10 +573,6 @@ class VectorStore:
                 except Exception as exc:
                     raise PublicationUncertain("无法核对发布结果，已保留文件和索引，请稍后修复") from exc
                 if published:
-                    manifest = self.manifests.all()[(record.new_hash, document_format(record.destination))]
-                    rows = self.chunk_rows(f"index_id == {json.dumps(record.index_id)}")
-                    if not chunks_match(manifest, rows):
-                        raise PublicationUncertain("已发布版本校验失败，已保留恢复材料")
                     journal.advance("published")
                     self._finish_uploaded_version(journal)
                     return {**result, "ok": True, "committed": True, "error": None}

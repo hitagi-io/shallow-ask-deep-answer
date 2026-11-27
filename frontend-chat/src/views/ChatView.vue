@@ -13,6 +13,7 @@ const { projects: projectList, loading: projectsLoading, error: projectsError, l
 const { input, inputEl, chatArea, current, isProcessing, isThinking, thinkingSeconds, thinkingPhase, reconnecting, stopping,
   kbOnly, switchMode, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice, projectId, selectedProject, projectReady, projectDeleted, selectProject, newConversation,
   loading, loadError, initConversations, conversationBusy, following, onScroll, jumpToLatest,
+  revealingMessageId, scrollToBottom, finishReveal,
   knowledgeBlocked, knowledgeNotice, knowledgeStatus, refreshKnowledgeReadiness, checkingSend,
   hasEarlier, visibleMessages, messageOffset, showEarlier, loadMessages, retryMessage, canRetrySend, retryFailedSend } = props.chat
 const suggestions = computed(() => kbOnly.value ? [
@@ -85,6 +86,7 @@ async function clearInput() {
       <ChatMessage v-for="(msg, i) in visibleMessages" :key="`${current.id}:${kbOnly ? 'kb' : 'general'}:${msg.id ?? `local-${messageOffset + i}`}`"
         :message="msg" :project-deleted="projectDeleted" :thinking="isThinking && i === visibleMessages.length - 1"
         :streaming="isProcessing && !isThinking && i === visibleMessages.length - 1" :busy="isProcessing || !!current.messagesLoading"
+        :reveal="msg.id === revealingMessageId" @reveal-progress="scrollToBottom" @reveal-finished="finishReveal(msg.id)"
         :thinking-seconds="i === visibleMessages.length - 1 ? thinkingSeconds : 0" :thinking-phase="i === visibleMessages.length - 1 ? thinkingPhase : ''"
         @sync="loadMessages(current.id)" @retry="retryMessage(messageOffset + i)" />
     </template>

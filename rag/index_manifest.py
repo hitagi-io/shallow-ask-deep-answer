@@ -13,8 +13,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from utils.core.project_paths import knowledge_scope
-from utils.documents.knowledge_files import document_format
+from utils.core.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
+from utils.documents.knowledge_files import compute_file_sha256, document_format
 from utils.documents.file_listing import KnowledgeFile
 from utils.retrieval.source_evidence import chunk_signature, snapshot_digest, text_digest
 from utils.indexing.progress import UnitProgressCallback
@@ -286,19 +286,36 @@ class ManifestStore:
             self._record_files(conn, {source: digest})
             self._publish_file(conn, source, digest)
 
+    def _published_rows(self, conn, index_version: str, *, for_search: bool):
+        return conn.execute("""
+            SELECT m.index_id, f.source, f.content_sha256
+            FROM published_source_files f JOIN index_manifests m
+              ON m.namespace = f.namespace AND m.content_sha256 = f.content_sha256
+              AND m.source_format = f.source_format
+            WHERE f.namespace = %s AND m.state = 'ready' AND m.index_version = %s
+              AND (NOT %s OR NOT EXISTS (
+                  SELECT 1 FROM pending_file_deletions WHERE user_id=%s AND project_id=%s))
+            ORDER BY m.index_id, (f.source = m.source) DESC, f.source
+        """, (self.namespace, index_version, for_search, self.user_id, self.project_id)).fetchall()
+
+    @staticmethod
+    def _matches_publication(directory: str, path: str, digest: str) -> bool:
+        try:
+            source = scoped_knowledge_file(directory, path)
+        except (ValueError, OSError):
+            return False
+        return os.path.isfile(source) and compute_file_sha256(source) == digest
+
     def published_index_sources(self, index_version: str) -> dict[str, str]:
-        """同一次查询取得可检索代次及其引用文件，优先使用仍在发布的原文件。"""
+        """每个代次只引用磁盘内容仍匹配的文件，优先选原文件，再尝试其副本。"""
         with self._connect() as conn:
-            rows = conn.execute("""
-                SELECT DISTINCT ON (m.index_id) m.index_id, f.source
-                FROM published_source_files f JOIN index_manifests m
-                  ON m.namespace = f.namespace AND m.content_sha256 = f.content_sha256
-                  AND m.source_format = f.source_format
-                WHERE f.namespace = %s AND m.state = 'ready' AND m.index_version = %s
-                  AND NOT EXISTS (SELECT 1 FROM pending_file_deletions WHERE user_id=%s AND project_id=%s)
-                ORDER BY m.index_id, (f.source = m.source) DESC, f.source
-            """, (self.namespace, index_version, self.user_id, self.project_id)).fetchall()
-        return {row["index_id"]: row["source"] for row in rows}
+            rows = self._published_rows(conn, index_version, for_search=True)
+        directory = get_knowledge_dir(self.user_id, self.project_id)
+        sources = {}
+        for row in rows:
+            if row["index_id"] not in sources and self._matches_publication(directory, row["source"], row["content_sha256"]):
+                sources[row["index_id"]] = row["source"]
+        return sources
 
     def is_published(self, source: str, digest: str, index_id: str) -> bool:
         """先等待同一清单的未决事务结束，再核对发布映射，处理提交回执丢失。"""
@@ -347,7 +364,7 @@ class ManifestStore:
             """, (self.namespace, path, digest, document_format(path), info.st_size, info.st_mtime_ns))
 
     def record_files(self, files: dict[str, str | None]) -> None:
-        """入库或定时扫描已计算摘要后记录文件元数据，文件列表不再重复读取正文。"""
+        """记录入库或扫描时观察到的文件元数据。"""
         if not any(files.values()):
             return
         with self._connect() as conn:
@@ -355,37 +372,22 @@ class ManifestStore:
             self._record_files(conn, files)
 
     def file_statuses(self, paths: tuple[str, ...], index_version: str) -> list[KnowledgeFile]:
-        """返回已记录的入库状态；完整性由独立的深度检查报告表达。"""
+        """只有当前磁盘内容匹配已发布版本的文件才显示为已入库。"""
         with self._connect() as conn:
             pending = {os.path.normcase(row["filename"]) for row in conn.execute(
                 "SELECT filename FROM pending_file_deletions WHERE user_id=%s AND project_id=%s",
                 (self.user_id, self.project_id))}
-            rows = conn.execute("""
-                SELECT f.source, f.size_bytes, f.mtime_ns, m.state, m.index_version,
-                       p.source AS published_source
-                FROM indexed_source_files f LEFT JOIN index_manifests m
-                  ON m.namespace = f.namespace AND m.content_sha256 = f.content_sha256
-                  AND m.source_format = f.source_format
-                LEFT JOIN published_source_files p ON p.namespace = f.namespace
-                  AND p.source = f.source AND p.content_sha256 = f.content_sha256
-                  AND p.source_format = f.source_format
-                WHERE f.namespace = %s
-            """, (self.namespace,)).fetchall()
-        records = {os.path.normcase(row["source"]): row for row in rows}
+            rows = self._published_rows(conn, index_version, for_search=False)
+        digests = {os.path.normcase(row["source"]): row["content_sha256"] for row in rows}
+        directory = get_knowledge_dir(self.user_id, self.project_id)
         files: list[KnowledgeFile] = []
         for path in paths:
             if os.path.normcase(os.path.basename(path)) in pending:
                 continue
-            try:
-                info = os.stat(path)
-            except FileNotFoundError:
-                continue  # 文件可在目录枚举后被并发删除或替换。
-            record = records.get(os.path.normcase(path))
-            indexed = record is not None and (
-                record["state"] == "ready" and record["index_version"] == index_version
-                and record["published_source"] is not None
-                and record["size_bytes"] == info.st_size and record["mtime_ns"] == info.st_mtime_ns
-            )
+            if not os.path.isfile(path):
+                continue
+            digest = digests.get(os.path.normcase(path))
+            indexed = digest is not None and self._matches_publication(directory, path, digest)
             files.append({"name": os.path.basename(path), "indexed": indexed})
         return files
 

@@ -3,8 +3,7 @@
 两种模式（与前端的问答模式选择一一对应）：
 - kb_only=True（默认，严格模式）：事实性内容只能来自知识库。子代理在出口由代码根据
   检索 artifact 生成结构化报告；本模块只认结构报告，不扫描任何失败短句。模型文本
-  先缓冲，当前回合收齐任务报告且至少一份 status=ok 后才增量放行；回合结束时再校验引用，
-  校验失败则用 replace 事件用固定文案整段替换已下发内容。
+  保留在本轮内存中，收齐报告并完成引用校验后才发布。校验失败时只发布固定提示。
 - kb_only=False（通用模式）：模型自身知识 + 必要时联网搜索，没有固定文案约定；
   本模块过滤工具消息和内部摘要，只透传用户可见的回答文本。
 
@@ -50,7 +49,7 @@ class AnswerGuard:
     """仅知识库模式的单回合输出判定器。
 
     调用方（guarded_stream）负责从流中取出消息并区分工具消息与文本消息；
-    本类维护单回合状态：收齐任务报告且有证据后允许增量放行，finish() 返回最终正文。
+    本类在内存中保留本轮草稿，finish() 核对所有报告和引用后返回最终正文。
     """
 
     def __init__(self) -> None:
@@ -62,8 +61,6 @@ class AnswerGuard:
         self._task_call_ids: set[str] = set()
         self._clarification_call_ids: set[str] = set()
         self._seen_tools: list[str] = []
-        # status=ok 报告到达后进入增量放行：后续文本边生成边下发
-        self._releasing = False
 
 
     def note_tool_call(self, tool_name: str | None, tool_call_id: str | None = None) -> None:
@@ -73,7 +70,6 @@ class AnswerGuard:
             if tool_call_id and tool_call_id not in self._task_call_ids:
                 # 检索前的计划或推测不属于最终答案。
                 self._buffer.clear()
-                self._releasing = False
                 self._task_call_ids.add(tool_call_id)
         elif tool_name == "ask_kb_clarification" and tool_call_id:
             self._clarification_call_ids.add(tool_call_id)
@@ -111,7 +107,6 @@ class AnswerGuard:
             has_evidence = any(r["status"] == STATUS_OK for r in self._reports.values())
             if complete and has_evidence and not self._clarification_call_ids:
                 self._buffer.clear()
-                self._releasing = True
             return True
 
         if looks_like_report(text):
@@ -129,12 +124,9 @@ class AnswerGuard:
             return True
         return False
 
-    def feed_text(self, text: str) -> str | None:
-        """缓冲模型文本；已进入增量放行时返回应立刻下发的增量。"""
-        if not text:
-            return None
-        self._buffer.append(text)
-        return text if self._releasing else None
+    def feed_text(self, text: str) -> None:
+        if text:
+            self._buffer.append(text)
 
     def finish(self) -> str:
         """流耗尽时返回最终正文，空字符串表示没有可输出的文本。"""
@@ -264,11 +256,8 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None, *,
                    on_final_text: Callable[[str], None] | None = None):
     """把 Agent 的原始消息流包装为"用户可见文本流"。
 
-    严格模式先缓冲模型文本；收齐任务报告且有 status=ok 时进入增量放行，
-    回合结束时校验证据标记，并生成原文页段链接，证据正文按需查看。
-    缺少引用或显式引用校验失败时，
-    下发 replace 事件，用固定文案整段替换已下发内容。澄清回合只输出工具返回的问句；
-    其余没有有效证据的回合只输出固定文案。
+    严格模式实时发送阶段，回合结束且引用校验完成后才发送正文。
+    澄清回合只输出工具返回的问句，其余没有有效证据的回合只输出固定文案。
 
     输出元素协议：
     - str：正常文本增量；
@@ -300,7 +289,6 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None, *,
             return
 
         guard = AnswerGuard()
-        emitted: list[str] = []
 
         for chunk, metadata in raw_stream:
             if should_stop is not None and should_stop():
@@ -321,10 +309,7 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None, *,
                         yield event
                 continue
 
-            delta = guard.feed_text(chunk.text)
-            if delta:
-                emitted.append(delta)
-                yield delta
+            guard.feed_text(chunk.text)
             if next_phase:
                 event = phase_event(next_phase)
                 if event:
@@ -337,17 +322,12 @@ def guarded_stream(raw_stream, kb_only: bool = True, should_stop=None, *,
             validation.attributes["result_kind"] = guard.outcome.result_kind
             if guard.outcome.error_code is not None:
                 validation.fail(guard.outcome.error_code)
-        if text:
-            emitted_text = "".join(emitted)
-            if not emitted_text:
-                yield text
-            elif emitted_text != text:
-                # 已下发内容与最终校验结果不一致（引用越界、降级文案等），整段替换
-                yield {"type": "replace", "content": text}
         if should_stop is not None and should_stop():
             return
         if on_final_text is not None:
             on_final_text(text or ANSWER_REJECTED_ERROR)
+        if text:
+            yield text
         yield guard.outcome
     finally:
         try:

@@ -2,7 +2,7 @@
 
 from datetime import date, datetime, time
 from contextlib import ExitStack, nullcontext
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from functools import lru_cache
 from html.parser import HTMLParser
 from io import BytesIO
@@ -490,6 +490,23 @@ def load_docx(path, *, on_progress: UnitProgressCallback | None = None):
     return result
 
 
+def _percent_value(value, integer_mask, decimal_mask):
+    number = Decimal(str(value))
+    places = len(decimal_mask)
+    with localcontext() as context:
+        context.prec = max(context.prec, number.adjusted() + 4 + places)
+        rounded = number.scaleb(2).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+    whole, _, fraction = format(rounded.copy_abs(), "f").partition(".")
+    digits = list(whole) if whole != "0" else []
+    integer = []
+    for mark in reversed(integer_mask):
+        integer.append(digits.pop() if digits else {"0": "0", "#": "", "?": " "}[mark])
+    integer = "".join(digits) + "".join(reversed(integer))
+    visible = max(len(fraction.rstrip("0")), decimal_mask.rfind("0") + 1)
+    decimals = fraction[:visible] + " " * decimal_mask[visible:].count("?")
+    return ("-" if rounded.is_signed() else "") + integer + ("." + decimals if decimals else "") + "%"
+
+
 def _display_value(value, number_format):
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
@@ -498,9 +515,10 @@ def _display_value(value, number_format):
     if value is None:
         return ""
     # 仅转换语义明确的百分比和整数补零；条件、货币、缩放等格式保留存储值及格式。
-    if isinstance(value, (int, float, Decimal)) and re.fullmatch(r"[0#?]+(?:\.[0#?]+)?%", number_format):
-        return f"{(Decimal(str(value)) * 100).normalize():f}%"
     if isinstance(value, (int, float, Decimal)):
+        percent = re.fullmatch(r"([0#?]+)(?:\.([0#?]+))?%", number_format)
+        if percent:
+            return _percent_value(value, *percent.groups(default=""))
         if re.fullmatch(r"0+", number_format) and value == int(value):
             integer = int(value)
             return f"{'-' if integer < 0 else ''}{abs(integer):0{len(number_format)}d}"
@@ -594,6 +612,7 @@ def _check_sheet_bounds(sheet, available):
 
 def _xlsx_documents(path, cell_limit, text_limit, progress):
     from utils.documents.xlsx_worker import TEXT_LIMIT_ERROR
+    from openpyxl.cell.cell import MergedCell
     from openpyxl.drawing.spreadsheet_drawing import AbsoluteAnchor
 
     _check_package(path)
@@ -639,7 +658,10 @@ def _xlsx_documents(path, cell_limit, text_limit, progress):
                         raise ValueError("Any2Markdown 返回的工作表数据行不完整")
                 values = []
                 row_chars = len(prefix)
-                for index, cell in enumerate(row):
+                nonempty = any(cell.value is not None and cell.value != "" for cell in row)
+                for index, cell in enumerate(row if nonempty else ()):
+                    if isinstance(cell, MergedCell):
+                        continue
                     raw = cell.value
                     plain = (isinstance(raw, str) and cell.data_type != "f" and raw == raw.strip()
                              and "<br>" not in raw) or (type(raw) in (int, float) and cell.number_format == "General")
@@ -647,12 +669,12 @@ def _xlsx_documents(path, cell_limit, text_limit, progress):
                         value = rendered[index]
                     else:
                         value = _cell_value(cell, cached_row[index] if index < len(cached_row) else None)
-                    if value:
-                        label = merged.get(cell.coordinate, cell.coordinate)
-                        row_chars += len(label) + 2 + len(value) + bool(values)
-                        if row_chars > remaining:
-                            raise ValueError(TEXT_LIMIT_ERROR)
-                        values.append(f"{label}: {value}")
+                    value = value or "（空）"
+                    label = merged.get(cell.coordinate, cell.coordinate)
+                    row_chars += len(label) + 2 + len(value) + bool(values)
+                    if row_chars > remaining:
+                        raise ValueError(TEXT_LIMIT_ERROR)
+                    values.append(f"{label}: {value}")
                 if values:
                     remaining -= row_chars
                     text = "；".join(values)

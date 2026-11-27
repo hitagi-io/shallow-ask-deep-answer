@@ -219,11 +219,12 @@ class UploadTaskStore:
             lease.close()
             raise
 
-    def list_tasks(self, user_id: int, project_id: str) -> list[dict]:
-        # 历史条数限制不隐藏未结束任务；在同一快照中读取全部所需记录，
-        # 无论任务数量多少，都只执行两次查询。
+    def list_tasks(self, user_id: int, project_id: str) -> tuple[str, list[dict]]:
+        # 活动状态包含尚未入队的接收租约，和任务列表读取同一个事务快照。
         with psycopg.connect(self.conninfo, row_factory=dict_row) as conn:
             conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            with conn.cursor() as cur:
+                activity = self.project_activity(cur, user_id, project_id)
             tasks = conn.execute("""
                 SELECT * FROM upload_tasks WHERE user_id = %s AND project_id = %s
                   AND (status IN ('queued', 'running') OR EXISTS (
@@ -235,7 +236,7 @@ class UploadTaskStore:
                 ORDER BY created_at DESC, sequence DESC
             """, (user_id, project_id, user_id, project_id)).fetchall()
             if not tasks:
-                return []
+                return activity, []
             grouped = {task["id"]: [] for task in tasks}
             for item in conn.execute("""
                 SELECT task_id, position, name, status, overwritten, indexed, error, progress,
@@ -243,7 +244,7 @@ class UploadTaskStore:
                 FROM upload_task_items WHERE task_id = ANY(%s) ORDER BY position
             """, (list(grouped),)).fetchall():
                 grouped[item.pop("task_id")].append(item)
-        return [{**task, "files": grouped[task["id"]], "recovery_required": task["status"] in ("failed", "completed")
+        return activity, [{**task, "files": grouped[task["id"]], "recovery_required": task["status"] in ("failed", "completed")
                  and any(item["recovery_pending"] for item in grouped[task["id"]])} for task in tasks]
 
     def items(self, task_id: str) -> list[dict]:
@@ -273,24 +274,27 @@ class UploadTaskStore:
         return [FileUploadOrder.model_validate(row) for row in rows]
 
     @staticmethod
-    def project_has_active(cur, user_id: int, project_id: str) -> bool:
+    def project_activity(cur, user_id: int, project_id: str) -> str:
         cur.execute("""
-            SELECT 1 FROM upload_receivers
-            WHERE user_id = %s AND project_id = %s AND expires_at > clock_timestamp()
-            UNION ALL
-            SELECT 1 FROM pending_file_deletions WHERE user_id=%s AND project_id=%s
-            UNION ALL
-            SELECT 1 FROM upload_tasks WHERE user_id = %s AND project_id = %s
-              AND (status IN ('queued', 'running') OR EXISTS (
-                SELECT 1 FROM upload_task_items i WHERE i.task_id=upload_tasks.id
-                  AND i.recovery IS NOT NULL AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished')
-              ))
-            LIMIT 1
-        """, (user_id, project_id, user_id, project_id, user_id, project_id))
-        return cur.fetchone() is not None
+            SELECT CASE
+              WHEN EXISTS (SELECT 1 FROM upload_receivers WHERE user_id=%(user)s AND project_id=%(project)s
+                           AND expires_at > clock_timestamp())
+                OR EXISTS (SELECT 1 FROM upload_tasks WHERE user_id=%(user)s AND project_id=%(project)s
+                           AND status IN ('queued','running')) THEN 'updating'
+              WHEN EXISTS (SELECT 1 FROM pending_file_deletions WHERE user_id=%(user)s AND project_id=%(project)s)
+                OR EXISTS (SELECT 1 FROM upload_tasks t JOIN upload_task_items i ON i.task_id=t.id
+                           WHERE t.user_id=%(user)s AND t.project_id=%(project)s AND i.recovery IS NOT NULL
+                           AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished')) THEN 'recovery'
+              ELSE 'idle' END AS activity
+        """, {"user": user_id, "project": project_id})
+        return cur.fetchone()["activity"]
+
+    @classmethod
+    def project_has_active(cls, cur, user_id: int, project_id: str) -> bool:
+        return cls.project_activity(cur, user_id, project_id) != "idle"
 
     def has_active(self, user_id: int, project_id: str) -> bool:
-        with psycopg.connect(self.conninfo) as conn, conn.cursor() as cur:
+        with psycopg.connect(self.conninfo, row_factory=dict_row) as conn, conn.cursor() as cur:
             return self.project_has_active(cur, user_id, project_id)
 
     def pending_recoveries(self, user_id: int, project_id: str) -> list[dict]:

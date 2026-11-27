@@ -21,7 +21,7 @@ from starlette.datastructures import UploadFile
 
 import anyio
 import psycopg
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 
 from chat_agent import ChatAgent, PG_CHECKPOINT_POOL_MAX
@@ -61,7 +61,6 @@ from auth import (
     close_db_pool,
     register,
     login,
-    consume_rate_limit,
     consume_account_change_limit,
     verify_token,
     get_session_user,
@@ -83,8 +82,7 @@ from auth import (
     finish_generation,
     reap_stale_generations,
     delete_conversation_guarded,
-    acquire_chat_slot,
-    bind_chat_slot_generation,
+    ChatLimits,
     release_chat_slot,
     list_projects,
     get_project,
@@ -966,27 +964,6 @@ def api_delete_conversation(conv_id: str, user: dict = Depends(get_current_user)
 _chat_slot_cancels: dict[str, Callable[[], None]] = {}
 
 
-async def _acquire_chat_slot(user_id: int) -> dict:
-    """占用一个跨进程对话并发槽位，返回 {"token", "reaped"}；token 为 None 表示已达上限。
-
-    达到 CHAT_SLOT_MAX_AGE_SECONDS 或绑定任务已结束/心跳超时的租约会被清理；
-    跨进程取消已由数据库写入 cancel_requested，本进程内的对应任务还需通过
-    本地回调立即停止，否则会继续占用模型请求与线程资源。
-    """
-    lease = await asyncio.to_thread(
-        acquire_chat_slot,
-        user_id,
-        MAX_CONCURRENT_CHAT_PER_USER,
-        CHAT_SLOT_MAX_AGE_SECONDS,
-        CHAT_GENERATION_STALE_SECONDS,
-    )
-    for token in lease["reaped"]:
-        cancel = _chat_slot_cancels.pop(token, None)
-        if cancel is not None:
-            cancel()
-    return lease
-
-
 def _bind_chat_slot_cancel(token: str, cancel) -> None:
     """把租约与生成任务的取消入口绑定，租约清理时可以停止本进程内的任务。"""
     _chat_slot_cancels[token] = cancel
@@ -1097,10 +1074,14 @@ async def resume_generation(conv_id: str, request_id: str, user: dict = Depends(
 
 
 @app.post("/api/conversations/{conv_id}/generations/{request_id}/cancel")
-async def stop_generation(conv_id: str, request_id: str, user: dict = Depends(get_current_user)):
-    if not await asyncio.to_thread(cancel_generation, user["user_id"], conv_id, request_id):
+async def stop_generation(conv_id: str, request_id: str, user: dict = Depends(get_current_user), before_start: bool = False):
+    if not re.fullmatch(r"[0-9a-zA-Z_-]{8,64}", request_id):
+        raise HTTPException(status_code=404, detail="未找到这次回答")
+    state = await asyncio.to_thread(cancel_generation, user["user_id"], conv_id, request_id,
+                                    user["expires_at"] if before_start else None)
+    if state is None:
         raise HTTPException(status_code=404, detail="未找到这次回答，请刷新页面后重试。")
-    return {"message": "ok"}
+    return {"message": "ok", "state": state}
 
 
 @app.post("/api/chat/stream")
@@ -1111,34 +1092,6 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(subscription_user))
         raise HTTPException(status_code=400, detail="请先选择知识库项目")
     if not req.kb_only and req.project_id is not None:
         raise HTTPException(status_code=400, detail="通用模式不使用项目")
-    existing = await asyncio.to_thread(
-        get_generation, user["user_id"], req.thread_id, req.request_id, CHAT_GENERATION_STALE_SECONDS,
-    )
-    if existing is not None:
-        if existing["project_deleted"]:
-            raise HTTPException(status_code=410, detail="项目已删除，历史对话仅供查看，无法继续提问")
-        if existing["kb_only"] != req.kb_only or existing["project_id"] != req.project_id:
-            raise HTTPException(status_code=409, detail="请求编号已用于其他模式或项目，请重新发送")
-        if existing["user_content"] != req.message or existing["retry_of"] != req.retry_of:
-            raise HTTPException(status_code=409, detail="请求编号已用于不同的问题或重试，请使用新的请求编号")
-        # 幂等重放和恢复只订阅已有任务，不消耗新的并发槽位或发送额度。
-        return _generation_stream(user, req.thread_id, req.request_id)
-    if req.kb_only:
-        await asyncio.to_thread(_ensure_no_uploads, user["user_id"], req.project_id)
-    if not await asyncio.to_thread(
-        consume_rate_limit, "chat", str(user["user_id"]), CHAT_RATE_LIMIT, CHAT_RATE_WINDOW_SECONDS
-    ):
-        raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
-
-    try:
-        lease = await _acquire_chat_slot(user["user_id"])
-    except Exception as e:
-        logger.error(f"[对话流] 获取并发槽位失败 user_id={user['user_id']}：{e}")
-        raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
-    slot = lease["token"]
-    if slot is None:
-        raise HTTPException(status_code=429, detail="并发回答数过多，请等待当前回答完成")
-
     # 服务端统一登记生成任务并写入用户消息：会话必须存在且属于当前用户；
     # 同一会话只允许一个运行中任务，同一 request_id 重复提交按幂等重放处理。
     try:
@@ -1152,13 +1105,21 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(subscription_user))
             req.kb_only,
             req.project_id,
             req.retry_of,
+            limits=ChatLimits(send_count=CHAT_RATE_LIMIT, window_seconds=CHAT_RATE_WINDOW_SECONDS,
+                              concurrent=MAX_CONCURRENT_CHAT_PER_USER, lease_seconds=CHAT_SLOT_MAX_AGE_SECONDS),
         )
     except Exception as e:
-        await _release_chat_slot(user["user_id"], slot)
         logger.error(f"[对话流] 登记生成任务失败 thread_id={req.thread_id}：{e}")
         raise HTTPException(status_code=503, detail="服务暂时不可用，请稍后重试")
 
+    for token in begun.get("reaped", ()):
+        cancel = _chat_slot_cancels.pop(token, None)
+        if cancel is not None:
+            cancel()
+
     generation_errors = {
+        "rate_limited": (429, "请求过于频繁，请稍后再试"),
+        "concurrency_limited": (429, "并发回答数过多，请等待当前回答完成"),
         "not_found": (404, "会话不存在或已被删除"),
         "busy": (409, "当前会话已有回答正在生成，请稍后再试"),
         "mode_conflict": (409, "请求编号已用于其他问答模式，请重新发送"),
@@ -1172,28 +1133,23 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(subscription_user))
         "upload_active": (409, UPLOAD_ACTIVE_DETAIL),
         "conversation_project_conflict": (409, "此会话的项目已固定，请开启新对话后选择项目"),
     }
+    if begun["status"] == "stopped_before_start":
+        return Response(status_code=204)
     if begun["status"] in generation_errors:
-        await _release_chat_slot(user["user_id"], slot)
         status, detail = generation_errors[begun["status"]]
         raise HTTPException(status_code=status, detail=detail)
 
-    if begun["status"] == "replay":
-        await _release_chat_slot(user["user_id"], slot)
-    else:
+    if begun["status"] == "started":
         # 在返回响应前启动独立任务；断开 SSE 只结束订阅。
         with bind_context(ExecutionContext(http_request_id=current_context.get().http_request_id,
                           trace_id=begun["trace_id"], user_id=user["user_id"], project_id=req.project_id,
                           generation_id=begun["generation_id"], attempt_id=begun["attempt_id"])):
             generation_task = asyncio.create_task(
-                _run_generation(req, user["user_id"], begun["generation_id"], begun["attempt_id"], slot),
+                _run_generation(req, user["user_id"], begun["generation_id"], begun["attempt_id"], begun["slot"]),
                 name=f"generation-{begun['generation_id']}",
             )
         _generation_tasks.add(generation_task)
         generation_task.add_done_callback(_background_task_done)
-        try:
-            await asyncio.to_thread(bind_chat_slot_generation, user["user_id"], slot, begun["generation_id"])
-        except Exception:
-            logger.exception("[对话流] 关联并发槽位与生成任务失败")
 
     return _generation_stream(user, req.thread_id, req.request_id)
 
@@ -1512,8 +1468,8 @@ def _stage_uploads(files: list[UploadFile], oversized: set[UploadFile], project:
 
 @app.get("/api/projects/{project_id}/upload-tasks")
 def list_upload_tasks(project: dict = Depends(require_project)):
-    return {"tasks": [_upload_task_payload(task) for task in
-                      _upload_task_store.list_tasks(project["user_id"], project["id"])]}
+    activity, tasks = _upload_task_store.list_tasks(project["user_id"], project["id"])
+    return {"activity": activity, "tasks": [_upload_task_payload(task) for task in tasks]}
 
 
 @app.get("/api/projects/{project_id}/upload-tasks/{task_id}")

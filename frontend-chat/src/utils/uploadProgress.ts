@@ -74,9 +74,13 @@ function parseProgress(value: unknown): IndexProgress | null {
   return { stage: value.stage, completed: value.completed, total: value.total, percent: value.percent }
 }
 
-export function parseUploadTasks(value: unknown): UploadTask[] {
+export type ProjectActivity = 'updating' | 'recovery' | 'idle'
+
+export function parseUploadTasks(value: unknown): { activity: ProjectActivity; tasks: UploadTask[] } {
   if (!isRecord(value) || !Array.isArray(value.tasks)) return invalidProgress()
-  return value.tasks.map((task: unknown): UploadTask => {
+  const { activity } = value
+  if (activity !== 'updating' && activity !== 'recovery' && activity !== 'idle') return invalidProgress()
+  const tasks = value.tasks.map((task: unknown): UploadTask => {
     if (!isRecord(task) || typeof task.task_id !== 'string'
         || (task.status !== 'queued' && task.status !== 'running' && task.status !== 'completed' && task.status !== 'failed')
         || !isCount(task.total) || !isCount(task.completed) || !isCount(task.succeeded) || !isCount(task.failed)
@@ -93,4 +97,5 @@ export function parseUploadTasks(value: unknown): UploadTask[] {
     return { task_id: task.task_id, status: task.status, total: task.total, completed: task.completed,
       succeeded: task.succeeded, failed: task.failed, error: task.error, recovery_required: task.recovery_required, files }
   })
+  return { activity, tasks }
 }

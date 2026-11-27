@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watchPostEffect } from 'vue'
 import { answerHtml } from '../../utils/answerHtml'
+import { revealAnswer } from '../../utils/revealAnswer'
 import { isSourceUrl, type Message } from '../../api'
 import { formatDuration } from '../../utils/duration'
 import BrandMark from '../common/BrandMark.vue'
@@ -16,11 +17,12 @@ const props = defineProps<{
   projectDeleted: boolean
   thinking: boolean
   streaming: boolean
+  reveal: boolean
   thinkingSeconds: number
   thinkingPhase: string
   busy: boolean
 }>()
-const emit = defineEmits<{ retry: []; sync: [] }>()
+const emit = defineEmits<{ retry: []; sync: []; revealProgress: []; revealFinished: [] }>()
 const feedback = ref<'like' | 'dislike' | null>(null)
 function toggleFeedback(value: 'like' | 'dislike') {
   feedback.value = feedback.value === value ? null : value
@@ -75,6 +77,11 @@ const html = computed(() => {
   }
   return clean.replace(/<pre>/g, '<pre><button type="button" class="icon-button" data-copy-code aria-label="复制代码" title="复制代码"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg></button>')
 })
+watchPostEffect(onCleanup => {
+  if (props.reveal && body.value) {
+    onCleanup(revealAnswer(body.value, html.value, () => emit('revealProgress'), () => emit('revealFinished')))
+  }
+})
 </script>
 
 <template>
@@ -92,8 +99,8 @@ const html = computed(() => {
         <span class="thinking-dot" style="animation-delay:0.3s"></span>
         <span class="thinking-text">{{ thinkingPhase || '正在处理问题' }}… {{ formatDuration(thinkingSeconds) }}</span>
       </div>
-      <div v-if="message.role === 'assistant' && !(thinking && !message.content)" ref="body" class="bubble markdown-body" @click="copyCode" v-html="html"></div>
-      <div v-if="message.role === 'assistant' && !thinking && !streaming" class="message-actions">
+      <div v-if="message.role === 'assistant' && !(thinking && !message.content)" ref="body" class="bubble markdown-body" :class="{ revealing: reveal }" @click="copyCode" v-html="reveal ? '' : html"></div>
+      <div v-if="message.role === 'assistant' && !thinking && !streaming && !reveal" class="message-actions">
         <button v-if="message.status === 'streaming'" class="text-action" :disabled="busy" @click="emit('sync')">同步回答</button>
         <button v-if="message.generation_id && message.trace_id" class="text-action" @click="showExecution = true">执行过程</button>
         <button v-if="message.content" class="icon-button" aria-label="复制回答" title="复制回答" @click="copy(message.content)">
@@ -115,7 +122,7 @@ const html = computed(() => {
         {{ message.status === 'cancelled' ? '已停止回答' : projectDeleted ? '回答未完成' : '回答未完成，可重新提问' }}
       </div>
       <div v-if="message.role === 'user'" class="bubble">{{ message.content }}</div>
-      <span v-if="streaming && message.role === 'assistant'" class="cursor">▌</span>
+      <span v-if="(streaming || reveal) && message.role === 'assistant'" class="cursor">▌</span>
     </div>
   </div>
 </template>
@@ -133,6 +140,7 @@ const html = computed(() => {
   .feedback-button:active { transform: none; }
 }
 .markdown-body :deep(pre button) { margin: 0 0 10px auto; color: var(--muted); }
+.markdown-body.revealing :deep([data-copy-code]) { visibility: hidden; }
 .message { display: flex; gap: 14px; max-width: var(--reading-width); margin: 0 auto 32px; }
 .avatar { width: 32px; height: 32px; display: grid; place-items: center; flex-shrink: 0; border: 1px solid var(--accent-border); border-radius: var(--radius-control); background: var(--accent-soft); }
 .avatar .brand-mark { width: 22px; height: 22px; color: var(--accent); }

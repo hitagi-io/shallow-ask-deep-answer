@@ -4,7 +4,7 @@ import { useNotice } from './useNotice'
 import { useHealthReport } from './useHealthReport'
 import type { ConfirmAction } from './useConfirmation'
 import { knowledgeFileTypes, supportsKnowledgeFile } from '../utils/knowledgeFormats'
-import { fileProgressStageCount, transferredPercent, taskFileDetail, taskFilePercent } from '../utils/uploadProgress'
+import { fileProgressStageCount, transferredPercent, taskFileDetail, taskFilePercent, type ProjectActivity } from '../utils/uploadProgress'
 import { formatQuotaBytes } from '../utils/uploadQuota'
 import type { FileFilter, FileSort, FileSummary } from '../utils/knowledgeFiles'
 
@@ -61,8 +61,9 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   const uploadResults = ref<UploadResult[]>([])
   const uploadTasks = ref<UploadTask[]>([])
   const taskLoadError = ref('')
-  const indexing = computed(() => uploadTasks.value.some(task => task.status === 'queued' || task.status === 'running'))
-  const recoveryRequired = computed(() => uploadTasks.value.some(task => task.recovery_required))
+  const activity = ref<ProjectActivity>('idle')
+  const indexing = computed(() => activity.value === 'updating')
+  const recoveryRequired = computed(() => activity.value === 'recovery')
   const uploadProgress = computed<UploadProgressGroup[]>(() => {
     // 接收响应前可能已经轮询到新任务；等 taskId 返回后在原条目中接续，避免重复显示。
     const visibleTasks = uploadTasks.value.filter(task => operation.value !== 'uploading'
@@ -210,9 +211,10 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     try {
       const result = await fetchUploadTasks(id, { signal: readAbort.signal })
       if (request === tasksRequestVersion) {
-        uploadTasks.value = result
+        activity.value = result.activity
+        uploadTasks.value = result.tasks
         // 仅清理请求前已确认的历史任务；请求期间新提交的任务可能尚未进入这次快照。
-        const taskIds = new Set(result.map(task => task.task_id))
+        const taskIds = new Set(result.tasks.map(task => task.task_id))
         uploadResults.value = uploadResults.value.filter(row => row.taskId === null
           || !submittedBeforeRequest.has(row.taskId) || taskIds.has(row.taskId))
         taskLoadError.value = ''
@@ -337,18 +339,20 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
       show(errors.length ? `修复与补建部分失败：${errors.join('；')}` : report.healthy ? '修复与补建完成，索引状态良好' : '修复与补建已执行，仍有异常，请查看检查结果', errors.length || !report.healthy ? 'error' : 'success')
     })
   }
-  // 可见项目只轮询文件元数据和缓存报告，不启动完整性扫描。
+  // 可见项目轮询活动状态，资料与缓存报告在任务变化或刷新周期到期时重新读取。
   async function poll() {
     if (disposed) return
     try {
       const id = projectId.value
       if (active.value && id && (!knowledgeBusy.value || knowledgeUploading.value)) {
+        const previousActivity = activity.value
         const before = uploadTasks.value.map(task => `${task.task_id}:${task.status}:${task.completed}`).join('|')
         await refreshTasks(id)
         const after = uploadTasks.value.map(task => `${task.task_id}:${task.status}:${task.completed}`).join('|')
-        if (!quotaRequest && (before !== after || Date.now() - lastQuotaRead > 60_000)) void refreshQuota()
+        const changed = before !== after || previousActivity !== activity.value
+        if (!quotaRequest && (changed || Date.now() - lastQuotaRead > 60_000)) void refreshQuota()
         if (!knowledgeBusy.value && !filesLoading.value
-            && (before !== after || Date.now() - lastFullRefresh > 60_000)) {
+            && (changed || Date.now() - lastFullRefresh > 60_000)) {
           await Promise.allSettled([refreshFiles(id), refreshHealth(id)])
           lastFullRefresh = Date.now()
         }
@@ -361,6 +365,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
   watch(projectId, () => {
     viewVersion++; cancelReads()
     fileSummary.value = null; filePage.value = 1; filePageCount.value = 0; matchedFiles.value = 0
+    activity.value = 'idle'
     files.value = []; uploadTasks.value = []; uploadResults.value = []; taskLoadError.value = ''; lastFullRefresh = 0; healthState.reset(); search.value = ''; statusFilter.value = 'all'; fileSort.value = 'uploaded_desc'; loadError.value = ''; clearNotice()
     if (active.value) void loadKnowledgeState()
   }, { flush: 'sync' })

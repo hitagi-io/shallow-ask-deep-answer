@@ -3,7 +3,7 @@ import { fetchFileSummary, fetchUploadTasks } from '../api'
 
 type Readiness = 'checking' | 'updating' | 'recovery' | 'empty' | 'partial' | 'ready' | 'error'
 
-// 只读取文件入库记录和后台任务，不触发索引检查或检索。
+// 先核对服务端活动状态，项目空闲时再读取当前资料统计。
 export function useProjectReadiness(projectId: Readonly<Ref<string | null>>, updatingProjectId: Readonly<Ref<string | null>>) {
   const remoteStatus = ref<Readiness>('checking')
   const locallyUpdating = computed(() => !!projectId.value && projectId.value === updatingProjectId.value)
@@ -32,11 +32,15 @@ export function useProjectReadiness(projectId: Readonly<Ref<string | null>>, upd
     if (pending) return pending
     pending = (async () => {
       try {
-        const [tasks, summary] = await Promise.all([fetchUploadTasks(id, { signal }), fetchFileSummary(id, { signal })])
+        const { activity } = await fetchUploadTasks(id, { signal })
         if (signal.aborted) return false
-        remoteStatus.value = tasks.some(task => task.recovery_required) ? 'recovery'
-          : tasks.some(task => task.status === 'queued' || task.status === 'running') ? 'updating'
-          : summary.indexed === 0 ? 'empty'
+        if (activity !== 'idle') {
+          remoteStatus.value = activity
+          return false
+        }
+        const summary = await fetchFileSummary(id, { signal })
+        if (signal.aborted) return false
+        remoteStatus.value = summary.indexed === 0 ? 'empty'
           : summary.indexed < summary.total ? 'partial' : 'ready'
         return !blocked.value
       } catch (reason) {

@@ -8,6 +8,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -270,6 +271,13 @@ def init_db():
                         expires_at TIMESTAMPTZ NOT NULL
                     );
                     CREATE INDEX IF NOT EXISTS idx_chat_subscriptions_user ON chat_subscriptions(user_id, expires_at);
+                    CREATE TABLE IF NOT EXISTS pending_generation_stops (
+                        conversation_id VARCHAR(36) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                        request_id VARCHAR(64) NOT NULL,
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (conversation_id, request_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_pending_generation_stops_expiry ON pending_generation_stops(expires_at);
                 """)
                 ManifestStore.setup(cur)
                 migrate(cur)
@@ -376,6 +384,7 @@ def maintain_access_limits() -> None:
     with _connection() as conn:
         conn.execute("DELETE FROM revoked_access_sessions WHERE expires_at <= now()")
         conn.execute("DELETE FROM chat_subscriptions WHERE expires_at <= now()")
+        conn.execute("DELETE FROM pending_generation_stops WHERE expires_at <= now()")
         conn.execute("DELETE FROM upload_daily_usage WHERE usage_day < (now() AT TIME ZONE 'UTC')::date - 2")
         with conn.cursor() as cur:
             cur.execute("SELECT token FROM upload_receivers WHERE expires_at <= now() "
@@ -808,6 +817,19 @@ def list_conversations(user_id: int, limit: int = 20, cursor: str | None = None)
     }
 
 
+_UNVERIFIED_DRAFT_NOTICE = "本次知识库回答未完成引用校验，未发布回答正文。"
+
+
+def _public_answer(content: str, kb_only: bool, status: str, result_kind: str | None) -> str:
+    # 兼容旧版本已经写入数据库的流式草稿。已完成的旧回答可能没有 result_kind。
+    if kb_only and result_kind is None:
+        if status in ("streaming", "running"):
+            return ""
+        if status in ("failed", "error", "cancelled"):
+            return _UNVERIFIED_DRAFT_NOTICE
+    return content
+
+
 def list_messages(
     user_id: int,
     conv_id: str,
@@ -846,6 +868,9 @@ def list_messages(
             rows = cur.fetchall()
         conn.commit()
     page = rows[:limit]
+    for message in page:
+        if message["role"] == "assistant":
+            message["content"] = _public_answer(message["content"], message["kbOnly"], message["status"], message["result_kind"])
     return {"messages": list(reversed(page)),
             "kbOnly": conversation["kb_only"],
             "project_id": conversation["project_id"], "project_name": conversation["project_name"],
@@ -937,8 +962,9 @@ _GENERATION_JOINS = """
     LEFT JOIN messages u ON u.id = g.user_message_id
     LEFT JOIN projects p ON p.id = g.project_id AND p.user_id = g.user_id
 """
-_GENERATION_REPLAY_QUERY = f"""
-    SELECT {_GENERATION_FIELDS} FROM generations g {_GENERATION_JOINS}
+_GENERATION_REPLAY_QUERY = """
+    SELECT g.kb_only, g.project_id, g.retry_of, u.content AS user_content
+    FROM generations g LEFT JOIN messages u ON u.id=g.user_message_id
     WHERE g.conversation_id = %s AND g.request_id = %s
 """
 _GENERATION_SNAPSHOT_QUERY = f"""
@@ -976,9 +1002,9 @@ def _reap_stale_generations(cur, conv_id: str, stale_seconds: float) -> int:
         message_id = row["assistant_message_id"]
         status = "cancelled" if row["cancel_requested"] else "failed"
         code = "cancelled" if row["cancel_requested"] else "worker_lost"
-        cur.execute("UPDATE messages SET status = %s, content = CASE WHEN content = '' "
+        cur.execute("UPDATE messages SET status = %s, content = CASE WHEN kb_only THEN %s WHEN content = '' "
                     "THEN '回答已中断，请重新提问。' ELSE content END WHERE id = %s",
-                    ("cancelled" if row["cancel_requested"] else "error", message_id))
+                    ("cancelled" if row["cancel_requested"] else "error", _UNVERIFIED_DRAFT_NOTICE, message_id))
         cur.execute(
             "UPDATE generations SET status = %s, error_code = %s, error = %s, "
             "assistant_message_id = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
@@ -995,6 +1021,14 @@ def _reap_stale_generations(cur, conv_id: str, stale_seconds: float) -> int:
     return len(rows)
 
 
+@dataclass(frozen=True)
+class ChatLimits:
+    send_count: int
+    window_seconds: int
+    concurrent: int
+    lease_seconds: int
+
+
 def begin_generation(
     user_id: int,
     conv_id: str,
@@ -1004,33 +1038,21 @@ def begin_generation(
     kb_only: bool = True,
     project_id: str | None = None,
     retry_of: int | None = None,
+    *, limits: ChatLimits,
 ) -> dict:
-    """登记一次生成任务，并原子写入用户消息。
+    """在会话锁内核对幂等请求。只有接受的新请求才在同一事务登记任务、消息、租约和发送额度。
 
-    同一会话同时只允许一个运行中的任务（由数据库部分唯一索引保证），
-    首次接受消息时固定会话模式和私有项目，绑定与消息原子提交。
-    request_id 重放也必须匹配模式和项目；归属检查不依赖前端传入用户信息。
-
-    返回：
-    - {"status": "started", "generation_id": ..., "user_message_id": ...}
-    - {"status": "replay", "generation": {...}}
-    - {"status": "busy"}
-    - {"status": "mode_conflict"}：请求编号已经用于其他模式
-    - {"status": "conversation_mode_conflict"}：会话已经固定为其他模式
-    - {"status": "project_required"}：知识库模式未选择项目
-    - {"status": "project_not_found"}：项目不存在或不属于当前用户
-    - {"status": "project_deleted"}：项目已删除，历史对话仅供查看
-    - {"status": "project_conflict"}：通用模式携带项目，或重放使用了不同项目
-    - {"status": "conversation_project_conflict"}：会话已经固定为其他项目
-    - {"status": "not_found"}：会话不存在或不属于当前用户
+    重放返回 replay，首次接受返回 started 及后台执行所需的标识。
     """
     if kb_only and not project_id:
         return {"status": "project_required"}
     if not kb_only and project_id is not None:
         return {"status": "project_conflict"}
-    with _connection() as conn:
+    with _connection() as conn, conn.transaction():
         with conn.cursor(row_factory=dict_row) as cur:
             account_write_access(cur, user_id)
+            # 所有登记先串行化账号准入，再锁会话及生成行；重放在任何额度操作之前返回。
+            cur.execute("SELECT pg_advisory_xact_lock(%s,%s)", (_CHAT_SLOT_LOCK_CLASS, user_id))
             if project_id is not None:
                 cur.execute("SELECT id, deleted_at FROM projects WHERE id = %s AND user_id = %s FOR SHARE",
                             (project_id, user_id))
@@ -1058,14 +1080,18 @@ def begin_generation(
             cur.execute(_GENERATION_REPLAY_QUERY, (conv_id, request_id))
             existing = cur.fetchone()
             if existing is not None:
-                conn.commit()
                 if existing["kb_only"] != kb_only:
                     return {"status": "mode_conflict"}
                 if existing["project_id"] != project_id:
                     return {"status": "project_conflict"}
                 if existing["user_content"] != content or existing["retry_of"] != retry_of:
                     return {"status": "content_conflict"}
-                return {"status": "replay", "generation": existing}
+                return {"status": "replay"}
+
+            cur.execute("SELECT 1 FROM pending_generation_stops WHERE conversation_id=%s AND request_id=%s "
+                        "AND expires_at > now()", (conv_id, request_id))
+            if cur.fetchone() is not None:
+                return {"status": "stopped_before_start"}
 
             if project_id is not None and UploadTaskStore.project_has_active(cur, user_id, project_id):
                 return {"status": "upload_active"}
@@ -1073,7 +1099,6 @@ def begin_generation(
             cur.execute("SELECT 1 FROM generations WHERE conversation_id = %s AND status = 'running'",
                         (conv_id,))
             if cur.fetchone() is not None:
-                conn.commit()
                 return {"status": "busy"}
 
             if retry_of is not None:
@@ -1082,6 +1107,14 @@ def begin_generation(
                 previous = cur.fetchone()
                 if previous is None or previous["status"] not in ("failed", "cancelled") or previous["content"] != content:
                     return {"status": "invalid_retry"}
+            key = str(user_id)
+            _rate_lock_keys(cur, [("chat", key)])
+            now = datetime.now()
+            if _rate_exceeded(cur, "chat", key, limits.send_count, limits.window_seconds, now):
+                return {"status": "rate_limited"}
+            slot, reaped = _claim_chat_slot(cur, user_id, limits, stale_seconds)
+            if slot is None:
+                return {"status": "concurrency_limited", "reaped": reaped}
             trace_id, attempt_id = uuid.uuid4().hex, uuid.uuid4().hex
             cur.execute(
                 "INSERT INTO generations (conversation_id,user_id,request_id,kb_only,project_id,trace_id,attempt_id,retry_of) "
@@ -1089,6 +1122,9 @@ def begin_generation(
                 (conv_id,user_id,request_id,kb_only,project_id,trace_id,attempt_id,retry_of),
             )
             generation_id = cur.fetchone()["id"]
+            cur.execute("INSERT INTO chat_slots(token,user_id,generation_id) VALUES (%s,%s,%s)",
+                        (slot, user_id, generation_id))
+            _rate_record(cur, "chat", key, now)
             cur.execute("INSERT INTO generation_attempts(id,generation_id,trace_id,worker_id,status) VALUES(%s,%s,%s,%s,'running')",
                         (attempt_id, generation_id, trace_id, f"{os.getpid()}:{threading.get_ident()}"))
             append_audit(cur, user_id=user_id, action="generation.retry" if retry_of is not None else "generation.start",
@@ -1117,9 +1153,9 @@ def begin_generation(
                 "UPDATE conversations SET kb_only = %s, project_id = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
                 (kb_only, project_id, conv_id),
             )
-        conn.commit()
         return {
             "status": "started",
+            "slot": slot, "reaped": reaped,
             "generation_id": generation_id,
             "user_message_id": user_message_id,
             "assistant_message_id": assistant_message_id,
@@ -1169,25 +1205,36 @@ def get_generation(user_id: int, conv_id: str, request_id: str, stale_seconds: f
         del row["subscriber_tokens"]
     del row["stale"]
     row["elapsed_seconds"] = float(row["elapsed_seconds"])
+    row["assistant_content"] = _public_answer(row["assistant_content"], row["kb_only"], row["status"], row["result_kind"])
     return row
 
 
-def cancel_generation(user_id: int, conv_id: str, request_id: str) -> bool:
-    """显式停止与断开订阅分离；重复停止已结束的任务也成功。"""
+def cancel_generation(user_id: int, conv_id: str, request_id: str, pending_until: float | None = None) -> str | None:
+    """与登记共用会话锁。先到达的停止意图覆盖原凭证可提交请求的整个有效期。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (_conversation_lock_key(conv_id),))
+            cur.execute("SELECT id FROM conversations WHERE id=%s AND user_id=%s FOR SHARE", (conv_id, user_id))
+            if cur.fetchone() is None:
+                return None
             cur.execute("UPDATE generations SET cancel_requested = TRUE "
                         "WHERE conversation_id = %s AND request_id = %s AND user_id = %s RETURNING id,project_id,trace_id",
                         (conv_id, request_id, user_id))
             row = cur.fetchone()
-            found = row is not None
             if row is not None:
                 append_audit(cur, user_id=user_id, action="generation.cancel", resource_type="generation",
                              resource_id=str(row["id"]), project_id=row["project_id"], result="accepted",
                              event_key=f"generation:{row['id']}:cancel", operation_id=f"generation:{row['id']}",
                              trace_id=row["trace_id"])
+            elif pending_until is not None:
+                cur.execute("INSERT INTO pending_generation_stops(conversation_id,request_id,expires_at) "
+                            "VALUES (%s,%s,to_timestamp(%s)) ON CONFLICT(conversation_id,request_id) DO UPDATE "
+                            "SET expires_at=GREATEST(pending_generation_stops.expires_at, EXCLUDED.expires_at)",
+                            (conv_id, request_id, pending_until))
+            else:
+                return None
         conn.commit()
-    return found
+    return "registered" if row is not None else "before_start"
 
 
 def save_generation_progress(generation_id: int, attempt_id: str, content: str | None, phase: str) -> bool:
@@ -1196,9 +1243,9 @@ def save_generation_progress(generation_id: int, attempt_id: str, content: str |
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("UPDATE generations SET heartbeat_at = CURRENT_TIMESTAMP, phase = %s "
                         "WHERE id = %s AND attempt_id = %s AND status = 'running' AND NOT cancel_requested "
-                        "RETURNING assistant_message_id", (phase, generation_id, attempt_id))
+                        "RETURNING assistant_message_id, kb_only", (phase, generation_id, attempt_id))
             row = cur.fetchone()
-            if row is not None and content is not None:
+            if row is not None and not row["kb_only"] and content is not None:
                 cur.execute("UPDATE messages SET content = %s WHERE id = %s",
                             (content, row["assistant_message_id"]))
         conn.commit()
@@ -1238,6 +1285,7 @@ def finish_generation(
                 publish_checkpoint(conn)
             if not content and message_status == "error":
                 content = error or "回答已中断，请重新提问。"
+            content = _public_answer(content, row["kb_only"], status, result_kind)
             message_id = row["assistant_message_id"]
             cur.execute("UPDATE messages SET content = %s, status = %s WHERE id = %s",
                         (content, message_status, message_id))
@@ -1312,95 +1360,52 @@ def delete_conversation_guarded(
         return "deleted"
 
 
-def acquire_chat_slot(
-    user_id: int,
-    limit: int,
-    max_age_seconds: int,
-    stale_seconds: float,
-) -> dict:
-    """跨进程占用一个对话并发槽位（数据库租约），超额时 token 为 None。
+def _claim_chat_slot(cur, user_id: int, limits: ChatLimits, stale_seconds: float) -> tuple[str | None, list[str]]:
+    """调用方持有账号准入锁。回收过期租约，并为可接受的新任务分配 token。"""
+    cur.execute(
+        """
+        SELECT s.token, s.generation_id,
+               s.started_at <= now() - make_interval(secs => %s) AS lease_expired,
+               s.generation_id IS NOT NULL AND (
+                   g.id IS NULL
+                   OR g.status <> 'running'
+                   OR g.heartbeat_at <= now() - make_interval(secs => %s)
+               ) AS generation_dead
+        FROM chat_slots s
+        LEFT JOIN generations g ON g.id = s.generation_id
+        WHERE s.user_id = %s
+        ORDER BY s.started_at
+        """,
+        (limits.lease_seconds, stale_seconds, user_id),
+    )
+    rows = cur.fetchall()
 
-    limit <= 0 时不限制数量，仍记录租约并清理失效任务。
+    reaped = [
+        row["token"]
+        for row in rows
+        if row["lease_expired"] or row["generation_dead"]
+    ]
+    cancel_ids = [
+        row["generation_id"]
+        for row in rows
+        if row["generation_id"] is not None
+        and (row["lease_expired"] or row["generation_dead"])
+    ]
+    if reaped:
+        cur.execute(
+            "DELETE FROM chat_slots WHERE user_id = %s AND token = ANY(%s)",
+            (user_id, reaped),
+        )
+    if cancel_ids:
+        cur.execute(
+            "UPDATE generations SET cancel_requested = TRUE "
+            "WHERE id = ANY(%s) AND status = 'running'",
+            (cancel_ids,),
+        )
 
-    计数以 chat_slots 表为唯一来源：按 user_id 持有事务级咨询锁（advisory lock）后，先清理失效
-    租约再判定剩余数量并插入，多个 worker/实例因此共享同一上限。失效租约分两类：
-    超过 max_age_seconds 的租约，以及绑定的生成任务已结束或心跳超时
-    stale_seconds 的租约；后者对应的运行中任务会被写入 cancel_requested，
-    由持有该任务的心跳循环停止上游生成，避免只删租约而任务继续占用资源。
-
-    返回 {"token": str | None, "reaped": [失效租约 token]}，reaped 供调用方
-    取消本进程内仍然存活的任务。
-    """
-    with _connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            account_write_access(cur, user_id)
-            cur.execute(
-                "SELECT pg_advisory_xact_lock(%s, %s)",
-                (_CHAT_SLOT_LOCK_CLASS, user_id),
-            )
-            cur.execute(
-                """
-                SELECT s.token, s.generation_id,
-                       s.started_at <= now() - make_interval(secs => %s) AS lease_expired,
-                       s.generation_id IS NOT NULL AND (
-                           g.id IS NULL
-                           OR g.status <> 'running'
-                           OR g.heartbeat_at <= now() - make_interval(secs => %s)
-                       ) AS generation_dead
-                FROM chat_slots s
-                LEFT JOIN generations g ON g.id = s.generation_id
-                WHERE s.user_id = %s
-                ORDER BY s.started_at
-                """,
-                (max_age_seconds, stale_seconds, user_id),
-            )
-            rows = cur.fetchall()
-
-            reaped = [
-                row["token"]
-                for row in rows
-                if row["lease_expired"] or row["generation_dead"]
-            ]
-            cancel_ids = [
-                row["generation_id"]
-                for row in rows
-                if row["generation_id"] is not None
-                and (row["lease_expired"] or row["generation_dead"])
-            ]
-            if reaped:
-                cur.execute(
-                    "DELETE FROM chat_slots WHERE user_id = %s AND token = ANY(%s)",
-                    (user_id, reaped),
-                )
-            if cancel_ids:
-                cur.execute(
-                    "UPDATE generations SET cancel_requested = TRUE "
-                    "WHERE id = ANY(%s) AND status = 'running'",
-                    (cancel_ids,),
-                )
-
-            token = None
-            if limit <= 0 or len(rows) - len(reaped) < limit:
-                token = uuid.uuid4().hex
-                cur.execute(
-                    "INSERT INTO chat_slots (token, user_id) VALUES (%s, %s)",
-                    (token, user_id),
-                )
-        conn.commit()
-        return {"token": token, "reaped": reaped}
-
-
-def bind_chat_slot_generation(user_id: int, token: str, generation_id: int) -> bool:
-    """把租约与生成任务关联，使租约过期时能跨进程请求该任务停止生成。"""
-    with _connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE chat_slots SET generation_id = %s WHERE token = %s AND user_id = %s",
-                (generation_id, token, user_id),
-            )
-            bound = cur.rowcount > 0
-        conn.commit()
-        return bound
+    if limits.concurrent > 0 and len(rows) - len(reaped) >= limits.concurrent:
+        return None, reaped
+    return uuid.uuid4().hex, reaped
 
 
 def release_chat_slot(user_id: int, token: str) -> None:

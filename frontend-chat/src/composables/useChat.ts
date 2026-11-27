@@ -62,6 +62,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     return !!attempt && attempt.mode === kbOnly.value && attempt.projectId === projectId.value && projectReady.value
   })
   const following = ref(true)
+  const revealingMessageId = ref<number | null>(null)
   const visibleCount = ref(50)
   interface GenerationRun {
     requestId: string
@@ -71,7 +72,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     reconnecting: boolean
     stopping: boolean
     confirmed: boolean
-    cancelSent: boolean
+    stopState: 'registered' | 'before_start' | null
   }
   const runs = ref<Record<string, GenerationRun>>({})
   const controllers = new Map<string, AbortController>()
@@ -98,7 +99,10 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   const selectedProject = computed(() => projects.value.find(project => project.id === projectId.value))
   const projectDeleted = computed(() => !!conversations.value[currentId.value]?.project_deleted)
   const projectReady = computed(() => !projectDeleted.value && (!kbOnly.value || !!selectedProject.value))
-  watch([currentId, kbOnly, projectId, active], clearNotice, { flush: 'sync' })
+  watch([currentId, kbOnly, projectId, active], () => {
+    clearNotice()
+    revealingMessageId.value = null
+  }, { flush: 'sync' })
   const knowledgeReadiness = useProjectReadiness(computed(() => active.value && kbOnly.value && projectReady.value ? projectId.value : null), updatingProjectId)
   const { blocked: knowledgeBlocked, notice: knowledgeNotice, status: knowledgeStatus, refresh: refreshKnowledgeReadiness } = knowledgeReadiness
   const checkingSendFor = ref<string | null>(null)
@@ -260,8 +264,15 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     })
   }
 
+  function finishReveal(messageId: number | undefined) {
+    if (revealingMessageId.value === messageId) {
+      revealingMessageId.value = null
+      scrollToBottom()
+    }
+  }
+
   async function newConversation(mode = kbOnly.value, selectedProjectId: string | null = null) {
-    if (conversationBusy.value || loading.value) return
+    if (disposed || conversationBusy.value || loading.value) return
     const active = conversations.value[currentId.value]
     const empty = active && isEmptyConversation(active) ? active : convList.value.find(isEmptyConversation)
     if (empty) {
@@ -311,7 +322,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
 
   async function deleteConversation(id: string) {
     if (runs.value[id] || conversationBusy.value || !await confirmAction('删除此对话及全部消息？此操作无法撤销。')) return
-    if (runs.value[id] || conversationBusy.value) return
+    if (disposed || runs.value[id] || conversationBusy.value) return
     conversationBusy.value = true
     // 先由服务端确认删除：运行中的会话会返回 409，本地不能抢先移除
     try {
@@ -370,13 +381,14 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   }
 
   async function requestStop(id: string, run: GenerationRun) {
-    if (!run.confirmed || run.cancelSent) return
-    run.cancelSent = true
     try {
-      await cancelGeneration(id, run.requestId)
+      const state = await cancelGeneration(id, run.requestId, !run.confirmed)
+      if (disposed || runs.value[id] !== run) return
+      run.stopState = state
+      controllers.get(id)?.abort()
     } catch (e) {
+      if (disposed || runs.value[id] !== run) return
       run.stopping = false
-      run.cancelSent = false
       handlePersistError('停止回答', e)
     }
   }
@@ -394,7 +406,8 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   }) {
     const conv = conversations.value[id]
     if (!conv || runs.value[id] || disposed) return
-    runs.value[id] = { requestId, startedAt: Date.now(), thinking: true, phase: '', reconnecting: false, stopping: false, confirmed: false, cancelSent: false }
+    if (currentId.value === id) revealingMessageId.value = null
+    runs.value[id] = { requestId, startedAt: Date.now(), thinking: true, phase: '', reconnecting: false, stopping: false, confirmed: false, stopState: null }
     const run = runs.value[id]
     const ac = new AbortController()
     controllers.set(id, ac)
@@ -415,6 +428,7 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
         now.value = Date.now()
         run.phase = PHASE_LABELS[snapshot.phase] || ''
         let assistant = conv.messages.find(m => m.id === snapshot.assistant_message_id)
+        const alreadyPublished = assistant?.status === 'completed'
         if (assistant && submission && assistant !== submission.assistant) {
           conv.messages = conv.messages.filter(m => m !== submission.assistant)
         }
@@ -441,20 +455,28 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
         }
         if (assistant.content && run.thinking && submission) assistant.thinkingTime = +(snapshot.elapsed_seconds).toFixed(1)
         run.thinking = snapshot.status === 'running' && !assistant.content
-        if (run.stopping && snapshot.status === 'running') void requestStop(id, run)
-        if (currentId.value === id) scrollToBottom()
+        if (currentId.value === id) {
+          if (active.value && !document.hidden && !alreadyPublished && snapshot.kb_only
+            && snapshot.status === 'completed' && snapshot.result_kind === 'answered') {
+            revealingMessageId.value = snapshot.assistant_message_id
+          }
+          scrollToBottom()
+        }
       }, value => { run.reconnecting = value }, ac.signal, submission ? { message: submission.text, kbOnly: submission.mode, projectId: submission.projectId, retryOf: submission.retryOf } : undefined)
       if (disposed) return
-      if (!outcome.started && submission) {
+      interrupted = outcome.status === 'interrupted'
+      if (!outcome.started && submission && run.stopState !== 'registered') {
         conv.messages = conv.messages.filter(m => m !== submission.user && m !== submission.assistant)
         conv.hasMessages = submission.hadMessages
         if (submission.clearedDraft !== null && !drafts.value[id]) drafts.value[id] = submission.clearedDraft
-        failedAttempts.value[id] = { text: submission.text, mode: submission.mode, projectId: submission.projectId, requestId, retryOf: submission.retryOf }
-        handlePersistError('发送消息', new Error(outcome.error || '未能确认是否发送成功，请重试'))
+        if (outcome.status === 'cancelled') delete failedAttempts.value[id]
+        else {
+          failedAttempts.value[id] = { text: submission.text, mode: submission.mode, projectId: submission.projectId, requestId, retryOf: submission.retryOf }
+          handlePersistError('发送消息', new Error(outcome.error || '未能确认是否发送成功，请重试'))
+        }
       } else {
         delete failedAttempts.value[id]
-        interrupted = outcome.status === 'interrupted'
-        if (outcome.status === 'error' && outcome.error) {
+        if ((interrupted || outcome.status === 'error') && outcome.error) {
           console.error('[回答失败]', outcome.error)
           showNotice(outcome.error, 'error')
         }
@@ -462,8 +484,8 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
     } finally {
       delete runs.value[id]
       controllers.delete(id)
-      if (!disposed && (interrupted || (submission && !run.confirmed))) {
-        await loadMessages(id, null, submission ? undefined : requestId)
+      if (!disposed && (interrupted || run.stopState === 'registered' || (submission && !run.confirmed))) {
+        await loadMessages(id, null, interrupted ? requestId : undefined)
       }
       if (currentId.value === id) scrollToBottom()
     }
@@ -534,6 +556,6 @@ export function useChat(userId: number, projects: Ref<Project[]>, confirmAction:
   })
   return { input, inputEl, chatArea, current, currentId, convList, isProcessing, processingIds, reconnecting, stopping, isThinking, thinkingSeconds, thinkingPhase, kbOnly, switchMode, newConversation, selectConversation, deleteConversation, sendMessage, stopStreaming, onKeydown, persistNotice, clearNotice,
     nextCursor, loadingMore, loadMoreConversations, loadMessages, hasEarlier, loading, loadError, initConversations, conversationBusy, renameConversation, following, onScroll, jumpToLatest, visibleMessages, messageOffset, showEarlier, retryMessage, canRetrySend, retryFailedSend,
-    projectId, selectedProject, projectReady, projectDeleted, selectProject, markProjectDeleted,
+    revealingMessageId, scrollToBottom, finishReveal, projectId, selectedProject, projectReady, projectDeleted, selectProject, markProjectDeleted,
     knowledgeBlocked, knowledgeNotice, knowledgeStatus, refreshKnowledgeReadiness, checkingSend }
 }

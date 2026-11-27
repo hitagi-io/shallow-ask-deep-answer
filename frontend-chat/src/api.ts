@@ -1,4 +1,4 @@
-import { parseUploadTasks, type UploadTask } from './utils/uploadProgress'
+import { parseUploadTasks } from './utils/uploadProgress'
 import { parseUploadQuota, type UploadQuota } from './utils/uploadQuota'
 export type { UploadQuota } from './utils/uploadQuota'
 import { parseGeneration, parseTrace, parseAuditPage, parseMessageHistory, type GenerationSnapshot, type ResultKind } from './utils/generation'
@@ -93,9 +93,9 @@ export async function apiSourcePassage(url: string, signal: AbortSignal): Promis
 
 // ---------- 认证辅助函数 ----------
 
-const TOKEN_KEY = 'shallow_ask_deep_answer_token'
+export const TOKEN_KEY = 'shallow_ask_deep_answer_token'
 
-function getToken(): string | null {
+export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)
 }
 
@@ -104,13 +104,35 @@ export function hasAuthToken(): boolean {
   return !!getToken()
 }
 
-export function clearAuth() {
+let verifiedSession: { token: string; userId: number } | null = null
+
+export function suspendSession() { verifiedSession = null }
+
+export function confirmSession(token: string, user: UserInfo): boolean {
+  if (token !== getToken()) return false
+  verifiedSession = { token, userId: user.id }
+  return true
+}
+
+export function verifiedTokenFor(user: UserInfo): string | null {
+  if (verifiedSession?.userId !== user.id || verifiedSession.token !== getToken()) return null
+  return verifiedSession.token
+}
+
+function storeSession(token: string, user: UserInfo) {
+  localStorage.setItem(TOKEN_KEY, token)
+  if (!confirmSession(token, user)) throw new Error('登录状态已变更')
+}
+
+function clearAuth() {
+  suspendSession()
   localStorage.removeItem(TOKEN_KEY)
 }
 
 function authHeaders(): Record<string, string> {
-  const token = getToken()
-  return token ? { Authorization: `Bearer ${token}` } : {}
+  const verifiedToken = verifiedSession?.token
+  if (!verifiedToken || verifiedToken !== getToken()) throw new Error('登录状态已变更，正在复核身份')
+  return { Authorization: `Bearer ${verifiedToken}` }
 }
 
 // 401 统一回调：由应用层注册（清空登录态并展示登录页）
@@ -136,9 +158,10 @@ async function handleUnauthorized(token: string | null, signal?: AbortSignal | n
  * 登录接口不使用它——那里的 401 表示账号密码错误，而非会话过期。
  */
 async function apiFetch(input: string, init?: RequestInit, waitForCredentialChange = true): Promise<Response> {
-  const token = getToken()
+  const token = new Headers(init?.headers).get('Authorization')?.slice(7) ?? null
   const res = await fetch(input, init)
   if (res.status === 401) await handleUnauthorized(token, init?.signal, waitForCredentialChange)
+  if (token !== getToken()) throw new Error('登录状态已变更')
   return res
 }
 
@@ -166,6 +189,7 @@ export async function apiRegister(username: string, password: string): Promise<v
 }
 
 export async function apiLogin(username: string, password: string): Promise<UserInfo> {
+  const originalToken = getToken()
   const res = await fetch('/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -175,16 +199,16 @@ export async function apiLogin(username: string, password: string): Promise<User
     throw new Error(await errorMessage(res, '登录失败'))
   }
   const data = await res.json()
-  localStorage.setItem(TOKEN_KEY, data.token)
+  if (getToken() !== originalToken) throw new Error('登录状态已变更')
+  storeSession(data.token, data.user)
   return data.user
 }
 
-export async function apiMe(): Promise<UserInfo> {
-  const token = getToken()
+export async function apiMe(token: string): Promise<UserInfo> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 10000)
   try {
-    const res = await apiFetch('/api/auth/me', { headers: authHeaders(), signal: controller.signal })
+    const res = await apiFetch('/api/auth/me', { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal })
     if (!res.ok) throw new Error(await errorMessage(res, '验证登录状态失败，请稍后重试'))
     const data = await res.json()
     if (!token || token !== getToken()) throw new Error('登录状态已变更')
@@ -195,8 +219,9 @@ export async function apiMe(): Promise<UserInfo> {
 }
 
 export async function apiLogout(): Promise<boolean> {
+  const token = verifiedSession?.token ?? null
   if (credentialChange) await credentialChange
-  const token = getToken()
+  if (getToken() !== token) throw new Error('登录状态已变更')
   if (!token) return true
   const res = await fetch('/api/auth/logout', {
     method: 'POST', headers: authHeaders(), signal: AbortSignal.timeout(10000),
@@ -221,7 +246,7 @@ export async function apiUpdateAccount(changes: { username?: string; current_pas
     const data = await res.json()
     if (originalToken !== getToken()) throw new Error('登录状态已变更')
     if (changes.new_password !== undefined || data.reauthenticate) clearAuth()
-    else localStorage.setItem(TOKEN_KEY, data.token)
+    else storeSession(data.token, data.user)
     return data.user
   } finally { credentialChange = null; settle() }
 }
@@ -262,9 +287,12 @@ export async function fetchConversations(cursor?: string | null): Promise<{
 export async function fetchMessages(id: string, before?: number | null) {
   const query = new URLSearchParams({ limit: '50' })
   if (before != null) query.set('before', String(before))
-  const res = await apiFetch(`/api/conversations/${encodeURIComponent(id)}/messages?${query}`, { headers: authHeaders() })
-  if (!res.ok) throw new Error(await errorMessage(res, '获取消息失败'))
-  return parseMessageHistory(await res.json())
+  const controller = new AbortController()
+  return chatIO(controller, async () => {
+    const res = await apiFetch(`/api/conversations/${encodeURIComponent(id)}/messages?${query}`, { headers: authHeaders(), signal: controller.signal })
+    if (!res.ok) throw new Error(await errorMessage(res, '获取消息失败'))
+    return parseMessageHistory(await res.json())
+  })
 }
 
 export async function createConversationApi(title: string): Promise<Conversation> {
@@ -328,11 +356,35 @@ function generationPath(conversationId: string, requestId: string) {
   return `/api/conversations/${encodeURIComponent(conversationId)}/generations/${encodeURIComponent(requestId)}`
 }
 
-export async function cancelGeneration(conversationId: string, requestId: string): Promise<void> {
-  const res = await apiFetch(`${generationPath(conversationId, requestId)}/cancel`, {
-    method: 'POST', headers: authHeaders(),
+const CHAT_IDLE_TIMEOUT_MS = 15_000
+
+async function chatIO<T>(controller: AbortController, operation: () => Promise<T>): Promise<T> {
+  const { signal } = controller
+  signal.throwIfAborted()
+  const timer = setTimeout(() => controller.abort(new DOMException('回答连接超时', 'TimeoutError')), CHAT_IDLE_TIMEOUT_MS)
+  let onAbort!: () => void
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason)
+    signal.addEventListener('abort', onAbort, { once: true })
   })
-  if (!res.ok) throw new Error(await errorMessage(res, '暂时无法停止回答，请重试'))
+  try {
+    return await Promise.race([operation(), aborted])
+  } finally {
+    clearTimeout(timer)
+    signal.removeEventListener('abort', onAbort)
+  }
+}
+
+export async function cancelGeneration(conversationId: string, requestId: string, beforeStart: boolean) {
+  const controller = new AbortController()
+  return chatIO(controller, async (): Promise<'registered' | 'before_start'> => {
+    const path = generationPath(conversationId, requestId) + '/cancel' + (beforeStart ? '?before_start=true' : '')
+    const res = await apiFetch(path, { method: 'POST', headers: authHeaders(), signal: controller.signal })
+    if (!res.ok) throw new Error(await errorMessage(res, '暂时无法停止回答，请重试'))
+    const data = await res.json()
+    if (data.state !== 'registered' && data.state !== 'before_start') throw new Error('服务端尚未确认停止回答')
+    return data.state
+  })
 }
 
 function reconnectDelay(signal: AbortSignal): Promise<void> {
@@ -362,22 +414,27 @@ export async function streamChat(
   let submit = submission
   let missingAttempts = 0
   let reconnectAttempts = 0
+  let previousSnapshot: GenerationSnapshot | undefined
   while (!signal.aborted) {
+    const connection = new AbortController()
+    const disconnect = () => connection.abort()
+    signal.addEventListener('abort', disconnect, { once: true })
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
     try {
       const initial = submit
       submit = undefined
-      const res = await apiFetch(initial ? '/api/chat/stream' : `${generationPath(conversationId, requestId)}/stream`, {
+      const res = await chatIO(connection, () => apiFetch(initial ? '/api/chat/stream' : `${generationPath(conversationId, requestId)}/stream`, {
         method: initial ? 'POST' : 'GET',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: initial ? JSON.stringify({ message: initial.message, thread_id: conversationId, request_id: requestId, kb_only: initial.kbOnly, project_id: initial.projectId, retry_of: initial.retryOf ?? null }) : undefined,
-        signal,
-      }).catch(error => { throw new StreamConnectionError('连接回答服务失败', error) })
+        signal: connection.signal,
+      })).catch(error => { throw new StreamConnectionError('连接回答服务失败', error) })
+      if (initial && res.status === 204) return { status: 'cancelled', started: false }
       if (!res.ok) {
         // 首次 POST 回执丢失时，给登记事务留出完成时间，再确认任务是否存在。
         if (!initial && res.status === 404 && !started && ++missingAttempts < 3) throw new StreamConnectionError('等待任务登记')
         if (res.status >= 500) throw new StreamConnectionError('服务暂时不可用')
-        return { status: 'interrupted', started, error: await errorMessage(res, `请求失败: ${res.status}`) }
+        return { status: 'interrupted', started, error: await chatIO(connection, () => errorMessage(res, `请求失败: ${res.status}`)) }
       }
       started = true
       reader = res.body?.getReader()
@@ -393,12 +450,15 @@ export async function streamChat(
         const data = parseGeneration(event)
         onConnection(false)
         onSnapshot(data)
-        reconnectAttempts = 0
+        if (!previousSnapshot || data.phase !== previousSnapshot.phase || data.assistant_content !== previousSnapshot.assistant_content) {
+          reconnectAttempts = 0
+        }
+        previousSnapshot = data
         if (data.status === 'running') return null
         return { status: data.status === 'completed' ? 'completed' : data.status === 'cancelled' ? 'cancelled' : 'error', started, error: data.error ?? undefined }
       }
       while (!signal.aborted) {
-        const { done, value } = await reader.read().catch(error => {
+        const { done, value } = await chatIO(connection, () => reader!.read()).catch(error => {
           throw new StreamConnectionError('读取回答连接失败', error)
         })
         buffer += done ? decoder.decode() : decoder.decode(value, { stream: true })
@@ -418,7 +478,9 @@ export async function streamChat(
         return { status: 'interrupted', started, error: '回答数据处理失败，请重新同步回答。' }
       }
     } finally {
-      await reader?.cancel().catch(() => {})
+      signal.removeEventListener('abort', disconnect)
+      disconnect()
+      void reader?.cancel().catch(() => {})
     }
     if (!signal.aborted) {
       if (++reconnectAttempts >= 5) {
@@ -556,7 +618,7 @@ export async function uploadFiles(projectId: string, files: File[], { onProgress
   return res.json()
 }
 
-export async function fetchUploadTasks(projectId: string, options: KnowledgeRequestOptions = {}): Promise<UploadTask[]> {
+export async function fetchUploadTasks(projectId: string, options: KnowledgeRequestOptions = {}) {
   const result = await fetchKnowledgeJson<unknown>(`${projectPath(projectId)}/upload-tasks`, '读取上传进度失败，将自动重试', options)
   return parseUploadTasks(result)
 }
