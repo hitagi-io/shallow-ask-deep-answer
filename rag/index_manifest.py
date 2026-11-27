@@ -48,6 +48,10 @@ def project_collection_name(config: dict, user_id: int, project_id: str) -> str:
     return f"{prefix}_u{user_id}_p{uuid.UUID(project_id).hex}"
 
 
+def index_namespace(uri: str, collection: str) -> str:
+    return text_digest(json.dumps([uri, collection]))
+
+
 @dataclass(frozen=True)
 class IndexManifest:
     content_sha256: str
@@ -108,13 +112,25 @@ def chunks_match(manifest: IndexManifest, rows: list[dict], *, on_progress: Unit
 class ManifestStore:
     """每次写入使用独立事务；业务操作由 API 的索引咨询锁串行化。"""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, user_id: int, project_id: str):
         self.conninfo = os.getenv(
             "PG_CONNECTION_STRING", "postgresql://postgres:postgres@localhost:5432/shallow_ask_deep_answer"
         )
-        self.namespace = text_digest(json.dumps([
-            config["milvus_uri"], config["collection_name"],
-        ]))
+        self.user_id, self.project_id = knowledge_scope(user_id, project_id)
+        self.uri = config["milvus_uri"]
+        self.collection_name = project_collection_name(config, self.user_id, self.project_id)
+        self.namespace = index_namespace(self.uri, self.collection_name)
+
+    def register_location(self, conn) -> None:
+        registered = conn.execute("""
+            INSERT INTO index_namespaces(namespace, user_id, project_id, milvus_uri, collection_name)
+            VALUES (%s,%s,%s,%s,%s) ON CONFLICT (namespace) DO UPDATE
+            SET milvus_uri=EXCLUDED.milvus_uri, collection_name=EXCLUDED.collection_name
+            WHERE index_namespaces.user_id=EXCLUDED.user_id AND index_namespaces.project_id=EXCLUDED.project_id
+            RETURNING namespace
+        """, (self.namespace, self.user_id, self.project_id, self.uri, self.collection_name)).fetchone()
+        if registered is None:
+            raise ValueError("索引命名空间的项目归属不匹配")
 
     @staticmethod
     def setup(conn) -> None:
@@ -192,6 +208,7 @@ class ManifestStore:
 
     def put(self, manifest: IndexManifest, *, snapshots=()) -> None:
         with self._connect() as conn:
+            self.register_location(conn)
             conn.execute("""
                 INSERT INTO index_manifests
                     (namespace, content_sha256, source_format, source, index_version, index_id,
@@ -259,6 +276,7 @@ class ManifestStore:
         调用方须持有项目写锁，并已确认清单及其分块仍有效，才能复用。
         """
         with self._connect() as conn:
+            self.register_location(conn)
             record = conn.execute("""
                 SELECT state FROM index_manifests
                 WHERE namespace = %s AND content_sha256 = %s AND source_format = %s FOR SHARE
@@ -277,8 +295,9 @@ class ManifestStore:
                   ON m.namespace = f.namespace AND m.content_sha256 = f.content_sha256
                   AND m.source_format = f.source_format
                 WHERE f.namespace = %s AND m.state = 'ready' AND m.index_version = %s
+                  AND NOT EXISTS (SELECT 1 FROM pending_file_deletions WHERE user_id=%s AND project_id=%s)
                 ORDER BY m.index_id, (f.source = m.source) DESC, f.source
-            """, (self.namespace, index_version)).fetchall()
+            """, (self.namespace, index_version, self.user_id, self.project_id)).fetchall()
         return {row["index_id"]: row["source"] for row in rows}
 
     def is_published(self, source: str, digest: str, index_id: str) -> bool:
@@ -329,12 +348,18 @@ class ManifestStore:
 
     def record_files(self, files: dict[str, str | None]) -> None:
         """入库或定时扫描已计算摘要后记录文件元数据，文件列表不再重复读取正文。"""
+        if not any(files.values()):
+            return
         with self._connect() as conn:
+            self.register_location(conn)
             self._record_files(conn, files)
 
     def file_statuses(self, paths: tuple[str, ...], index_version: str) -> list[KnowledgeFile]:
         """返回已记录的入库状态；完整性由独立的深度检查报告表达。"""
         with self._connect() as conn:
+            pending = {os.path.normcase(row["filename"]) for row in conn.execute(
+                "SELECT filename FROM pending_file_deletions WHERE user_id=%s AND project_id=%s",
+                (self.user_id, self.project_id))}
             rows = conn.execute("""
                 SELECT f.source, f.size_bytes, f.mtime_ns, m.state, m.index_version,
                        p.source AS published_source
@@ -349,6 +374,8 @@ class ManifestStore:
         records = {os.path.normcase(row["source"]): row for row in rows}
         files: list[KnowledgeFile] = []
         for path in paths:
+            if os.path.normcase(os.path.basename(path)) in pending:
+                continue
             try:
                 info = os.stat(path)
             except FileNotFoundError:
@@ -374,8 +401,13 @@ class ManifestStore:
             conn.execute("DELETE FROM index_manifests WHERE namespace = %s AND content_sha256 = %s AND source_format = %s",
                          (self.namespace, *identity))
 
-    def delete_all(self) -> None:
-        """只删除当前项目的索引清单。"""
+    def project_locations(self) -> list[dict]:
         with self._connect() as conn:
-            conn.execute("DELETE FROM indexed_source_files WHERE namespace = %s", (self.namespace,))
-            conn.execute("DELETE FROM index_manifests WHERE namespace = %s", (self.namespace,))
+            return conn.execute("SELECT namespace, milvus_uri, collection_name FROM index_namespaces "
+                                "WHERE user_id=%s AND project_id=%s", (self.user_id, self.project_id)).fetchall()
+
+    def remember_location(self, uri: str, collection: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE index_namespaces SET milvus_uri=%s, collection_name=%s WHERE namespace=%s "
+                         "AND user_id=%s AND project_id=%s AND milvus_uri IS NULL",
+                         (uri, collection, index_namespace(uri, collection), self.user_id, self.project_id))

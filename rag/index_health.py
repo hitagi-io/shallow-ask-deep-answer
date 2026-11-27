@@ -24,7 +24,7 @@ class IndexHealth:
     def _scan(self):
         report = {
             "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "healthy": True, "milvus_error": None, "manifest_error": None,
+            "healthy": True, "disk_error": None, "milvus_error": None, "manifest_error": None,
             "stats": {"files": 0, "indexed_files": 0, "chunks": 0}, "issues": [],
         }
         issues = {}
@@ -40,8 +40,16 @@ class IndexHealth:
                 entry["items"].append(item)
                 entry["count"] += 1
 
-        disk = {path: compute_file_sha256(path) for path in
-                list_supported_files(self.knowledge_dir, self.allowed_types)}
+        try:
+            paths = list_supported_files(self.knowledge_dir, self.allowed_types, missing_ok=False)
+        except FileNotFoundError:
+            # 新项目可能尚未上传。读取清单和向量后才能判断空目录是否正常。
+            paths = ()
+        except OSError:
+            paths = ()
+            report["disk_error"] = "无法完整读取项目资料目录，请检查存储和访问权限"
+            issue("disk_unavailable", "资料目录不可用", report["disk_error"], "项目资料目录")
+        disk = {path: compute_file_sha256(path) for path in paths}
         by_norm = {os.path.normcase(path): path for path in disk}
         by_identity = defaultdict(list)
         for path, digest in disk.items():
@@ -75,6 +83,18 @@ class IndexHealth:
             report["issues"] = list(issues.values())
             return report, state
         report["stats"]["chunks"] = len(rows)
+        # 空挂载点或挂错目录也可能正常返回目录项。至少要看见一个已知来源或同内容副本，
+        # 才能用本次目录快照推断其他来源已被移除。
+        known_sources = set(published)
+        known_sources.update(os.path.normcase(record.current_source) for record in records.values())
+        known_sources.update(os.path.normcase(row["source"]) for row in rows if isinstance(row.get("source"), str))
+        known_content = set(records) | {(row.get("content_sha256"), row.get("source_format")) for row in rows}
+        if (records or rows or published) and not (known_sources.intersection(by_norm) or known_content.intersection(by_identity)):
+            report["disk_error"] = "目录中找不到任何已入库的来源或同内容副本，请检查项目存储后重新扫描"
+            issue("disk_unavailable", "无法确认资料目录完整", report["disk_error"], "项目资料目录")
+        if report["disk_error"]:
+            report["issues"] = list(issues.values())
+            return report, state
         rows_by_identity = defaultdict(list)
         for row in rows:
             identity = (row.get("content_sha256"), row.get("source_format"))
@@ -136,7 +156,7 @@ class IndexHealth:
         """默认只读检查；定时维护可同时更新已知的文件摘要记录。"""
         with self.vector_store._store_lock:
             report, state = self._scan()
-            if record_files and not report["manifest_error"]:
+            if record_files and not report["disk_error"] and not report["manifest_error"]:
                 self.vector_store.manifests.record_files(state["disk"])
             return report
 
@@ -148,6 +168,9 @@ class IndexHealth:
                 raise RuntimeError("存储不可用，修复终止")
             summary = {"ghost_deleted": [], "ghost_errors": [], "manifest_rebuilt": False,
                        "re_indexed": [], "re_index_failures": []}
+            if report["disk_error"]:
+                report["repair"] = summary
+                return report
             targets = {}
             for identity, record in state["records"].items():
                 if identity in state["healthy_keys"]:
@@ -184,7 +207,7 @@ class IndexHealth:
 
             # 重建完成后重新取快照；仅清理确认已无磁盘内容的清单。
             after_report, after = self._scan()
-            if after_report["milvus_error"] or after_report["manifest_error"]:
+            if after_report["disk_error"] or after_report["milvus_error"] or after_report["manifest_error"]:
                 after_report["repair"] = summary
                 return after_report
             unreadable = any(digest is None for digest in after["disk"].values())

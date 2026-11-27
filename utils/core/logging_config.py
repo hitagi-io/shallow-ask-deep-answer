@@ -9,12 +9,31 @@ from __future__ import annotations
 import logging
 import os
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from utils.observability.context import current_context
 
 
 LOGGER_NAME = "shallow_ask_deep_answer"
 _CONFIGURED = False
+_private_vector_write = ContextVar("private_vector_write", default=False)
+
+
+def _allow_driver_log(_record: logging.LogRecord) -> bool:
+    return not _private_vector_write.get()
+
+
+@contextmanager
+def private_vector_write():
+    """这两个 SDK 日志源会输出完整实体或包含实体的 RPC 异常。在写入线程内丢弃原始记录。"""
+    for name in ("langchain_milvus.vectorstores.milvus", "pymilvus.decorators"):
+        logging.getLogger(name).addFilter(_allow_driver_log)
+    token = _private_vector_write.set(True)
+    try:
+        yield
+    finally:
+        _private_vector_write.reset(token)
 
 
 class ContextFormatter(logging.Formatter):

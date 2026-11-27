@@ -5,7 +5,6 @@ import stat
 import hashlib
 import threading
 from collections import OrderedDict
-from os import listdir
 from langchain_core.documents import Document
 from utils.documents.document_parsing import LOADERS
 from utils.documents.document_ocr import document_ocr_progress
@@ -53,18 +52,28 @@ def compute_file_sha256(file_path: str) -> str | None:
         return None
 
 
-def list_supported_files(dir_path,allowed_types:tuple[str]):
+def list_supported_files(dir_path, allowed_types: tuple[str, ...], *, missing_ok: bool = True):
     """仅列出项目目录中的普通文件；空项目无需提前创建磁盘目录。"""
     abs_dir_path = resolve_project_path(dir_path)
     files = []
     try:
-        names = listdir(abs_dir_path)
+        names = os.listdir(abs_dir_path)
     except FileNotFoundError:
-        return ()
+        if missing_ok:
+            return ()
+        raise
     for f in names:
         ext = os.path.splitext(f)[1].lower()
+        if ext not in allowed_types:
+            continue
         path = os.path.join(abs_dir_path, f)
-        if ext in allowed_types and os.path.isfile(path) and not os.path.islink(path):
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError as exc:
+            if missing_ok:
+                continue
+            raise OSError("无法完整枚举项目资料目录") from exc
+        if stat.S_ISREG(mode):
             files.append(path)
     return tuple(sorted(files))
 

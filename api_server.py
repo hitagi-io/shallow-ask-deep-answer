@@ -26,15 +26,15 @@ from pydantic import BaseModel, Field, field_validator
 
 from chat_agent import ChatAgent, PG_CHECKPOINT_POOL_MAX
 from utils.chat.checkpoints import AttemptCheckpoints
-from rag.vector_store import get_vector_store
+from rag.vector_store import get_vector_store, drop_project_vectors
 from rag.index_health import IndexHealth
-from rag.index_manifest import ManifestStore, current_index_version, project_collection_name
+from rag.index_manifest import ManifestStore, current_index_version
 from utils.documents.knowledge_files import document_format, list_supported_files
 from utils.documents.upload_form import upload_form, upload_request_size
 from utils.documents.file_listing import NAME_SORTS, FileFilter, FilePage, FileSort, KnowledgeFile, paginate_files, summarize_files
 from utils.retrieval.source_evidence import SourceVersionChanged, read_source_passage
 from utils.core.config_loader import vector_db_config
-from utils.core.project_paths import get_knowledge_dir, get_knowledge_storage_root, scoped_knowledge_file
+from utils.core.project_paths import get_account_knowledge_dir, get_knowledge_dir, get_knowledge_storage_root, scoped_knowledge_file
 from utils.core.pg_lock import SingleInstanceGuard, exclusive_section, shared_section, project_index_lock_key
 from utils.chat.generation_runner import run_generation
 from utils.chat.subscriptions import POLL_SECONDS, SubscriptionResponse, watch_generation
@@ -50,7 +50,8 @@ from utils.runtime.request_wait import wait_for_client
 from utils.runtime.shutdown import ServiceStopping, check_shutdown, request_shutdown, reset_shutdown
 from utils.core.logging_config import configure_logging, get_logger
 from utils.indexing.upload_tasks import UploadTaskStore
-from utils.indexing.upload_quota import UploadLimits, UploadQuotaExceeded, daily_embedding_limit, staged_upload_prefix
+from utils.indexing.deletions import begin_file_deletion, file_deletions, finish_file_deletion, pending_deletions
+from utils.indexing.upload_quota import UploadLimits, UploadQuotaExceeded, daily_embedding_limit, moving_upload_files, staged_upload_prefix
 from utils.indexing.progress import IndexProgress
 from auth import (
     PASSWORD_MAX_LENGTH,
@@ -89,7 +90,10 @@ from auth import (
     get_project,
     create_project,
     update_project,
-    delete_project,
+    begin_project_deletion,
+    finish_project_deletion,
+    project_deletion_state,
+    set_deletion_disk_stage,
     project_access,
     get_upload_usage,
     reserve_upload_request,
@@ -97,7 +101,7 @@ from auth import (
     upload_admission,
     list_project_scopes,
 )
-from accounts import AccountError, update_account, prepare_deletion, delete_account
+from accounts import AccountError, update_account, prepare_deletion, begin_account_deletion, finish_account_deletion
 
 logger = get_logger(__name__)
 configure_logging()
@@ -134,7 +138,7 @@ if CHAT_GENERATION_STALE_SECONDS < CHAT_GENERATION_SAVE_SECONDS * 3:
     raise ValueError("CHAT_GENERATION_STALE_SECONDS 必须不小于保存间隔的 3 倍")
 
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-UPLOAD_ACTIVE_DETAIL = "资料正在上传、入库或仍需恢复，请稍后重试；中断的任务请执行“修复与补建”"
+UPLOAD_ACTIVE_DETAIL = "资料正在上传、入库、删除或等待恢复，请稍后重试"
 
 # 就绪检查的总时限（秒），覆盖进程启动、建连、查询及 RPC。
 READINESS_TIMEOUT_SECONDS = float(os.getenv("READINESS_TIMEOUT_SECONDS", "3"))
@@ -189,6 +193,7 @@ async def lifespan(_app: FastAPI):
         task.add_done_callback(_background_task_done)
         recovery_task = asyncio.create_task(_recovery_loop(background_stop), name="generation-recovery")
         recovery_task.add_done_callback(_background_task_done)
+        deletion_task = asyncio.create_task(_deletion_recovery_loop(background_stop), name="deletion-recovery")
         upload_workers = [asyncio.create_task(_upload_worker_loop(i, background_stop, upload_executor),
                                              name=f"upload-index-{i}") for i in range(UPLOAD_WORKERS)]
         try:
@@ -201,7 +206,7 @@ async def lifespan(_app: FastAPI):
             for generation_task in generation_tasks:
                 generation_task.cancel()
             # 不取消健康检查的 asyncio 等待，确保底层线程退出后再关闭连接池。
-            await asyncio.gather(task, recovery_task, *generation_tasks, return_exceptions=True)
+            await asyncio.gather(task, recovery_task, deletion_task, *generation_tasks, return_exceptions=True)
             # 线程在解析/嵌入边界响应停止；等待回滚、状态写回和已提交写入的收尾。
             await asyncio.gather(*upload_workers, return_exceptions=True)
     logger.info("[关闭] PostgreSQL 连接池已释放")
@@ -237,6 +242,40 @@ async def _recovery_loop(stop: asyncio.Event) -> None:
             await asyncio.wait_for(stop.wait(), timeout=15)
         except TimeoutError:
             pass
+
+def _recover_project_files(user_id: int, project_id: str) -> None:
+    with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
+        if current is not None:
+            _finish_file_deletions(user_id, project_id)
+
+
+def _recover_deletions() -> None:
+    users, projects, files = pending_deletions(PG_CONN)
+    for callback, scopes in ((_complete_account_deletion, [(user,) for user in users]),
+                             (_complete_project_deletion, projects), (_recover_project_files, files)):
+        for scope in scopes:
+            check_shutdown()
+            try:
+                callback(*scope)
+            except ServiceStopping:
+                raise
+            except Exception:
+                logger.exception("[恢复] 删除清理仍待重试 scope=%s", scope)
+
+
+async def _deletion_recovery_loop(stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            await asyncio.to_thread(_recover_deletions)
+        except ServiceStopping:
+            return
+        except Exception:
+            logger.exception("[恢复] 读取待删除资源失败")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=15)
+        except TimeoutError:
+            pass
+
 
 # 仅在 lifespan 启动时创建，避免脚本入口和 Uvicorn 导入分别创建连接池。
 agent: ChatAgent
@@ -361,7 +400,7 @@ def _auto_heal_report(user_id: int, project_id: str) -> dict | None:
             check_shutdown()
             if report["healthy"]:
                 break
-            if report["milvus_error"] or report["manifest_error"]:
+            if report["disk_error"] or report["milvus_error"] or report["manifest_error"]:
                 logger.warning("[索引自动修复] 存储不可用，本轮暂不执行修复")
                 break
             try:
@@ -555,6 +594,7 @@ def _run_next_upload() -> bool:
 
 def _resolve_pending_uploads(user_id: int, project_id: str) -> None:
     """调用方持项目写锁；仅核对已结束任务，运行中的队列由原 worker 处理。"""
+    _finish_file_deletions(user_id, project_id)
     for item in _upload_task_store.pending_recoveries(user_id, project_id):
         task = {"id": item["task_id"], "user_id": user_id, "project_id": project_id}
         journal = _upload_task_store.journal(task, item)
@@ -831,42 +871,34 @@ def api_prepare_deletion(req: DeletionVerificationRequest, user: dict = Depends(
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
+def _remove_account_directory(user_id: int) -> None:
+    try:
+        get_account_knowledge_dir(user_id).rmdir()
+    except FileNotFoundError:
+        pass
+
+
+def _complete_account_deletion(user_id: int) -> None:
+    finish_account_deletion(user_id, _complete_project_deletion, _remove_account_directory)
+
+
 @app.delete("/api/auth/me")
 def api_delete_account(req: DeleteAccountRequest, user: dict = Depends(account_change_user("account.delete"))):
-    with audit_operation(user["user_id"], "account.delete", "account", str(user["user_id"]), transactional=True) as operation:
-        user_id = user["user_id"]
-
-        def cleanup(project_ids, conversation_ids):
-            for conv_id in conversation_ids:
-                _purge_thread_checkpoints(f"{user_id}:{conv_id}")
-            for project_id in project_ids:
-                try:
-                    get_vector_store(user_id, project_id).drop_project_index()
-                    _remove_project_files(user_id, project_id)
-                    agent.forget_project(user_id, project_id)
-                finally:
-                    _invalidate_health(user_id, project_id)
-            # 仅删除清理后已为空的账号目录，不递归删除未经校验的子目录。
-            root = Path(get_knowledge_storage_root()).resolve()
-            account_dir = root / str(user_id)
-            if account_dir.resolve() != account_dir or account_dir.parent != root:
-                raise RuntimeError("无效的账号文件目录")
-            if account_dir.exists():
-                account_dir.rmdir()
-
+    user_id = user["user_id"]
+    with audit_operation(user_id, "account.delete", "account", str(user_id), transactional=True):
         try:
-            delete_account(user_id, user["auth_version"], req.confirmation_token, req.confirmation_text,
-                           cleanup=cleanup,
-                           stale_seconds=CHAT_GENERATION_STALE_SECONDS, slot_max_age=CHAT_SLOT_MAX_AGE_SECONDS)
-            return {"message": "账号及其项目、文档、索引和对话已注销删除"}
+            begin_account_deletion(user_id, user["auth_version"], req.confirmation_token, req.confirmation_text,
+                                   stale_seconds=CHAT_GENERATION_STALE_SECONDS, slot_max_age=CHAT_SLOT_MAX_AGE_SECONDS)
         except AccountError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         except (TimeoutError, psycopg.errors.LockNotAvailable) as exc:
             raise HTTPException(status_code=409, detail="账号资料正在处理其他操作，请稍后重试注销") from exc
-        except Exception as exc:
-            logger.exception("[账号] 注销清理未完成 user_id=%s", user_id)
-            raise HTTPException(status_code=503, detail="注销清理未完成，部分数据可能已删除。账号仍保留，请重试注销。") from exc
-
+        try:
+            _complete_account_deletion(user_id)
+        except Exception:
+            logger.exception("[账号] 等待恢复注销清理 user_id=%s", user_id)
+            return JSONResponse({"message": "注销已受理，账号已停用，后台将继续清理资料"}, status_code=202)
+        return {"message": "账号及其项目、文档、索引和对话已注销删除"}
 
 
 @app.get("/api/conversations")
@@ -908,19 +940,6 @@ def api_update_title(conv_id: str, req: UpdateTitleRequest, user: dict = Depends
     if not update_conversation_title(user["user_id"], conv_id, req.title):
         raise HTTPException(status_code=404, detail="会话不存在")
     return {"message": "ok"}
-
-
-def _purge_thread_checkpoints(thread_id: str) -> None:
-    """删除会话对应的 LangGraph 检查点；仅数据库运行故障最多尝试 3 次。"""
-    for attempt in range(3):
-        try:
-            agent.checkpointer.delete_thread(thread_id)
-            return
-        except psycopg.OperationalError:
-            logger.exception("[会话] 清理检查点失败 thread_id=%s（第 %s 次尝试）", thread_id, attempt + 1)
-            if attempt == 2:
-                raise
-            time.sleep(0.5)
 
 
 @app.delete("/api/conversations/{conv_id}")
@@ -1229,46 +1248,71 @@ def api_update_project(req: ProjectRequest, project: dict = Depends(require_proj
         return {"project": updated}
 
 
-def _remove_project_files(user_id: int, project_id: str) -> None:
-    # 目录只由经过规范化的账号与UUID构造；删除前再次确认完整路径边界。
-    target = Path(get_knowledge_dir(user_id, project_id)).resolve()
-    account_dir = Path(get_knowledge_dir(user_id, project_id)).parent.resolve()
-    if target.parent != account_dir or target.name != str(UUID(project_id)):
+def _remove_project_files(user_id: int, project_id: str, state: dict) -> None:
+    target = Path(get_knowledge_dir(user_id, project_id))
+    parent = get_account_knowledge_dir(user_id)
+    staged = parent / f".deleting-{UUID(project_id)}"
+    if target.parent != parent or target.name != str(UUID(project_id)) or staged.resolve() != staged:
         raise RuntimeError("无效的项目文件目录")
-    if target.exists():
-        shutil.rmtree(target)
+    stage = state["deletion_disk_stage"]
+    try:
+        target.stat()
+    except FileNotFoundError:
+        pass
+    else:
+        if staged.exists():
+            raise RuntimeError("项目目录及其删除暂存目录同时存在，请核对存储")
+        with moving_upload_files(PG_CONN, user_id):
+            target.rename(staged)
+    try:
+        staged.stat()
+    except FileNotFoundError:
+        if stage == "pending" and state["expect_files"]:
+            raise RuntimeError("无法确认项目源文件已删除，请恢复资料目录")
+        if stage == "quarantined":
+            parent.stat()  # 区分清理后崩溃和整个存储离线。
+    else:
+        if stage != "quarantined":
+            set_deletion_disk_stage(user_id, project_id, "quarantined")
+        stage = "quarantined"
+        shutil.rmtree(staged)
+    if stage != "removed":
+        set_deletion_disk_stage(user_id, project_id, "removed")
+
+
+def _complete_project_deletion(user_id: int, project_id: str) -> None:
+    with _index_write_section(user_id, project_id):
+        state = project_deletion_state(user_id, project_id)
+        if state is None:
+            return
+        _remove_project_files(user_id, project_id, state)
+        drop_project_vectors(user_id, project_id)
+        agent.forget_project(user_id, project_id)
+        finish_project_deletion(user_id, project_id)
+        _invalidate_health(user_id, project_id)
 
 
 @app.delete("/api/projects/{project_id}")
-def api_delete_project(project: dict = Depends(require_project)):
-    with audit_operation(project["user_id"], "project.delete", "project", project["id"], project_id=project["id"], transactional=True) as operation:
-        user_id, project_id = project["user_id"], project["id"]
-
-        def cleanup(conversation_ids):
-            for conv_id in conversation_ids:
-                _purge_thread_checkpoints(f"{user_id}:{conv_id}")
-            store = get_vector_store(user_id, project_id)
-            store.drop_project_index()
-            _remove_project_files(user_id, project_id)
-            agent.forget_project(user_id, project_id)
-
+def api_delete_project(project_id: UUID, user: dict = Depends(get_current_user)):
+    user_id, pid = user["user_id"], str(project_id)
+    with audit_operation(user_id, "project.delete", "project", pid, project_id=pid, transactional=True):
         try:
-            with _index_write_section(user_id, project_id):
-                result = delete_project(user_id, project_id, CHAT_GENERATION_STALE_SECONDS, cleanup)
-            if result["status"] == "not_found":
-                raise HTTPException(status_code=404, detail="项目不存在或已被删除")
-            if result["status"] == "busy":
-                raise HTTPException(status_code=409, detail="项目中有回答正在生成，请停止或等待完成后再删除")
-            return {"message": "项目文档和索引已删除，历史对话已保留，仅供查看"}
-        except HTTPException:
-            raise
-        except TimeoutError:
-            raise HTTPException(status_code=503, detail="项目正在处理其他操作，请稍后重试")
-        except Exception:
-            logger.exception("[项目] 删除失败 project_id=%s", project_id)
-            raise HTTPException(status_code=503, detail="项目清理未完成，请重试删除")
-        finally:
-            _invalidate_health(user_id, project_id)
+            with _index_write_section(user_id, pid):
+                status = begin_project_deletion(user_id, pid, CHAT_GENERATION_STALE_SECONDS)
+        except TimeoutError as exc:
+            raise HTTPException(status_code=503, detail="项目正在处理其他操作，请稍后重试") from exc
+        if status == "not_found":
+            raise HTTPException(status_code=404, detail="项目不存在")
+        if status == "busy":
+            raise HTTPException(status_code=409, detail="项目中有回答正在生成，请停止或等待完成后再删除")
+        if status == "pending":
+            _invalidate_health(user_id, pid)
+            try:
+                _complete_project_deletion(user_id, pid)
+            except Exception:
+                logger.exception("[项目] 等待恢复删除清理 project_id=%s", pid)
+                return JSONResponse({"message": "删除已受理，历史对话仅供查看，后台将继续清理资料"}, status_code=202)
+        return {"message": "项目文档和索引已删除，历史对话已保留，仅供查看"}
 
 
 def _ensure_project(project):
@@ -1292,8 +1336,7 @@ def _safe_filename(filename: str) -> str:
 
 
 def _project_manifests(user_id: int, project_id: str) -> ManifestStore:
-    return ManifestStore({**vector_db_config, "collection_name":
-                          project_collection_name(vector_db_config, user_id, project_id)})
+    return ManifestStore(vector_db_config, user_id, project_id)
 
 
 def _project_file_statuses(user_id: int, project_id: str) -> list[KnowledgeFile]:
@@ -1345,6 +1388,9 @@ def get_source_passage(
             with shared_section(PG_CONN, project_index_lock_key(user_id, project_id), timeout_seconds=10), \
                     project_access(user_id, project_id) as current:
                 _ensure_project(current)
+                if any(os.path.normcase(job["filename"]) == os.path.normcase(filename)
+                       for job in file_deletions(PG_CONN, user_id, project_id)):
+                    raise HTTPException(410, "文件正在删除")
                 def lookup(key: str):
                     identity = (version, document_format(file_path))
                     return _project_manifests(user_id, project_id).source_snapshot(identity, key)
@@ -1478,34 +1524,41 @@ def get_upload_task(task_id: UUID, project: dict = Depends(require_project)):
     return _upload_task_payload(task)
 
 
+def _finish_file_deletions(user_id: int, project_id: str) -> None:
+    for job in file_deletions(PG_CONN, user_id, project_id):
+        directory = get_knowledge_dir(user_id, project_id)
+        def delete_index(path):
+            get_vector_store(user_id, project_id, location=job).delete_file_index(path)
+        finish_file_deletion(PG_CONN, user_id, project_id, directory, job, delete_index)
+        _invalidate_health(user_id, project_id)
+
+
 @app.delete("/api/projects/{project_id}/files/{filename}")
 def delete_file(filename: str, project: dict = Depends(require_project)):
-    with audit_operation(project["user_id"], "file.delete", "file", resource_digest(filename), project_id=project["id"]) as operation:
-        user_id, project_id = project["user_id"], project["id"]
-        _ensure_no_uploads(user_id, project_id)
+    user_id, project_id = project["user_id"], project["id"]
+    with audit_operation(user_id, "file.delete", "file", resource_digest(filename), project_id=project_id, transactional=True):
         try:
             filename = _safe_filename(filename)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        directory = get_knowledge_dir(user_id, project_id)
-        file_path = scoped_knowledge_file(directory, os.path.join(directory, filename))
-        try:
             with _index_write_section(user_id, project_id), project_access(user_id, project_id) as current:
                 _ensure_project(current)
-                _ensure_no_uploads(user_id, project_id)
-                if not os.path.isfile(file_path):
-                    raise HTTPException(status_code=404, detail="文件不存在")
+                jobs = file_deletions(PG_CONN, user_id, project_id)
+                if not any(os.path.normcase(job["filename"]) == os.path.normcase(filename) for job in jobs):
+                    _ensure_no_uploads(user_id, project_id)
+                    source = Path(scoped_knowledge_file(get_knowledge_dir(user_id, project_id), filename))
+                    if not source.is_file():
+                        raise HTTPException(status_code=404, detail="文件不存在")
+                    begin_file_deletion(_project_manifests(user_id, project_id), source.name)
                 _invalidate_health(user_id, project_id)
-                get_vector_store(user_id, project_id).delete_file_index(file_path)
-                os.remove(file_path)
-            return {"message": f"已删除: {filename}"}
-        except HTTPException:
-            raise
-        except TimeoutError:
-            raise HTTPException(status_code=503, detail="索引正被其他操作占用，请稍后重试")
-        except Exception:
-            logger.exception("[知识库] 删除失败 file=%s project_id=%s", filename, project_id)
-            raise HTTPException(status_code=500, detail="删除文件失败，请重试或执行索引修复")
+                try:
+                    _finish_file_deletions(user_id, project_id)
+                except Exception:
+                    logger.exception("[知识库] 等待恢复文件删除 project_id=%s", project_id)
+                    return JSONResponse({"message": "删除已受理，后台将继续清理文件及索引"}, status_code=202)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=503, detail="索引正在更新，请稍后重试") from exc
+        return {"message": f"已删除 {filename}"}
 
 
 @app.post("/api/projects/{project_id}/vector/build")

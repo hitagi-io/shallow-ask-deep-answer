@@ -15,7 +15,7 @@ import AppDialog from '../components/common/AppDialog.vue'
 import { useConfirmation } from '../composables/useConfirmation'
 
 const props = defineProps<{ user: UserInfo }>()
-const emit = defineEmits<{ logout: []; userUpdated: [user: UserInfo]; accountDeleted: []; passwordChanged: [] }>()
+const emit = defineEmits<{ logout: []; userUpdated: [user: UserInfo]; accountDeleted: [message: string]; passwordChanged: [] }>()
 const MODE_KEY = `shallow_ask_deep_answer_mode_${props.user.id}`
 const PROJECT_KEY = `shallow_ask_deep_answer_project_${props.user.id}`
 // 仅刷新时恢复页面；新进入或恢复标签页时默认打开问答首页。
@@ -108,7 +108,7 @@ async function logout() {
       <ChatView v-if="mode === 'chat'" :chat="chat" :projects="projects" @manage="navigate('knowledge')" />
       <KnowledgeView v-else-if="mode === 'knowledge'" :knowledge="knowledge" :projects="projects" @back="navigate('chat')" @ask="askProject" @deleted="chat.markProjectDeleted" />
       <AuditView v-else-if="mode === 'audit'" @back="navigate('chat')" />
-      <AccountView v-else-if="mode === 'account'" :user="user" @back="navigate('chat')" @updated="emit('userUpdated', $event)" @deleted="emit('accountDeleted')" @password-changed="emit('passwordChanged')" />
+      <AccountView v-else-if="mode === 'account'" :user="user" @back="navigate('chat')" @updated="emit('userUpdated', $event)" @deleted="emit('accountDeleted', $event)" @password-changed="emit('passwordChanged')" />
       <AboutView v-else @back="navigate('chat')" @knowledge="navigate('knowledge')" />
     </main>
   </div>

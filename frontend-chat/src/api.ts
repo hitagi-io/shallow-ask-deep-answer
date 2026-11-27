@@ -235,7 +235,7 @@ export async function apiVerifyDeletion(password: string): Promise<{ confirmatio
   return res.json()
 }
 
-export async function apiDeleteAccount(confirmation_token: string, confirmation_text: string): Promise<void> {
+export async function apiDeleteAccount(confirmation_token: string, confirmation_text: string): Promise<string> {
   const token = getToken()
   const res = await apiFetch('/api/auth/me', {
     method: 'DELETE', headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -244,6 +244,7 @@ export async function apiDeleteAccount(confirmation_token: string, confirmation_
   if (!res.ok) throw new Error(await errorMessage(res, '未能确认注销结果，请重新登录查看账号状态后再试'))
   if (getToken() !== token && hasAuthToken()) throw new Error('原账号已注销，当前登录状态已变更')
   clearAuth()
+  return (await res.json()).message
 }
 
 // ---------- 会话接口 ----------
@@ -493,9 +494,10 @@ export async function saveProject(name: string, id?: string): Promise<Project> {
   return (await res.json()).project
 }
 
-export async function deleteProject(id: string): Promise<void> {
+export async function deleteProject(id: string): Promise<string> {
   const res = await apiFetch(projectPath(id), { method: 'DELETE', headers: authHeaders() })
   if (!res.ok) throw new Error(await errorMessage(res, '删除项目失败'))
+  return (await res.json()).message
 }
 
 export interface FileRequestOptions extends KnowledgeRequestOptions {
@@ -559,9 +561,10 @@ export async function fetchUploadTasks(projectId: string, options: KnowledgeRequ
   return parseUploadTasks(result)
 }
 
-export async function deleteFile(projectId: string, name: string): Promise<void> {
+export async function deleteFile(projectId: string, name: string): Promise<string> {
   const res = await apiFetch(`${projectPath(projectId)}/files/${encodeURIComponent(name)}`, { method: 'DELETE', headers: authHeaders() })
   if (!res.ok) throw new Error(await errorMessage(res, '删除失败'))
+  return (await res.json()).message
 }
 
 export interface HealthIssue {
@@ -577,6 +580,7 @@ export interface HealthReport {
   checked_at: string | null
   healthy: boolean
   milvus_error?: string | null
+  disk_error?: string | null
   manifest_error?: string | null
   stats: { files: number; indexed_files: number; chunks: number }
   issues: HealthIssue[]

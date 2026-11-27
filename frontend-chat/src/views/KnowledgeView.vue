@@ -84,9 +84,15 @@ async function submitProject() {
   if (!dialog.value) return
   if (await save(projectName.value, dialog.value === 'rename' ? selectedId.value || undefined : undefined)) dialog.value = null
 }
+const deletionNotice = ref('')
 async function removeProject() {
   const id = selectedId.value
-  if (id && await remove(id)) emit('deleted', id)
+  if (!id) return
+  const message = await remove(id)
+  if (message) {
+    deletionNotice.value = message
+    emit('deleted', id)
+  }
 }
 </script>
 
@@ -95,6 +101,7 @@ async function removeProject() {
     <PageHeader title="让资料成为你的知识" description="按项目整理文档，让每一次提问都有据可循。" eyebrow="工作空间 / 知识库" back-label="返回对话" @back="emit('back')">
       <span class="private-label"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/></svg>仅自己可见</span>
     </PageHeader>
+    <AppNotice v-if="deletionNotice" class="knowledge-notice" tone="success" dismissible @dismiss="deletionNotice = ''">{{ deletionNotice }}</AppNotice>
     <AppNotice v-if="error && !dialog" class="knowledge-notice" tone="error" dismissible @dismiss="error = ''">{{ error }} <button v-if="!saving" class="text-action" @click="load">重新加载</button></AppNotice>
     <div class="knowledge-shell">
       <aside class="project-panel" aria-label="知识库项目">

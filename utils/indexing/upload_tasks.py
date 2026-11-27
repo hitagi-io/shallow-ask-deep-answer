@@ -186,6 +186,7 @@ class UploadTaskStore:
             candidates = lease.execute("""
                 SELECT user_id, project_id, MIN(sequence) AS first_sequence
                 FROM upload_tasks WHERE status IN ('queued', 'running')
+                  AND EXISTS (SELECT 1 FROM projects p WHERE p.id=upload_tasks.project_id AND p.deleted_at IS NULL)
                 GROUP BY user_id, project_id ORDER BY first_sequence
             """).fetchall()
             for candidate in candidates:
@@ -196,6 +197,7 @@ class UploadTaskStore:
                     SELECT id, user_id, project_id, status, trace_id FROM upload_tasks
                     WHERE user_id = %s AND project_id = %s
                       AND status IN ('queued', 'running')
+                      AND EXISTS (SELECT 1 FROM projects p WHERE p.id=upload_tasks.project_id AND p.deleted_at IS NULL)
                     ORDER BY sequence LIMIT 1
                 """, (candidate["user_id"], candidate["project_id"])).fetchone()
                 if row is None:
@@ -276,13 +278,15 @@ class UploadTaskStore:
             SELECT 1 FROM upload_receivers
             WHERE user_id = %s AND project_id = %s AND expires_at > clock_timestamp()
             UNION ALL
+            SELECT 1 FROM pending_file_deletions WHERE user_id=%s AND project_id=%s
+            UNION ALL
             SELECT 1 FROM upload_tasks WHERE user_id = %s AND project_id = %s
               AND (status IN ('queued', 'running') OR EXISTS (
                 SELECT 1 FROM upload_task_items i WHERE i.task_id=upload_tasks.id
                   AND i.recovery IS NOT NULL AND i.recovery->>'stage' NOT IN ('cleaned','rolled_back','unpublished')
               ))
             LIMIT 1
-        """, (user_id, project_id, user_id, project_id))
+        """, (user_id, project_id, user_id, project_id, user_id, project_id))
         return cur.fetchone() is not None
 
     def has_active(self, user_id: int, project_id: str) -> bool:

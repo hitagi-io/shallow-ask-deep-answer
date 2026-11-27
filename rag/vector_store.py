@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import uuid
 from collections import OrderedDict
@@ -12,10 +13,11 @@ from typing import NotRequired, TypedDict
 from langchain_core.runnables import RunnableLambda
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_milvus import BM25BuiltInFunction, Milvus
+from pymilvus import MilvusClient
 from dotenv import load_dotenv
 
 from rag.embeddings import DashScopeEmbeddings
-from rag.index_manifest import IndexManifest, ManifestStore, chunks_match, current_index_version, project_collection_name
+from rag.index_manifest import IndexManifest, ManifestStore, chunks_match, current_index_version, index_namespace, project_collection_name
 from rag.retrieval import HybridRetriever
 from utils.core.config_loader import vector_db_config
 from utils.documents.knowledge_files import list_supported_files, compute_file_sha256, get_document_loader, document_format
@@ -23,7 +25,7 @@ from utils.retrieval.source_evidence import (
     SOURCE_FIELDS, chunk_signature, parsed_unit_snapshot, split_located_documents, text_digest,
 )
 from utils.core.project_paths import get_knowledge_dir, knowledge_scope, scoped_knowledge_file
-from utils.core.logging_config import get_logger
+from utils.core.logging_config import get_logger, private_vector_write
 from utils.indexing.progress import IndexProgress, IndexStage, ProgressCallback
 from utils.indexing.upload_quota import daily_embedding_limit, moving_upload_files, reserve_embedding_chars, UploadQuotaExceeded
 from utils.indexing.recovery import UploadJournal, PublicationUncertain, UploadRecoveryResult
@@ -33,7 +35,7 @@ from utils.runtime.shutdown import ServiceStopping, check_shutdown, interruptibl
 logger = get_logger(__name__)
 load_dotenv()
 
-_vector_stores: OrderedDict[tuple[int, str], VectorStore] = OrderedDict()
+_vector_stores: OrderedDict[tuple[int, str, str, str], VectorStore] = OrderedDict()
 _lock = threading.Lock()
 _MAX_CACHED_PROJECTS = 128
 _INDEX_FAIL_GENERIC = "入库失败，详见服务端日志"
@@ -52,48 +54,123 @@ class UploadedFileResult(IndexResult):
     overwritten: bool
 
 
-def get_vector_store(user_id: int, project_id: str) -> "VectorStore":
+def get_vector_store(user_id: int, project_id: str, *, location: dict | None = None) -> "VectorStore":
     scope = knowledge_scope(user_id, project_id)
+    config = vector_db_config
+    if location is not None:
+        # 删除任务可能在配置切换后接管，继续使用受理时的命名空间。
+        suffix = f"_u{user_id}_p{uuid.UUID(scope[1]).hex}"
+        name = location["collection_name"]
+        config = {**config, "milvus_uri": location["milvus_uri"], "collection_prefix": name.removesuffix(suffix)}
+        if project_collection_name(config, *scope) != name:
+            raise ValueError("待删除文件的向量集合归属不匹配")
+    key = (*scope, config["milvus_uri"], config["collection_prefix"])
     with _lock:
-        if scope not in _vector_stores:
-            _vector_stores[scope] = VectorStore(*scope)
+        if key not in _vector_stores:
+            _vector_stores[key] = VectorStore(*scope, config=config)
             if len(_vector_stores) > _MAX_CACHED_PROJECTS:
                 _vector_stores.popitem(last=False)
-        _vector_stores.move_to_end(scope)
-        return _vector_stores[scope]
+        _vector_stores.move_to_end(key)
+        return _vector_stores[key]
+
+
+def _locate_legacy_vectors(manifests, missing, locations, owner):
+    """旧版只存哈希。只接受能重新算出同一个哈希的地址与集合，不猜测待删除目标。"""
+    candidates = {uri: set(names) for uri, names in locations.items()}
+    for previous in vector_db_config.get("legacy_milvus_locations", []):
+        if not isinstance(previous, dict) or not previous.get("milvus_uri") or not previous.get("collection_prefix"):
+            raise ValueError("legacy_milvus_locations 中的每项都需要 milvus_uri 和 collection_prefix")
+        name = project_collection_name(previous, manifests.user_id, manifests.project_id)
+        candidates.setdefault(previous["milvus_uri"], set()).add(name)
+
+    def match(uri, names):
+        loopback = r"^(https?://)(?:localhost|127\.0\.0\.1|\[::1\])(?=[:/]|$)"
+        uris = {uri}
+        for host in ("localhost", "127.0.0.1", "[::1]"):
+            uris.add(re.sub(loopback, lambda m: m[1] + host, uri))
+        for address in uris:
+            for name in names:
+                key = index_namespace(address, name)
+                if key in missing:
+                    manifests.remember_location(address, name)
+                    locations.setdefault(address, set()).add(name)
+                    missing.remove(key)
+
+    for uri, names in candidates.items():
+        match(uri, names)
+    for uri in tuple(locations):
+        if not missing:
+            break
+        client = MilvusClient(uri=uri, timeout=10)
+        try:
+            match(uri, [name for name in client.list_collections(timeout=10) if owner.fullmatch(name)])
+        finally:
+            client.close()
+    if missing:
+        raise RuntimeError("无法核实历史 Milvus 位置，请配置 legacy_milvus_locations。命名空间 " + ", ".join(sorted(missing)))
+
+
+def drop_project_vectors(user_id: int, project_id: str) -> None:
+    """调用方持项目写锁。删除所有已登记位置，最终数据库事务才移除归属记录。"""
+    manifests = ManifestStore(vector_db_config, user_id, project_id)
+    locations = {manifests.uri: {manifests.collection_name}}
+    missing = set()
+    owner = re.compile(rf"[A-Za-z][A-Za-z0-9_]{{0,79}}_u{user_id}_p{uuid.UUID(project_id).hex}")
+    for entry in manifests.project_locations():
+        if entry["milvus_uri"] is None:
+            missing.add(entry["namespace"])
+        elif (owner.fullmatch(entry["collection_name"])
+              and index_namespace(entry["milvus_uri"], entry["collection_name"]) == entry["namespace"]):
+            locations.setdefault(entry["milvus_uri"], set()).add(entry["collection_name"])
+        else:
+            raise ValueError("向量集合的项目归属不匹配")
+    if missing:
+        _locate_legacy_vectors(manifests, missing, locations, owner)
+    for uri, names in locations.items():
+        client = MilvusClient(uri=uri, timeout=10)
+        try:
+            for name in sorted(names):
+                if client.has_collection(collection_name=name, timeout=10):
+                    client.drop_collection(collection_name=name, timeout=30)
+        finally:
+            client.close()
+    with _lock:
+        for key in list(_vector_stores):
+            if key[:2] == (user_id, manifests.project_id):
+                del _vector_stores[key]
 
 
 class VectorStore:
     _ITER_BATCH_SIZE = 1000
     _INSERT_BATCH_SIZE = 1000
 
-    def __init__(self, user_id: int, project_id: str):
+    def __init__(self, user_id: int, project_id: str, *, config: dict | None = None):
+        config = vector_db_config if config is None else config
         self.user_id, self.project_id = knowledge_scope(user_id, project_id)
         self.knowledge_dir = get_knowledge_dir(self.user_id, self.project_id)
-        collection_name = project_collection_name(vector_db_config, self.user_id, self.project_id)
-        self.manifests = ManifestStore({**vector_db_config, "collection_name": collection_name})
-        self.index_version = current_index_version(vector_db_config)
+        self.manifests = ManifestStore(config, self.user_id, self.project_id)
+        self.index_version = current_index_version(config)
         self.daily_embedding_chars = daily_embedding_limit()
-        self.embeddings = DashScopeEmbeddings(vector_db_config)
+        self.embeddings = DashScopeEmbeddings(config)
         self.vector_store = Milvus(
-            collection_name=collection_name,
+            collection_name=self.manifests.collection_name,
             embedding_function=self.embeddings,
             vector_field=["vector", "sparse"],
             builtin_function=BM25BuiltInFunction(
                 input_field_names="text", output_field_names="sparse",
-                analyzer_params=vector_db_config["bm25_analyzer"],
+                analyzer_params=config["bm25_analyzer"],
                 function_name="knowledge_bm25",
             ),
-            connection_args={"uri": vector_db_config["milvus_uri"]},
+            connection_args={"uri": self.manifests.uri},
             drop_old=False,
             auto_id=False,
             enable_dynamic_field=True,
             consistency_level="Strong",
         )
         self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=vector_db_config["chunk_size"],
-            chunk_overlap=vector_db_config["chunk_overlap"],
-            separators=vector_db_config["separators"],
+            chunk_size=config["chunk_size"],
+            chunk_overlap=config["chunk_overlap"],
+            separators=config["separators"],
             length_function=len,
             add_start_index=True,
         )
@@ -110,16 +187,6 @@ class VectorStore:
             # 另一个 worker 可能刚为之前的空项目创建集合，补齐客户端字段与检索配置。
             if not vs.fields and vs.client.has_collection(collection_name=vs.collection_name):
                 vs._init()
-
-    def drop_project_index(self) -> None:
-        """调用方持有项目排他锁并禁止新生成后，清除此项目的向量及清单。"""
-        with self._store_lock:
-            vs = self.vector_store
-            if vs.client.has_collection(collection_name=vs.collection_name):
-                vs.client.drop_collection(collection_name=vs.collection_name)
-            self.manifests.delete_all()
-            with _lock:
-                _vector_stores.pop((self.user_id, self.project_id), None)
 
     def chunk_rows(self, expression: str = "") -> list[dict]:
         """强一致性游标遍历；空集合属于正常初始状态，连接错误继续抛出。"""
@@ -283,25 +350,31 @@ class VectorStore:
                 for start in range(0, len(documents), self._INSERT_BATCH_SIZE):
                     check_shutdown()
                     end = min(start + self._INSERT_BATCH_SIZE, len(documents))
-                    self.vector_store.add_embeddings(
-                        texts=texts[start:end], embeddings=embeddings[start:end],
-                        metadatas=[doc.metadata for doc in documents[start:end]], ids=ids[start:end],
-                    )
+                    with private_vector_write():
+                        self.vector_store.add_embeddings(
+                            texts=texts[start:end], embeddings=embeddings[start:end],
+                            metadatas=[doc.metadata for doc in documents[start:end]], ids=ids[start:end],
+                        )
                     report("writing", end, len(documents))
                 report("verifying", 0, len(documents))
-                rows = self.chunk_rows(f"index_id == {json.dumps(manifest.index_id)}")
+                with private_vector_write():
+                    rows = self.chunk_rows(f"index_id == {json.dumps(manifest.index_id)}")
                 if not chunks_match(manifest, rows, on_progress=partial(report, "verifying")):
                     raise RuntimeError("写入后的分块数、序号或内容哈希校验失败")
                 if compute_file_sha256(file_path) != sha256:
                     raise RuntimeError("入库期间源文件发生变化")
                 # 提交后不再调用可能失败的进度写入，避免错误触发源文件回滚。
                 report("finalizing", 0, 1)
-            except Exception:
-                logger.exception("[向量库] 入库失败 file=%s", file_path)
+            except Exception as exc:
+                # 驱动异常的消息和回溯可能含原文、向量或完整文件路径。
+                logger.error("[向量库] 写入或校验失败 index_id=%s chunks=%d error_type=%s",
+                             manifest.index_id, len(documents), type(exc).__name__)
                 try:
-                    self._delete_pks(ids)
-                except Exception:
-                    logger.exception("[向量库] 清理本次写入失败，保留清单供健康检查修复")
+                    with private_vector_write():
+                        self._delete_pks(ids)
+                except Exception as cleanup_error:
+                    logger.error("[向量库] 清理写入失败 index_id=%s error_type=%s",
+                                 manifest.index_id, type(cleanup_error).__name__)
                 return result
 
             if journal is not None:
@@ -361,7 +434,7 @@ class VectorStore:
 
     def _another_file_with_same_content(self, file_path: str, sha256: str) -> str | None:
         norm_self = os.path.normcase(os.path.abspath(file_path))
-        for path in list_supported_files(self.knowledge_dir, tuple(vector_db_config["allowed_types"])):
+        for path in list_supported_files(self.knowledge_dir, tuple(vector_db_config["allowed_types"]), missing_ok=False):
             if os.path.normcase(os.path.abspath(path)) == norm_self:
                 continue
             if document_format(path) != document_format(file_path):
@@ -405,7 +478,7 @@ class VectorStore:
                           and (keep_sha256 is None or row.get("content_sha256") != keep_sha256)])
 
     def delete_file_index(self, file_path: str) -> None:
-        """在项目写锁内先处理共享索引和发布记录，成功后调用方再移除磁盘文件。"""
+        """在项目写锁内清理来源，仍在磁盘上的同内容副本继续使用共享索引。"""
         with self._store_lock:
             self._retire_source_versions(file_path)
             self.manifests.forget_file(file_path)

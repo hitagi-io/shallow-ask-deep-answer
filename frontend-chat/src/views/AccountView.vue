@@ -6,7 +6,7 @@ import AppDialog from '../components/common/AppDialog.vue'
 import AppNotice from '../components/common/AppNotice.vue'
 
 const props = defineProps<{ user: UserInfo }>()
-const emit = defineEmits<{ back: []; updated: [user: UserInfo]; deleted: []; passwordChanged: [] }>()
+const emit = defineEmits<{ back: []; updated: [user: UserInfo]; deleted: [message: string]; passwordChanged: [] }>()
 const username = ref(props.user.username)
 watch(() => props.user.username, value => { username.value = value })
 const currentPassword = ref('')
@@ -90,8 +90,8 @@ async function confirmDeletion() {
   if (busy.value || deleteStep.value !== 3 || !deleteToken.value || confirmationText.value !== requiredText.value) return
   saving.value = 'delete'; deleteError.value = ''
   try {
-    await apiDeleteAccount(deleteToken.value, confirmationText.value)
-    emit('deleted')
+    const message = await apiDeleteAccount(deleteToken.value, confirmationText.value)
+    emit('deleted', message)
   } catch (error) { deleteError.value = (error as Error).message }
   finally { saving.value = null }
 }
@@ -152,7 +152,7 @@ async function confirmDeletion() {
         <div class="dialog-actions"><button type="button" class="btn btn-secondary" :disabled="busy" @click="closeDeletion">取消</button><button type="submit" class="btn btn-primary" :disabled="busy">{{ saving === 'verify' ? '验证中…' : '验证并继续' }}</button></div>
       </form>
       <form v-else class="form-stack delete-form" @submit.prevent="confirmDeletion">
-        <AppNotice tone="warning">这是最后一步。点击下方删除按钮后，账号及数据将立即删除，无法恢复。</AppNotice>
+        <AppNotice tone="warning">这是最后一步。确认后账号会立即停用，资料清理将在中断后自动继续。此操作无法撤销。</AppNotice>
         <label for="delete-confirmation">请输入「{{ requiredText }}」</label>
         <input id="delete-confirmation" v-model="confirmationText" class="filter-input" autocomplete="off" spellcheck="false" maxlength="60" required :disabled="busy" aria-describedby="delete-hint" />
         <p id="delete-hint" class="field-hint">身份验证 5 分钟内有效。过期后请重新验证。</p>

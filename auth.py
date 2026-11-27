@@ -24,6 +24,7 @@ from utils.core.pg_lock import PG_LOCK_KEY_SETUP, exclusive_section
 from utils.core.logging_config import get_logger
 from rag.index_manifest import ManifestStore
 from utils.indexing.upload_tasks import UploadTaskStore
+from utils.indexing.deletions import migrate_deletions
 from utils.indexing.upload_quota import UploadLimits, UploadReservation, account_upload_usage, claim_upload, discard_upload, reserve_upload
 from utils.observability.schema import migrate
 from utils.observability.audit import append_audit, resource_digest
@@ -272,6 +273,7 @@ def init_db():
                 """)
                 ManifestStore.setup(cur)
                 migrate(cur)
+                migrate_deletions(cur)
             conn.commit()
 
 
@@ -342,7 +344,7 @@ def get_session_user(user_id: int, session_id: str) -> dict | None:
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT id, username, auth_version FROM users WHERE id = %s AND NOT EXISTS "
+                "SELECT id, username, auth_version FROM users WHERE id = %s AND NOT deletion_pending AND NOT EXISTS "
                 "(SELECT 1 FROM revoked_access_sessions WHERE user_id=users.id AND session_id=%s)",
                 (user_id, session_id),
             )
@@ -540,7 +542,7 @@ def login(username: str, password: str, ip: str | None = None) -> dict:
                 _rate_record(cur, "login_ip", ip, now)
 
             cur.execute(
-                "SELECT id, username, password, auth_version FROM users WHERE username = %s",
+                "SELECT id, username, password, auth_version FROM users WHERE username = %s AND NOT deletion_pending",
                 (username,),
             )
             row = cur.fetchone()
@@ -656,7 +658,7 @@ def upload_admission(user_id: int, project_id: str, directory: str, incoming: in
 def account_write_access(cur, user_id: int) -> None:
     """与注销互斥；等待结束后重新验证账号，防止旧请求在删除后创建数据。"""
     cur.execute("SELECT pg_advisory_xact_lock_shared(%s, %s)", (_ACCOUNT_LOCK_CLASS, user_id))
-    cur.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+    cur.execute("SELECT id FROM users WHERE id = %s AND NOT deletion_pending", (user_id,))
     if cur.fetchone() is None:
         raise ValueError("账号不存在或已被注销")
 
@@ -690,15 +692,18 @@ def update_project(user_id: int, project_id: str, name: str) -> dict | None:
         return project
 
 
-def delete_project(user_id: int, project_id: str, stale_seconds: float, cleanup: Callable[[list[str]], None]) -> dict:
-    """清理项目资料并保留项目删除标记及历史会话；运行中拒绝删除。"""
+def begin_project_deletion(user_id: int, project_id: str, stale_seconds: float) -> str:
+    """先封存项目。事务提交后，即使清理被中断，项目也只能查看对话历史。"""
     with _connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             # 与登记生成保持相同顺序：项目行锁在先，会话咨询锁在后。
-            cur.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s AND deleted_at IS NULL FOR UPDATE",
+            cur.execute("SELECT deleted_at, deletion_pending FROM projects WHERE id = %s AND user_id = %s FOR UPDATE",
                         (project_id, user_id))
-            if cur.fetchone() is None:
-                return {"status": "not_found", "conversation_ids": []}
+            project = cur.fetchone()
+            if project is None:
+                return "not_found"
+            if project["deleted_at"] is not None:
+                return "pending" if project["deletion_pending"] else "deleted"
             cur.execute("SELECT id FROM conversations WHERE project_id = %s AND user_id = %s ORDER BY id",
                         (project_id, user_id))
             conversation_ids = [row["id"] for row in cur.fetchall()]
@@ -711,17 +716,48 @@ def delete_project(user_id: int, project_id: str, stale_seconds: float, cleanup:
                         "AND status = 'running' LIMIT 1", (project_id, user_id))
             if cur.fetchone() is not None:
                 conn.commit()
-                return {"status": "busy", "conversation_ids": conversation_ids}
-        cleanup(conversation_ids)
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM upload_tasks WHERE project_id = %s AND user_id = %s", (project_id, user_id))
-            # 保留项目身份供历史引用识别；文档、索引及模型上下文由 cleanup 清理。
-            cur.execute("UPDATE projects SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+                return "busy"
+            cur.execute("UPDATE projects SET deletion_pending=TRUE, deleted_at=now(), updated_at=now() "
                         "WHERE id = %s AND user_id = %s", (project_id, user_id))
             append_audit(cur, user_id=user_id, action="project.delete", resource_type="project",
-                         resource_id=project_id, project_id=project_id, result="succeeded")
+                         resource_id=project_id, project_id=project_id, result="accepted")
         conn.commit()
-        return {"status": "deleted", "conversation_ids": conversation_ids}
+        return "pending"
+
+
+def project_deletion_state(user_id: int, project_id: str):
+    with _connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""SELECT deletion_disk_stage,
+                       EXISTS (SELECT 1 FROM index_namespaces n WHERE n.project_id=p.id)
+                       OR EXISTS (SELECT 1 FROM upload_tasks t WHERE t.project_id=p.id)
+                       OR EXISTS (SELECT 1 FROM pending_file_deletions d WHERE d.project_id=p.id) AS expect_files
+                       FROM projects p WHERE user_id=%s AND id=%s AND deletion_pending""", (user_id, project_id))
+        return cur.fetchone()
+
+
+def set_deletion_disk_stage(user_id: int, project_id: str, stage: str):
+    with _connection() as conn, conn.transaction():
+        conn.execute("UPDATE projects SET deletion_disk_stage=%s WHERE id=%s AND user_id=%s AND deletion_pending",
+                     (stage, project_id, user_id))
+
+
+def finish_project_deletion(user_id: int, project_id: str):
+    """外部清理完成后，在同一事务删除检查点、各代索引及上传记录。"""
+    with _connection() as conn, conn.transaction(), conn.cursor() as cur:
+        cur.execute("UPDATE projects SET deletion_pending=FALSE WHERE id=%s AND user_id=%s AND deletion_pending "
+                    "RETURNING id", (project_id, user_id))
+        if cur.fetchone() is None:
+            return
+        cur.execute("SELECT id FROM conversations WHERE user_id=%s AND project_id=%s", (user_id, project_id))
+        saver = PostgresSaver(conn)
+        for (conv_id,) in cur.fetchall():
+            saver.delete_thread(f"{user_id}:{conv_id}")
+        cur.execute("DELETE FROM index_namespaces WHERE user_id=%s AND project_id=%s", (user_id, project_id))
+        cur.execute("DELETE FROM pending_file_deletions WHERE user_id=%s AND project_id=%s", (user_id, project_id))
+        cur.execute("DELETE FROM upload_tasks WHERE user_id=%s AND project_id=%s", (user_id, project_id))
+        cur.execute("DELETE FROM upload_receivers WHERE user_id=%s AND project_id=%s", (user_id, project_id))
+        append_audit(cur, user_id=user_id, action="project.delete", resource_type="project",
+                     resource_id=project_id, project_id=project_id, result="succeeded")
 
 
 class InvalidConversationCursor(ValueError):
@@ -917,7 +953,7 @@ _GENERATION_SNAPSHOT_QUERY = f"""
     FROM users account
     JOIN generations g ON g.user_id = account.id AND g.conversation_id = %s AND g.request_id = %s
     {_GENERATION_JOINS}
-    WHERE account.id = %s
+    WHERE account.id = %s AND NOT account.deletion_pending
 """
 
 

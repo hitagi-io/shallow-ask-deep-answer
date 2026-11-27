@@ -50,11 +50,11 @@ export function useProjects(confirmAction: ConfirmAction, initialSelectedId: str
     saving.value = true
     error.value = ''
     try {
-      await deleteProject(id)
+      const message = await deleteProject(id)
       if (disposed) return
       projects.value = projects.value.filter(item => item.id !== id)
       if (selectedId.value === id) selectedId.value = null
-      return true
+      return message
     } catch (value) { if (!disposed) error.value = errorText(value); return false }
     finally { saving.value = false }
   }

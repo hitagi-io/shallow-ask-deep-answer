@@ -2,12 +2,14 @@
 from datetime import datetime, timedelta, timezone
 
 import jwt
+from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
 import auth
 from utils.core.pg_lock import project_index_lock_key
 from utils.observability.audit import append_audit
+from utils.runtime.shutdown import ServiceStopping
 
 
 class AccountError(ValueError):
@@ -17,7 +19,8 @@ class AccountError(ValueError):
 
 
 def _locked_user(cur, user_id: int, version: int):
-    cur.execute("SELECT id, username, password, auth_version FROM users WHERE id = %s FOR UPDATE", (user_id,))
+    cur.execute("SELECT id, username, password, auth_version FROM users "
+                "WHERE id = %s AND NOT deletion_pending FOR NO KEY UPDATE", (user_id,))
     user = cur.fetchone()
     if user is None or user["auth_version"] != version:
         raise AccountError("登录已失效，请重新登录", 401)
@@ -92,9 +95,9 @@ def _deletion_claims(token: str, user_id: int, version: int, confirmation: str) 
     return claims
 
 
-def delete_account(user_id: int, version: int, token: str, confirmation: str, *,
-                   cleanup, stale_seconds: float, slot_max_age: int) -> None:
-    """持账号排他锁，按索引→项目→会话顺序清理；外部失败保留账号以便重试。"""
+def begin_account_deletion(user_id: int, version: int, token: str, confirmation: str, *,
+                           stale_seconds: float, slot_max_age: int) -> None:
+    """确认身份并与写请求互斥，在任何外部清理之前持久化注销请求。"""
     claims = _deletion_claims(token, user_id, version, confirmation)
     with auth._connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -123,8 +126,41 @@ def delete_account(user_id: int, version: int, token: str, confirmation: str, *,
                         "AND started_at > now() - make_interval(secs => %s) LIMIT 1", (user_id, slot_max_age))
             if cur.fetchone() is not None:
                 raise AccountError("有对话请求正在启动，请稍后重试注销", 409)
-            cleanup(project_ids, conversation_ids)
+            cur.execute("UPDATE users SET deletion_pending=TRUE WHERE id=%s", (user_id,))
+            cur.execute("UPDATE projects SET deleted_at=now(), updated_at=now(), deletion_pending=TRUE "
+                        "WHERE user_id=%s AND deleted_at IS NULL", (user_id,))
             append_audit(cur, user_id=user_id, action="account.delete", resource_type="account",
-                         resource_id=str(user_id), result="succeeded")
-            cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+                         resource_id=str(user_id), result="accepted")
         conn.commit()
+
+
+def finish_account_deletion(user_id: int, cleanup_project, cleanup_directory) -> None:
+    with auth._connection() as conn:
+        projects = conn.execute("SELECT p.id FROM projects p JOIN users u ON u.id=p.user_id "
+                                "WHERE u.id=%s AND u.deletion_pending AND p.deletion_pending ORDER BY p.id",
+                                (user_id,)).fetchall()
+    last_error = None
+    for (project_id,) in projects:
+        try:
+            cleanup_project(user_id, project_id)
+        except ServiceStopping:
+            raise
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    with auth._connection() as conn, conn.transaction(), conn.cursor() as cur:
+        cur.execute("SELECT id FROM users WHERE id=%s AND deletion_pending FOR UPDATE", (user_id,))
+        if cur.fetchone() is None:
+            return
+        cur.execute("SELECT 1 FROM projects WHERE user_id=%s AND deletion_pending LIMIT 1", (user_id,))
+        if cur.fetchone():
+            raise RuntimeError("项目清理尚未完成")
+        cleanup_directory(user_id)
+        cur.execute("SELECT id FROM conversations WHERE user_id=%s", (user_id,))
+        saver = PostgresSaver(conn)
+        for (conv_id,) in cur.fetchall():
+            saver.delete_thread(f"{user_id}:{conv_id}")
+        cur.execute("DELETE FROM users WHERE id=%s", (user_id,))
+        append_audit(cur, user_id=user_id, action="account.delete", resource_type="account",
+                     resource_id=str(user_id), result="succeeded")

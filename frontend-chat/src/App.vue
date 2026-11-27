@@ -89,7 +89,7 @@ onUnmounted(() => {
 
 <template>
 <div v-if="checkingAuth" class="auth-page auth-loading" role="status"><span class="loading-spinner" aria-hidden="true"></span><span>正在进入你的工作空间…</span></div>
-<WorkspaceView v-else-if="user" :key="user.id" :user="user" @logout="endSession()" @user-updated="user = $event" @account-deleted="endSession('', '账号及其项目、文档、索引和对话已注销删除。')" @password-changed="endSession('', '密码已修改，所有登录会话已失效，请使用新密码重新登录。')" />
+<WorkspaceView v-else-if="user" :key="user.id" :user="user" @logout="endSession()" @user-updated="user = $event" @account-deleted="endSession('', $event)" @password-changed="endSession('', '密码已修改，所有登录会话已失效，请使用新密码重新登录。')" />
 <div v-else-if="serviceUnavailable" class="auth-page auth-loading">
   <span role="status">暂时无法连接服务</span>
   <button class="btn btn-secondary" :disabled="validatingSession" @click="validateSession">{{ validatingSession ? '连接中…' : '重试' }}</button>

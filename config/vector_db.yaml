@@ -8,6 +8,8 @@ index_version: 5
 
 # Milvus 配置（通过 Docker 部署 Milvus 服务）
 milvus_uri: "http://localhost:19530"
+# 升级前用过且当前配置无法识别的存储位置，可填写原始 milvus_uri 和 collection_prefix。
+legacy_milvus_locations: []
 
 chunk_size: 500
 chunk_overlap: 50

@@ -309,10 +309,10 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
     if (selected !== projectId.value || indexing.value || recoveryRequired.value) return
     await run('deleting', async id => {
       deletingName.value = name
-      await deleteFile(id, name)
+      const message = await deleteFile(id, name)
       if (projectId.value === id) healthState.reset()
       await refreshAll(id)
-      show(`已删除：${name}`, 'success')
+      show(message, 'success')
     })
   }
   function handleHealthCheck() {
@@ -333,7 +333,7 @@ export function useKnowledge(projectId: Readonly<Ref<string | null>>, active: Re
       if (!healthState.acceptReport(request, report)) return
       await Promise.all([refreshFiles(id), refreshTasks(id)])
       const repair = report.repair
-      const errors = [...repair.ghost_errors, ...repair.re_index_failures.map(f => `${f.file}：${f.error}`)]
+      const errors = [...(report.disk_error ? [report.disk_error] : []), ...repair.ghost_errors, ...repair.re_index_failures.map(f => `${f.file}：${f.error}`)]
       show(errors.length ? `修复与补建部分失败：${errors.join('；')}` : report.healthy ? '修复与补建完成，索引状态良好' : '修复与补建已执行，仍有异常，请查看检查结果', errors.length || !report.healthy ? 'error' : 'success')
     })
   }
